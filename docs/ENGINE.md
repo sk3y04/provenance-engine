@@ -20,6 +20,16 @@ The first release exposes exactly two operations:
 Archive, vault, collection, encode, and import functionality remain CLI-local
 until a private consumer needs them.
 
+## CLI consumption
+
+The public CLI is a consumer of this facade: a plain `provenance grab` (http(s)
+or X/Twitter hashtag sources, without `--dry-run`, `--filename-template`,
+`--batch`, or `--session`) calls `Engine.Download` via
+`cmd/provenance/engine_adapter.go` and renders its structured events to stderr
+with a typed summary. Options the facade intentionally omits, and the richer
+`scan` manifest/JSON contract, remain on the legacy internal path. See
+[`ENGINE_REFACTOR.md`](ENGINE_REFACTOR.md) for the transitional boundary.
+
 ## Example
 
 ```go

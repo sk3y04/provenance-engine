@@ -148,6 +148,12 @@ output:     ./downloads
 
 When `--session` is used, an additional `session:` line appears. A detailed session status follows for session-backed runs.
 
+### Engine facade path
+
+A plain `grab` invocation (http/https URLs or supported X/Twitter hashtag sources, with no `--dry-run`, `--filename-template`, `--batch`, or `--session`) is executed through the public `engine` facade — the same `Engine.Download` a server-side worker calls in-process. Progress is delivered as structured events and rendered to stderr by the CLI adapter; the summary above is emitted from the aggregated typed result.
+
+The legacy internal path remains for options the public facade deliberately does not expose (`--dry-run`, `--filename-template`, `--batch`, `--session`), for non-standard `--quality` values, and for bare non-http sources. This is a documented transitional boundary; see [`ENGINE_REFACTOR.md`](ENGINE_REFACTOR.md).
+
 ---
 
 ## `provenance scan <URL...> [flags]`
