@@ -16,6 +16,8 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/config"
 	"github.com/sk3y04/provenance-engine/internal/downloader"
+	"github.com/sk3y04/provenance-engine/internal/engineerr"
+	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/extractor"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
@@ -35,6 +37,9 @@ type Options struct {
 	// FileProgress, when set, receives per-file lifecycle events from the
 	// HTTP downloader and yt-dlp structured progress output.
 	FileProgress downloader.ProgressReporter
+	// Events, when set, receives presentation-neutral structured events. When
+	// set, the generic/yt-dlp execution path does not write to the terminal.
+	Events event.Sink
 }
 
 // Reporter receives user-visible URL lifecycle events. It is intentionally tiny
@@ -186,8 +191,12 @@ func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
 
 	site, err := Classify(rawURL)
 	if err != nil {
-		return err
+		return engineerr.New(engineerr.Validation, "classify", rawURL, err)
 	}
+
+	event.Emit(ctx, opts.Events, event.Event{
+		Kind: event.KindStageChanged, Stage: event.StageResolving, URL: rawURL,
+	})
 
 	ytOpts := extractor.YtdlpOptions{
 		OutputDir:          opts.OutputDir,
@@ -200,6 +209,7 @@ func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
 		OutputTemplate:     opts.OutputTemplate,
 		SpeedLimit:         opts.SpeedLimit,
 		Progress:           opts.FileProgress,
+		Events:             opts.Events,
 	}
 
 	switch site {
@@ -247,6 +257,9 @@ func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
 		}, opts.DryRun)
 
 	case SiteGeneric:
+		event.Emit(ctx, opts.Events, event.Event{
+			Kind: event.KindStageChanged, Stage: event.StageDownloading, URL: rawURL,
+		})
 		stderr, err := extractor.RunYtdlpCaptured(ctx, rawURL, ytOpts)
 		if err == nil {
 			return nil
@@ -257,36 +270,68 @@ func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
 		}
 		return browserFallback(ctx, rawURL, opts, ytOpts, err)
 	}
-	return fmt.Errorf("no extractor for url: %s", rawURL)
+	return engineerr.New(engineerr.UnsupportedSource, "dispatch", rawURL,
+		fmt.Errorf("no extractor for url: %s", rawURL))
 }
 
 func browserFallback(ctx context.Context, rawURL string, opts Options, ytOpts extractor.YtdlpOptions, originalErr error) error {
 	if !extractor.IsBrowserCandidate(rawURL) {
-		return fmt.Errorf("browser fallback unavailable: %w", originalErr)
+		return engineerr.New(engineerr.UnsupportedSource, "browser-fallback", rawURL,
+			fmt.Errorf("browser fallback unavailable: %w", originalErr))
 	}
 
-	fmt.Println("[provenance] crawling the page (and any pagination) for video links...")
+	if opts.Events != nil {
+		event.Emit(ctx, opts.Events, event.Event{
+			Kind: event.KindStageChanged, Stage: event.StageProcessing, URL: rawURL,
+			Reason: "browser_crawl",
+			Detail: "crawling the page (and any pagination) for video links",
+		})
+	} else {
+		fmt.Println("[provenance] crawling the page (and any pagination) for video links...")
+	}
 	links, scrapeErr := extractor.ScrapePlaylistVideoLinks(ctx, rawURL, opts.CookiesFile, opts.ChromePath, 30*time.Second, 500)
 	if scrapeErr == nil && len(links) > 0 {
 		if cachePath, cerr := writeLinkCache(opts.OutputDir, rawURL, links); cerr == nil {
-			fmt.Fprintf(os.Stderr, "[provenance] saved %d link(s) to %s\n", len(links), cachePath)
-			fmt.Fprintf(os.Stderr, "[provenance]   (re-run later with: provenance grab --batch %q)\n", cachePath)
-		} else {
+			if opts.Events != nil {
+				event.Emit(ctx, opts.Events, event.Event{
+					Kind: event.KindWarning, URL: rawURL, Reason: "link_cache_saved",
+					Detail: fmt.Sprintf("saved %d link(s) to %s", len(links), cachePath),
+				})
+			} else {
+				fmt.Fprintf(os.Stderr, "[provenance] saved %d link(s) to %s\n", len(links), cachePath)
+				fmt.Fprintf(os.Stderr, "[provenance]   (re-run later with: provenance grab --batch %q)\n", cachePath)
+			}
+		} else if opts.Events == nil {
 			fmt.Fprintf(os.Stderr, "[provenance] WARNING: could not save link cache: %v\n", cerr)
 		}
 		return downloadVideoLinks(ctx, links, opts)
 	}
 	if scrapeErr != nil {
-		fmt.Printf("[provenance] link scrape failed: %v - falling back to media-URL sniffer\n", scrapeErr)
-	} else {
+		if opts.Events != nil {
+			event.Emit(ctx, opts.Events, event.Event{
+				Kind: event.KindWarning, URL: rawURL, Reason: "link_scrape_failed",
+				Detail: scrapeErr.Error(),
+			})
+		} else {
+			fmt.Printf("[provenance] link scrape failed: %v - falling back to media-URL sniffer\n", scrapeErr)
+		}
+	} else if opts.Events == nil {
 		fmt.Println("[provenance] no video links found on page - falling back to media-URL sniffer")
 	}
 
 	resolved, berr := extractor.SniffOrFallback(ctx, rawURL, opts.CookiesFile, opts.ChromePath)
 	if berr != nil {
-		return fmt.Errorf("browser fallback: %w (original error: %v)", berr, originalErr)
+		return engineerr.New(engineerr.ExternalTool, "browser-fallback", rawURL,
+			fmt.Errorf("browser fallback: %w (original error: %v)", berr, originalErr))
 	}
-	fmt.Printf("[provenance] sniffed media URL: %s\n", resolved.MediaURL)
+	if opts.Events != nil {
+		event.Emit(ctx, opts.Events, event.Event{
+			Kind: event.KindWarning, URL: rawURL, Reason: "sniffed_media_url",
+			Detail: resolved.MediaURL,
+		})
+	} else {
+		fmt.Printf("[provenance] sniffed media URL: %s\n", resolved.MediaURL)
+	}
 	return extractor.RunYtdlp(ctx, resolved.MediaURL, ytOpts)
 }
 
@@ -296,8 +341,11 @@ func browserFallback(ctx context.Context, rawURL string, opts Options, ytOpts ex
 func Scan(ctx context.Context, rawURL string, opts Options) (manifest.Manifest, error) {
 	site, err := Classify(rawURL)
 	if err != nil {
-		return manifest.Manifest{}, err
+		return manifest.Manifest{}, engineerr.New(engineerr.Validation, "classify", rawURL, err)
 	}
+	event.Emit(ctx, opts.Events, event.Event{
+		Kind: event.KindStageChanged, Stage: event.StageResolving, URL: rawURL,
+	})
 	var m manifest.Manifest
 	switch site {
 	case SiteTwitter:
@@ -339,6 +387,7 @@ func Scan(ctx context.Context, rawURL string, opts Options) (manifest.Manifest, 
 			OutputLayout:       opts.OutputLayout,
 			OutputTemplate:     opts.OutputTemplate,
 			SpeedLimit:         opts.SpeedLimit,
+			Events:             opts.Events,
 		})
 	}
 	if err != nil {
@@ -350,8 +399,11 @@ func Scan(ctx context.Context, rawURL string, opts Options) (manifest.Manifest, 
 func ScanResolved(ctx context.Context, rawURL string, opts Options) (resolve.Source, error) {
 	site, err := Classify(rawURL)
 	if err != nil {
-		return resolve.Source{}, err
+		return resolve.Source{}, engineerr.New(engineerr.Validation, "classify", rawURL, err)
 	}
+	event.Emit(ctx, opts.Events, event.Event{
+		Kind: event.KindStageChanged, Stage: event.StageResolving, URL: rawURL,
+	})
 	switch site {
 	case SiteTwitter:
 		return extractor.ScanTwitterResolved(ctx, rawURL, opts.OutputDir, opts.CookiesFile, extractor.TwOptions{
@@ -392,6 +444,7 @@ func ScanResolved(ctx context.Context, rawURL string, opts Options) (resolve.Sou
 			OutputLayout:       opts.OutputLayout,
 			OutputTemplate:     opts.OutputTemplate,
 			SpeedLimit:         opts.SpeedLimit,
+			Events:             opts.Events,
 		})
 	}
 }

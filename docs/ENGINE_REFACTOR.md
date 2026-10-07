@@ -580,3 +580,68 @@ services (matches CONTRIBUTING.md and the Phase 0 baseline).
 3. Event model and typed-error categories as specified in §4.2.
 4. Artifact output: controlled `WorkDir` for now (recommended) vs introducing
    `ArtifactSink` immediately.
+
+---
+
+## 10. Phase 3 implementation status
+
+Phase 3 introduced the contracts and converted the yt-dlp single-URL
+Download/Resolve path. The public `engine/` facade is still Phase 4.
+
+### Added
+
+- `internal/engineerr` — `Kind` categories, `Error`, `New`/`Newf`, `KindOf`,
+  `Is`, `As`; cancellation is never re-categorized. Tests cover `errors.Is`/`As`,
+  every category, and cancellation.
+- `internal/event` — `Event`, `Kind`, `Stage`, `Counts`, `Sink`, `Nop`, `Func`,
+  `Emit`, and `Notifier` (bounded, drop-on-full, panic-recovering delivery so a
+  slow or foreign sink can neither stall nor cancel extraction). Tests cover
+  ordering, panic recovery, non-blocking drop, close idempotency, and
+  cancellation dropping.
+- `internal/render` — CLI `Sink` rendering structured events to an `io.Writer`;
+  terminal formatting lives only here. Tests pin exact output.
+- `internal/dispatcher.Options.Events` and `extractor.YtdlpOptions.Events`.
+
+### Converted (event-driven, no terminal when a sink is set)
+
+- `extractor.RunYtdlp` / `runYtdlpInternal`, `ScanYtdlp`, `ScanYtdlpResolved`:
+  emit stage/warning/progress/item events, use an event→`ProgressReporter`
+  adapter, suppress the ffmpeg warning and progress fallback writes, and return
+  `engineerr`-categorized failures (`UnsupportedSource`, `AuthRequired`,
+  `RateLimited`, `Permanent`, `ExternalTool`, `Canceled`).
+- `dispatcher.Dispatch` / `Scan` / `ScanResolved` (generic/yt-dlp branch) and
+  `browserFallback`: emit events when a sink is set, legacy `[provenance]` output
+  byte-for-byte when it is nil.
+- `app.Download`: emits `ItemDone` failure events and an `EventSummary` (from the
+  same `Counts`), and returns a `Validation` error for empty input, instead of
+  printing.
+
+### Deviations from §4.2 (recorded per the phase prompt)
+
+- The event carries `Reason` (stable code), optional `Detail`,
+  `Err error`, and `Summary *Counts` instead of a single `Message` string. This
+  keeps stable facts machine-readable and avoids preformatted UI strings.
+- Public `engine` names are deferred; internal packages use `event.Sink` /
+  `engineerr.Kind`. Phase 4 will expose stable public aliases/DTOs.
+
+### Deferred (documented transitional paths)
+
+- CLI/TUI are **not** wired to the sink yet; they still use the nil-sink legacy
+  path, so user-visible behavior is unchanged. Wiring is Phase 5.
+- `downloader` progressbar fallback (§6.6) is unchanged; it remains opt-out via a
+  non-nil `Progress`/`Events` adapter.
+- `dispatcher.downloadVideoLinks` / `BatchDispatch` narration remains legacy;
+  their yt-dlp calls receive `Events` so per-file progress does not hit the
+  terminal, but the surrounding start/OK/FAILED lines are still direct writes.
+- Custom extractors (Twitter, Reddit, Instagram, Album, browser narration) still
+  write to the terminal; typing and event conversion of those paths continues in
+  Phases 4–5 as needed for Resolve/Download.
+
+### Verified
+
+- `go vet ./...`, `go test -race ./...`, `golangci-lint run ./...`, and
+  `go build -o provenance ./cmd/provenance` all pass.
+- New tests: `internal/engineerr`, `internal/event`, `internal/render`,
+  `internal/dispatcher/events_test.go`, `internal/extractor/events_test.go`,
+  `internal/app/app_test.go` (asserts no stderr with a sink and legacy stderr
+  without one). No test contacts a live service.

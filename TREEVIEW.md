@@ -580,6 +580,36 @@ Pattern-matches error strings to produce actionable hints for common failures.
 
 ---
 
+### `internal/engineerr/engineerr.go` - Categorized Errors
+
+**Package:** `engineerr`
+
+Typed, transport-independent failure categories so callers use `errors.As`/`errors.Is` instead of matching strings. Context cancellation is always categorized as `Canceled`.
+
+**Exports:** `Kind` (validation, authentication_required, unsupported_source, rate_limited, temporary, canceled, external_tool, permanent), `Error`, `New`, `Newf`, `KindOf`, `Is`, `As`.
+
+---
+
+### `internal/event/event.go` - Structured Events
+
+**Package:** `event`
+
+Presentation-neutral execution events (`stage_changed`, `progress`, `warning`, `item_done`, `retry`, `summary`) and the `Sink` contract. `Nop`, `Func`, and `Notifier` (bounded, drop-on-full, panic-recovering) implementations. The engine never reads back from a sink.
+
+**Exports:** `Kind`, `Stage`, `Event`, `Counts`, `Sink`, `Nop`, `Func`, `Emit`, `Notifier`, `NewNotifier`.
+
+---
+
+### `internal/render/render.go` - CLI Event Renderer
+
+**Package:** `render`
+
+CLI presentation adapter that renders structured events to an `io.Writer`. Terminal formatting lives only in presentation packages.
+
+**Exports:** `Sink`, `NewSink`.
+
+---
+
 ### `internal/tui/` - Terminal UI
 
 #### `internal/tui/tui.go` - TUI Core

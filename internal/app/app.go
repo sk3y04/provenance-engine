@@ -9,6 +9,8 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/diagnose"
 	"github.com/sk3y04/provenance-engine/internal/dispatcher"
+	"github.com/sk3y04/provenance-engine/internal/engineerr"
+	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/resolve"
 )
@@ -17,9 +19,13 @@ import (
 // non-empty the file (one URL per line) is dispatched via parallel worker
 // pools; individual urls are dispatched sequentially. The first encountered
 // error is returned but remaining work continues.
+//
+// When opts.Events is set, progress, item, and summary facts are emitted as
+// structured events and nothing is written to the terminal. When it is nil the
+// legacy CLI/TUI output is preserved unchanged.
 func Download(ctx context.Context, urls []string, batchPath string, opts dispatcher.Options) error {
 	if batchPath == "" && len(urls) == 0 {
-		return fmt.Errorf("provide at least one URL or use --batch <file>")
+		return engineerr.Newf(engineerr.Validation, "download", "", "provide at least one URL or use --batch <file>")
 	}
 	var firstErr error
 	cr := dispatcher.NewCountsReporter(opts.Reporter)
@@ -31,16 +37,34 @@ func Download(ctx context.Context, urls []string, batchPath string, opts dispatc
 	}
 	for _, u := range urls {
 		if err := dispatcher.Dispatch(ctx, u, opts); err != nil {
-			fmt.Fprintf(os.Stderr, "[provenance] %s: %v\n", u, err)
-			if hint := diagnose.Hint(err); hint != "" {
-				fmt.Fprintf(os.Stderr, "[provenance] hint: %s\n", hint)
+			if opts.Events != nil {
+				event.Emit(ctx, opts.Events, event.Event{
+					Kind: event.KindItemDone, URL: u, Err: err,
+				})
+			} else {
+				fmt.Fprintf(os.Stderr, "[provenance] %s: %v\n", u, err)
+				if hint := diagnose.Hint(err); hint != "" {
+					fmt.Fprintf(os.Stderr, "[provenance] hint: %s\n", hint)
+				}
 			}
 			if firstErr == nil {
 				firstErr = err
 			}
 		}
 	}
-	dispatcher.PrintSummary(&cr.Counts, opts.OutputDir, "")
+	if opts.Events != nil {
+		event.Emit(ctx, opts.Events, event.Event{
+			Kind: event.KindSummary,
+			Summary: &event.Counts{
+				Discovered: cr.Counts.Discovered.Load(),
+				Succeeded:  cr.Counts.Succeeded.Load(),
+				Failed:     cr.Counts.Failed.Load(),
+				Skipped:    cr.Counts.Skipped.Load(),
+			},
+		})
+	} else {
+		dispatcher.PrintSummary(&cr.Counts, opts.OutputDir, "")
+	}
 	return firstErr
 }
 
