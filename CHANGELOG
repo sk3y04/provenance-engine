@@ -1,0 +1,279 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+- **Twitter/X hashtag media search**: `provenance grab --cookies cookies.txt 'x:#golang'` (also `'#golang'` and `https://x.com/hashtag/golang`) now downloads native X media attached to posts from the authenticated **Latest** hashtag search, restricted to posts with native media (`filter:media`). Uses the current web-client `SearchTimeline` GraphQL operation via POST, follows the bottom cursor until exhausted/`--limit`/cancellation/loop, and downloads photos, videos, and animated GIFs. Works through `collect add`/`sync` as a stable canonical `x:#tag` source with post-ID dedup. Output lands under `twitter/hashtags/<slug>/{images,videos,posts}`. Query ID is discovered from X web-client JS (env override `TWITTER_QUERY_SEARCH_TIMELINE`) and refreshed once on stale-query responses. Includes fixture-driven tests (no live X calls).
+- **TUI Archive views**: new "Archive" main-menu entry with sub-views for every archive command — `archive url`, `archive session`, `archive import` (output directory), `import-pdf`, `import-git` (repo + ref), `import-docs` (site, scope, max pages), `import-openapi` (spec path), and `import-web` (URL, scope, max pages, screenshot, Chrome path) — each with its own input form, plus a "Vault init" and "Install yt-dlp" menu entry. Backed by `archive.IngestFromOutput`, which archives an output directory's captured manifests into the vault and returns the revision ID and entity count.
+- **TUI Vault revision diff**: the Vault view now lists per-collection revisions; selecting two revisions (A then B) renders a field-level entity diff (added/removed/changed) in-TUI. New `RevisionStore.ListRevisionIDsByCollection` and `DeleteRevisionsByCollection` (FK-ordered cascade delete: relations → documents → entities → artifacts → revisions) in `internal/catalog`.
+- **TUI Encode view**: "Encode videos" main-menu entry with dir/encoder/quality form driving the `encode` pipeline.
+- **TUI config persistence** (`internal/tui/config.go`): last-used download form values, scan URL + advanced options, and encode settings are saved to a JSON store and re-applied to forms on next launch.
+- **TUI session detail view**: `enter` in the Sessions list opens a detail view showing per-status counts and failed URLs with their last error; actions to export the session, export failed URLs, and resume the session (optionally retrying failed items). Main menu shows a banner for unfinished sessions with `R` to resume.
+- **TUI archive search history**: last 20 search queries kept, navigable when returning to the search view.
+- **TUI mouse support**: clicking a list row moves the cursor in list views and jumps form steps in forms.
+- **Runner per-file throughput**: progress view now shows per-file speed (with decay so a stalled file doesn't hold a stale value).
+- **Watch run status**: subscriptions now record `last_run_duration` and `last_run_status`; runs are marked `running` before download starts so an interrupted run reads as stuck rather than a stale success. `provenance watch run` records the same status/duration on finish.
+- **Downloader media sniffing** (`internal/downloader/sniff.go`): `SniffExt` returns the canonical extension from magic bytes for png, jpg, gif, webp, mp4, webm, and bmp.
+
+### Changed
+- **Twitter/X animated GIFs**: `animated_gif` media now selects the highest-bitrate MP4 variant (as the downloader and `--include mp4` expect) instead of the still thumbnail; falls back to the still image only when no video variant is present.
+- **TUI main menu**: expanded to 14 items (added Archive, Manifest, Encode videos); view enum grew from 12 to 25 views.
+- **TUI filters**: session, watch, history, and collection filters now persist when leaving and re-entering a view (`/` restores the last accepted text).
+- **Collection sync**: collection is reloaded before `RecordSync` to avoid a TOCTOU race with concurrent `AddSeen`/`RecordSync` calls.
+- **Reddit media extensions**: API-reported extensions are validated against the accepted media set (lowercased; junk values like `"Image"` rejected), and downloaded files whose extension doesn't match their magic bytes are renamed to the real format.
+
+### Fixed
+- **Instagram/Twitter cookie headers from full browser exports**: `--cookies` files exported from a browser contain cookies for dozens of unrelated domains. The Instagram and Twitter extractors sent every cookie in the file, producing ~100KB `Cookie` headers that exceed the ~8KB HTTP/2 header-block limit enforced by Instagram's edge — every request died with `http2: server sent GOAWAY ... header-block-exceeds-max-size`. Cookies are now filtered to domains that apply to the requested hosts (plus an expiry check and per-name dedupe) before being sent.
+- **Instagram REST API host cascade**: `i.instagram.com` rejects or rate-limits web sessions that `www.instagram.com` accepts (e.g. exports containing only `www.instagram.com` host cookies, or API-host challenges). All REST fetchers (profile feed, single post, stories, highlights) now fall back to `www.instagram.com/api/v1` when the first host rejects the session (401/403/404); rate limits are session-wide, so 429s do not trigger the fallback. A not-logged-in HTML response now prints a hint to re-export cookies including the `.instagram.com` domain.
+
+## [2026-09-01]
+
+### Added
+- **Instagram Story Highlights**: `provenance grab https://www.instagram.com/stories/highlights/<id>/` now downloads every story in a highlight — images, videos, and multi-slide carousels — in one command. `ParseIgURL` recognizes the `/stories/highlights/<id>/` path as a new `highlight` target (kept distinct from active `/stories/<username>/` stories). `fetchIgHighlightStories` reuses the same `/feed/reels_media/` endpoint as active stories, addressing the reel via `reel_ids=highlight:<id>`, with `429`/rate-limit backoff, error-preview logging, and `igMaxAttempts` retry matching the story path. The owning username is resolved from the highlight response's `user`/`owner` object so output still lands under `instagram/<username>/`, falling back to `highlight_<id>` when unresolvable; a `supported_capabilities_new` POST recovery is included for highlights that return empty on the bare GET. Wired through `ScanInstagram`, `DownloadInstagram`, and `ScanInstagramResolved`.
+- **AV1 transcode (`provenance encode`)**: batch-convert local video files to hardware-accelerated AV1 in an `.mkv` container, fanning work across one or more GPUs. New `internal/encode/` package (`encoder`, `runner`, `discover`, `run`) with `EncodeJob`, `Encoder`, and `Options`. Three hardware backends — Intel QuickSync (`av1_qsv`, `--encoder qsv`), AMD AMF (`av1_amf`, `amf`), NVIDIA NVENC (`av1_nvenc`, `nvenc`) — plus `auto`, which probes `ffmpeg -encoders` and selects the first available codec (QSV preferred); explicit selections are validated against the installed build. Quality uses a canonical QSV `global_quality` scale (1..51) translated per backend (AMF `cq_quality`, NVENC `crf` 1..33). Flags: `--dir`/`--file`, `--recursive`, `--ext` (default `mp4,mkv,mov,avi,ts,webm`), `--out`, `--suffix`, `--overwrite`, `--encoder`, `--devices` (render nodes/GPU indices, default `/dev/dri/renderD128`), `--quality` (30), `--preset` (per-backend mapped speed/efficiency hint), `--gop-seconds` (converted to a per-file frame interval via ffprobe-detected fps), `--lookahead-depth` (QSV max 100), `--bframes`, and `--dry-run` (prints the exact ffmpeg command without encoding). Inputs run through the shared `internal/worker` pool (one pool per device, permanent-error semantics), audio/subtitle streams and container metadata are copied, and source files are never modified. Encoder-mismatch errors carry the phrase `not supported by this ffmpeg build` so `diagnose` offers a hardware/hint recovery.
+
+### Changed
+- **Site routing**: refactored site classification and extractor internals; per-site host tables are now resolved at runtime instead of hardcoded.
+
+## [0.6.1] - 2026-07-26
+
+### Added
+- **Instagram stories support**: `provenance grab https://www.instagram.com/stories/USERNAME/` now downloads current story media (images and videos) using the `/feed/reels_media/` API endpoint with `reel_ids` parameter.
+
+### Changed
+- **Reddit API base**: switched from `www.reddit.com` to `old.reddit.com` for the JSON API, which has a more permissive bot policy.
+- **Reddit User-Agent**: changed from `provenance/1.0` to Chrome 131; added `Sec-Fetch-*`, `Accept-Language`, and `Referer` browser headers.
+- **uTLS** (`internal/downloader/utls_transport.go`): updated Chrome fingerprint from `HelloChrome_120` to `HelloChrome_131`, added `NextProtos` ALPN negotiation and `ForceAttemptHTTP2`. Used only by the downloader when `BrowserTLS` is set (media downloads). Native extractor API clients (Instagram, Twitter) keep Go's standard TLS as uTLS causes EOF/handshake issues on some endpoints.
+
+### Fixed
+- **Instagram profile user ID resolution**: `web_profile_info` API endpoint no longer reliably returns user `pk`. Added multi-method cascade: primary API call with `Referer` header and fallback to `id` field, web page HTML scraping (`profilePage_` pattern, iOS deep link meta tags, `user_id` JSON), `?__a=1&__d=1` JSON endpoint, and `users/search` API endpoint as last resort.
+- **`provenance collect add` command unregistered**: the `add` subcommand was defined but never attached to `collect` (missing `cmd.AddCommand(add)`), making `--limit` and other download flags unavailable when adding collections.
+- **Cookies path stored as relative**: `buildOptions` now resolves `--cookies` paths to absolute via `filepath.Abs`, preventing "no such file" errors when syncing collections from a different working directory.
+
+## [0.6.0] - 2026-07-26
+
+### Added
+- **TUI Collections view**: list all collections with Name, Last sync, New, Skip, URL table. Filter via `/`. `enter` for detail, `s` to sync, `S` to sync-all, `a` to archive.
+- **TUI Collection detail view**: full metadata, seen count, last sync result. `s` sync, `a` archive actions.
+- **TUI Vault view**: shows vault init status, archive collections with revision counts. Prompt to run `vault init` if not initialized.
+- **`provenance --version`**: version flag on root cobra command.
+- **Root CLI help text**: rewritten to describe the four progressive levels (grab/collect/archive/import), list all commands, reflect full product scope.
+- **Main menu**: expanded from 7 to 10 items (Collections, Vault added). TUI view enum expanded from 9 to 12.
+- `resolve.Error.Is()` method for `errors.Is` support.
+- `NewTextContent` constructor in resolve package.
+- `safeTruncate` for UTF-8 aware content truncation in git and docs importers.
+- `collFilter` properly initialized in TUI model for nil safety.
+
+### Fixed
+- **Search SQL**: SELECT/Scan column mismatch corrected; `revision_id`/`collection_name` scan order fixed.
+- **Artifacts table**: added `PRIMARY KEY (sha256)` to migration (was missing, causing `ON CONFLICT` SQL error).
+- **Vault connectivity**: `ensureVaultStore()` auto-connects PG from `PROVENANCE_DATABASE_URL` for vault-dependent commands.
+- **Revision ID determinism**: artifacts, entities, documents, relations sorted by stable key before SHA-256 ID computation.
+- **Blobstore `List()`**: fixed doubled hash prefix in concatenation.
+- **GC safety**: `isHex` now accepts uppercase `A-F` hex characters.
+- **Body leak**: `docs.go` response body now closed immediately (defer-in-loop removed).
+- **Retention performance**: `PruneRevisions` uses 1-pass load+sort instead of O(n log n) disk reads in sort comparator.
+- **`GetRevision`**: now populates `Artifacts` from PostgreSQL query.
+- **Blobstore race**: `O_EXCL` tmp collision on concurrent same-content `Put` handled gracefully.
+- **Comment retries**: `fetchRdComments` now has 4-attempt retry with exponential backoff.
+- **Diff safety**: `h[:12]` guarded against short hash strings to prevent panic.
+- **Downloader cache**: `LastHash`/`LastPath` now populated for already-existing files.
+- **Audio detection**: expanded from 3 to 9 audio extension formats.
+- **Dedup fallback**: items without external IDs now use URL for deduplication.
+- **Crosspost media**: `RdPostToItem` now iterates `CrosspostParentList`.
+- **Instagram URLs**: canonical URL now uses correct prefix (`/p/`, `/reel/`, `/tv/`) based on post type.
+- **Failure reporting**: partial download failures use actual session counts instead of marking all as failed.
+- **Playlist detection**: uses yt-dlp extractor key instead of fragile URL substring.
+- **Citation parse**: uses string splitting instead of `fmt.Sscanf`.
+- **Vault TUI**: per-collection revision counts instead of global total.
+- **Catalog race**: `UpsertCollection` TOCTOU fixed with `loadLocked`/`saveLocked` helpers.
+- **Other**: regex compiled once in docs.go; `ListRunManifests` sorted; `ToolVersion` set in capture manifest; dead `ids` parameter removed.
+
+### Changed
+- CLI short description: "a universal media downloader" → "universal media collector, source archive, and knowledge vault"
+
+## [0.5.2] - 2026-07-23
+
+### Added
+- **`archive/diff.go`**: `DiffRevisions(old, new) *DiffResult` — matches entities by `ExternalID`, reports added/removed/changed with field-level diffs.
+- **`blobstore.List()`**: enumerates all stored blobs for GC.
+- **`catalog/gc.go`**: `GarbageCollect(vaultRoot, dryRun)` — finds orphaned blobs by diffing filesystem against revision manifest references.
+- **`catalog/retention.go`**: `PruneRevisions(vaultRoot, collectionName, keep)` — prunes old revisions keeping the last N.
+- **CLI**: `provenance vault diff <idA> <idB>`, `vault gc --dry-run`, `vault retention prune --collection X --keep N`, `vault backup`.
+- **CLI**: `provenance collect sync --every 24h` — repeating sync with `time.Ticker` loop.
+
+## [0.5.1] - 2026-07-21
+
+### Added
+- **`internal/importers/web.go`**: chromedp-based web page archiver (`ImportWeb`) — navigates pages via headless Chrome, extracts rendered HTML, visible text, and page titles.
+- **Multi-page crawl**: discovers same-scope links via `document.querySelectorAll`, bounded by `--max-pages`.
+- **`ArtifactHTML`** constant in `archive/types.go` for HTML snapshot artifacts.
+- **CLI**: `provenance archive import-web <URL>` with `--scope`, `--max-pages`, `--screenshot` flags.
+- No Docker dependency — reuses existing `chromedp` infrastructure.
+
+## [0.5.0] - 2026-07-18
+
+### Added
+- **`internal/importers/`**: technical knowledge importers for PDFs, Git repositories, static docs sites, and OpenAPI specs.
+- **PDF importer**: extracts text per page via `ledongthuc/pdf`, stores original PDF as blob artifact, creates one `Document` per page with `RelContains` relations.
+- **Git importer**: shallow clone via `git clone --depth 1`, resolves tag to commit SHA, walks `.md`/`.adoc`/`.txt`/README/LICENSE/CHANGELOG files as Documents.
+- **Docs site importer**: sitemap discovery + link crawl, bounded by `--scope`/`--max-pages`, extracts headings and text.
+- **OpenAPI importer**: parses YAML spec, generates `Document` per endpoint, creates `Entity` with `Kind: "api_spec"`.
+- **CLI**: `archive import-pdf`, `import-git`, `import-docs`, `import-openapi` with `--ref`, `--scope`, `--max-pages` flags.
+
+### Changed
+- **Dependencies**: added `github.com/ledongthuc/pdf`, `github.com/yuin/goldmark`, `gopkg.in/yaml.v3`.
+
+## [0.4.2] - 2026-07-16
+
+### Added
+- **`--include-comments`** and **`--max-comments`** flags: opt-in comment fetching with configurable limit (default 100).
+- **Reddit comment fetching**: `fetchRdComments()` + `walkRdComments()` call `{permalink}.json`, recursively walk comment tree with depth bounding.
+- **`CaptureItem.Text` population**: `recordCapture()` now reads post `.md` files and populates `CaptureItem.Text`, enabling full-text search of social post content in the archive.
+
+## [0.4.1] - 2026-07-12
+
+### Added
+- **PostgreSQL integration**: `CatalogStore` interface; `PgStore` implementation using `pgx/v5` (connection pooling, transactional inserts).
+- **Full-text search**: `plainto_tsquery`/`ts_rank`/`ts_headline` across entities and documents with GIN indexes and auto-update `tsvector` triggers.
+- **SQL migration**: embedded schema creating `archive_collections`, `revisions`, `entities`, `documents`, `artifacts`, `relations` tables.
+- **Dual-write archive**: `archive.IngestCaptureManifest` writes to both filesystem (blobs) and PostgreSQL (metadata) when store is available.
+- **CLI**: `provenance vault init`, `vault show`, `vault cite` with `--entity`/`--format` flags, `provenance search <query>` with `--collection`/`--kind` flags.
+- **Citation formatters**: `Markdown()`, `Plain()` (title, URL, date, author, SHA-256), `ToJSON()`, `FromEntity()` constructor.
+- **TUI**: `viewArchiveSearch` — text input with search results, cursor navigation, ranked hits with headlines.
+
+## [0.4.0] - 2026-07-08
+
+### Added
+- **`internal/blobstore/`**: SHA-256 content-addressed filesystem storage with `Put`/`Get`/`Exists`/`Remove`. Deduplication via hash collision. Atomic writes via `.tmp` → rename.
+- **`internal/archive/`**: immutable vault domain model — `ArchiveCollection`, `Source`, `Revision`, `Entity`, `Artifact`, `Document`, `Relation`.
+- **`IngestCaptureManifest`**: consumes capture manifests, verifies SHA-256, copies files to blob store, builds revision records.
+- **`internal/catalog/`**: JSON persistence for archive collections.
+- **`internal/citation/`**: stable citation references `provenance://collection@revision#entity`.
+- **`provenance archive`**: CLI command tree — `archive url`, `archive collection`, `archive session`, `archive import`.
+- Blobstore tests: Put/Get/Exists, deduplication, Remove.
+
+## [0.3.2] - 2026-07-05
+
+### Added
+- **SHA-256 hashing in downloader**: `Download()` computes hash inline via `io.MultiWriter` with `sha256.New()`; stored in `Client.LastHash` and `Client.LastPath` on success.
+- **Capture manifests**: `CaptureManifest`, `CaptureItem`, `TextCapture`, `CaptureOptions`, `VerificationResult` types in `internal/manifest/capture.go`.
+- **`.provenance/` filesystem**: write/read/verify functions — `WriteCaptureManifest`, `WriteCaptureItem`, `VerifyCaptureDir`, `FileSha256`, `ListRunManifests`.
+- **`collect sync --record`**: writes capture manifests to `<outputDir>/.provenance/`.
+- **`provenance manifest show/verify`**: display and verify capture manifests.
+
+## [0.3.1] - 2026-06-28
+
+### Added
+- **`internal/collection/`**: named, repeatable sync sources with seen-item tracking and incremental dedup.
+- **CLI**: `provenance collect {add,list,show,sync,remove}` with all grab flags, `--dry-run`, `--all`.
+- Collections persisted as JSON at `~/.cache/provenance/collections.json`.
+- Resume support: each sync creates a resumable session (`collect-<name>-<timestamp>`).
+
+### Changed
+- **Terminal summary**: every `grab` prints structured counts (discovered/downloaded/skipped/failed/output) via `CountsReporter` with atomic counters.
+- **TUI labels**: `"New download"` → `"New grab"` in main menu, form header, and runner title.
+- **Runtime messages**: `"provenance download --batch"` → `"provenance grab --batch"`; `"video(s)"` → `"item(s)"`.
+
+## [0.3.0] - 2026-06-20
+
+### Changed
+- **CLI**: Renamed `download` command to `grab`; `download` kept as hidden deprecated alias.
+- **Module**: Path changed from `github.com/skey/provenance` to `github.com/sk3y04/provenance`.
+- **Lint**: Migrated `.golangci.yml` to golangci-lint v2 format; added gosec exclusions.
+
+### Added
+- **`internal/resolve/`** package: shared result types (`Source`, `Item`, `MediaAsset`, `TextContent`) that all extractors normalise into.
+- **`internal/resolve/errors.go`**: standardised error categories (`auth`, `rate_limit`, `unavailable`, `unsupported_url`, `resolve_failure`, `transfer_failure`).
+- **Per-extractor adapters**: `YtdlpInfoToSource`, `TwTweetToItem`, `RdPostToItem`, `IgPostToItem` with canonical URLs, consistent `MediaKind`, `PublishedAt`, raw metadata.
+- **Per-extractor resolved scans**: `ScanYtdlpResolved`, `ScanTwitterResolved`, `ScanRedditResolved`, `ScanInstagramResolved`.
+- **`provenance scan --json`** now emits `[]resolve.Source` format with full metadata and raw platform payloads.
+- yt-dlp: `PublishedAt` now populated by parsing `upload_date` field.
+- Adapter fixture tests for all four extractors (`resolve_test.go`).
+- Integration test fixtures under `testdata/` (yt-dlp single/playlist, Reddit subreddit/user, Instagram profile).
+
+### Fixed
+- 15 unchecked error returns across the codebase (errcheck).
+- Ineffectual assignment: unchecked error from `app.Scan` in `scanCmd`.
+- Deprecated `cobra.ExactValidArgs` usage in completion command.
+- `time.Until` simplification in downloader speed limiter.
+- Two untagged switch statements converted to tagged switches in Instagram extractor.
+- Removed 8 unused functions/types/fields across browser, helpers, twitter, and tui packages.
+- Package comments added to 10 uncommented packages.
+
+## [0.2.1] - 2026-06-10
+
+### Security
+- **HIGH**: Error messages no longer embed raw API response bodies (could leak tokens/PII).
+- **HIGH**: Creator names from URL parsing now sanitized to prevent directory escape via `sanitizeFilename()`.
+- **MEDIUM**: Added `CheckRedirect` to all HTTP clients to block redirects to private/reserved IP ranges (SSRF prevention).
+- **MEDIUM**: Downloader uses `O_EXCL` for new `.part` files to prevent TOCTOU race.
+- **LOW**: Headless Chrome no longer uses `--no-sandbox` by default.
+- **LOW**: Session, watch, and history JSON files now written with `0o600` (owner-only) instead of `0o644`.
+- `SafeRedirect` now uses `req.URL.Hostname()` to prevent port-bearing SSRF bypass.
+- Guest bearer token now refreshed at runtime from X.com web client JS.
+
+### Added
+- Rate-limiter map eviction: idle entries cleaned up periodically, hard cap at 5000 entries.
+- Session store: retry-with-reload logic when `ErrConcurrentModification` encountered during save.
+- History store and watch store: package-level mutex for thread-safe read-modify-write.
+- Twitter query ID cache: upgraded `sync.Mutex` to `sync.RWMutex`.
+- CI: `.github/workflows/test.yml`, `Makefile`, `.golangci.yml`.
+- Comprehensive documentation: ARCHITECTURE, CLI, EXTRACTORS, CONFIGURATION, TUI, SESSIONS, WATCHES, COOKIES, EXAMPLES, TROUBLESHOOTING.
+
+### Fixed
+- Zombie process leak in `openPath` (`exec.Cmd.Start` without `Wait`).
+- Silent session data loss when optimistic concurrency check fails.
+- SSRF bypass for redirects to private hosts with explicit ports.
+
+## [0.2.0] - 2026-05-28
+
+### Added
+- `--include-posts` flag to download post text, links, and metadata as markdown (Twitter/Reddit/Instagram).
+- TUI: advanced options toggle in "New download" form (15 fields).
+- TUI: cookie file picker (`ctrl+f` in form).
+- TUI: watch subscription add form with full download flag support.
+- TUI: session export to JSON.
+- Reddit: route external embeds (Imgur, YouTube) through yt-dlp.
+
+### Fixed
+- Twitter JPG conversion filename append issue.
+- Index out of range in viewNewDownload when advanced options visible.
+- Syntax error in TUI form model.
+
+## [0.1.0] - 2026-05-01
+
+### Added
+- Architecture: config/app/tui clean separation, per-domain rate limiter, session optimistic concurrency.
+- Per-domain rate limiter (2 req/s X, 1 req/s Reddit, 10 req/s default).
+- Resumable named sessions with version-based optimistic concurrency and atomic writes.
+- Watch subscriptions for recurring downloads with session-backed resume.
+- Download history (last 25 runs) with rerun and reveal-in-finder.
+- Actionable failure hints for auth, rate limit, ffmpeg, disk full, unsupported site, DNS, network errors.
+- Twitter: improved rate-limit handling with Retry-After header support and `--limit` wiring.
+
+### Fixed
+- Speculative non-existent Imgur URL generation in Reddit extractor.
+- Worker pool: replace `time.After` with `time.NewTimer` to avoid timer leaks on context cancellation.
+- Reddit extractor: limit rate-limiter goroutines per paused fetch request to 20.
+
+### Added (Initial release — 2026-05-01)
+- Initial CLI: `download`, `scan`, `status`, `resume`, `retry-failed`, `sessions`, `watch`, `install`, `tui`, `completion`.
+- yt-dlp integration with auto-install, progress parsing, quality selectors, output templates.
+- Native Twitter/X extractor via GraphQL API (photos, videos, GIFs).
+- Native Reddit extractor via JSON API (images, galleries, Reddit video passthrough).
+- Headless Chrome browser fallback for JS-heavy sites (media sniffing, playlist crawling).
+- Resumable HTTP downloader with uTLS Chrome TLS fingerprinting and referer support.
+- Twitter: dynamic query ID refresh with stale-detection retry from X.com web client JS.
+- Bounded worker pool with 3-retry exponential backoff and permanent-error semantics.
+- CLI progress bars, desktop notifications via `beeep`.
+- Shell completion for bash, zsh, fish, powershell.
+
+### Fixed
+- Pre-existing flaky test `TestPoolContextCancellation`.
+- Twitter: check `http.NewRequestWithContext` errors instead of silently ignoring.
