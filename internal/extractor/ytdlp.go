@@ -19,6 +19,8 @@ import (
 	"github.com/lrstanley/go-ytdlp"
 
 	"github.com/sk3y04/provenance-engine/internal/downloader"
+	"github.com/sk3y04/provenance-engine/internal/engineerr"
+	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/resolve"
 )
@@ -55,6 +57,9 @@ type YtdlpOptions struct {
 	OutputTemplate     string // raw yt-dlp output template, relative to OutputDir unless absolute
 	SpeedLimit         int64  // bytes per second; 0 means unlimited
 	Progress           downloader.ProgressReporter
+	// Events, when set, receives structured progress/warning/item events. The
+	// reusable path never writes to the terminal when Events is set.
+	Events event.Sink
 	// MetadataDir is the subdirectory (relative to OutputDir) where yt-dlp
 	// sidecar files like *.info.json, *.description, *.jpg thumbnails, and
 	// subtitles will be placed. Empty means "_metadata"; set to "." to keep
@@ -113,24 +118,39 @@ func RunYtdlp(ctx context.Context, rawURL string, opts YtdlpOptions) error {
 // into the returned error so callers can pattern-match it.
 func runYtdlpInternal(ctx context.Context, rawURL string, opts YtdlpOptions) (string, error) {
 	if err := EnsureInstalled(ctx); err != nil {
-		return "", fmt.Errorf("install yt-dlp: %w", err)
+		return "", classifyYtdlpError(rawURL, err, "")
+	}
+
+	event.Emit(ctx, opts.Events, event.Event{
+		Kind: event.KindStageChanged, Stage: event.StageDownloading, URL: rawURL,
+	})
+	if opts.Progress == nil && opts.Events != nil {
+		opts.Progress = newEventProgress(opts.Events)
 	}
 
 	ffmpeg := hasFfmpeg()
 	if !ffmpeg {
-		ffmpegWarn.Do(func() {
-			fmt.Fprintln(os.Stderr,
-				"[provenance] WARNING: ffmpeg not found on PATH. Falling back to single-file "+
-					"downloads (no merge, no thumbnail embed, no audio-only conversion).")
-			fmt.Fprintln(os.Stderr,
-				"[provenance]   Install ffmpeg for full quality:")
-			fmt.Fprintln(os.Stderr,
-				"[provenance]     Windows: winget install Gyan.FFmpeg   (or)   choco install ffmpeg")
-			fmt.Fprintln(os.Stderr,
-				"[provenance]     macOS:   brew install ffmpeg")
-			fmt.Fprintln(os.Stderr,
-				"[provenance]     Linux:   sudo apt install ffmpeg")
-		})
+		if opts.Events != nil {
+			event.Emit(ctx, opts.Events, event.Event{
+				Kind: event.KindWarning, Stage: event.StageDownloading, URL: rawURL,
+				Reason: "ffmpeg_missing",
+				Detail: "ffmpeg not found on PATH; falling back to single-file downloads",
+			})
+		} else {
+			ffmpegWarn.Do(func() {
+				fmt.Fprintln(os.Stderr,
+					"[provenance] WARNING: ffmpeg not found on PATH. Falling back to single-file "+
+						"downloads (no merge, no thumbnail embed, no audio-only conversion).")
+				fmt.Fprintln(os.Stderr,
+					"[provenance]   Install ffmpeg for full quality:")
+				fmt.Fprintln(os.Stderr,
+					"[provenance]     Windows: winget install Gyan.FFmpeg   (or)   choco install ffmpeg")
+				fmt.Fprintln(os.Stderr,
+					"[provenance]     macOS:   brew install ffmpeg")
+				fmt.Fprintln(os.Stderr,
+					"[provenance]     Linux:   sudo apt install ffmpeg")
+			})
+		}
 	}
 
 	cmd := ytdlp.New()
@@ -148,7 +168,8 @@ func runYtdlpInternal(ctx context.Context, rawURL string, opts YtdlpOptions) (st
 
 	if opts.AudioOnly {
 		if !ffmpeg {
-			return "", fmt.Errorf("--audio-only requires ffmpeg; please install ffmpeg first")
+			return "", engineerr.Newf(engineerr.ExternalTool, "yt-dlp", rawURL,
+				"--audio-only requires ffmpeg; please install ffmpeg first")
 		}
 		cmd = cmd.ExtractAudio().AudioFormat("mp3").AudioQuality("0")
 	} else {
@@ -186,14 +207,18 @@ func runYtdlpInternal(ctx context.Context, rawURL string, opts YtdlpOptions) (st
 		addYtdlpArgs(execCmd, rawURL, ytdlpProgressArgs()...)
 	}
 	var stderrBuf bytes.Buffer
-	stdoutWriter := newYtdlpProgressWriter(rawURL, opts.Progress, os.Stdout, nil)
-	stderrWriter := newYtdlpProgressWriter(rawURL, opts.Progress, os.Stderr, &stderrBuf)
+	var stdoutFallback, stderrFallback io.Writer = os.Stdout, os.Stderr
+	if opts.Events != nil {
+		stdoutFallback, stderrFallback = nil, nil
+	}
+	stdoutWriter := newYtdlpProgressWriter(rawURL, opts.Progress, stdoutFallback, nil)
+	stderrWriter := newYtdlpProgressWriter(rawURL, opts.Progress, stderrFallback, &stderrBuf)
 	execCmd.Stdout = stdoutWriter
 	execCmd.Stderr = stderrWriter
 	if err := execCmd.Run(); err != nil {
 		stdoutWriter.finishAll(err)
 		stderrWriter.finishAll(err)
-		return stderrBuf.String(), fmt.Errorf("yt-dlp: %w", err)
+		return stderrBuf.String(), classifyYtdlpError(rawURL, err, stderrBuf.String())
 	}
 	stdoutWriter.finishAll(nil)
 	stderrWriter.finishAll(nil)
@@ -441,8 +466,11 @@ type ytdlpInfo struct {
 
 func ScanYtdlp(ctx context.Context, rawURL string, opts YtdlpOptions) (manifest.Manifest, error) {
 	if err := EnsureInstalled(ctx); err != nil {
-		return manifest.Manifest{}, fmt.Errorf("install yt-dlp: %w", err)
+		return manifest.Manifest{}, classifyYtdlpError(rawURL, err, "")
 	}
+	event.Emit(ctx, opts.Events, event.Event{
+		Kind: event.KindStageChanged, Stage: event.StageResolving, URL: rawURL,
+	})
 	cmd := ytdlp.New().Simulate().PrintJSON()
 	if opts.CookiesFile != "" {
 		cmd = cmd.Cookies(opts.CookiesFile)
@@ -454,7 +482,7 @@ func ScanYtdlp(ctx context.Context, rawURL string, opts YtdlpOptions) (manifest.
 	execCmd.Stdout = &stdoutBuf
 	execCmd.Stderr = &stderrBuf
 	if err := execCmd.Run(); err != nil {
-		return manifest.Manifest{}, fmt.Errorf("yt-dlp scan: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
+		return manifest.Manifest{}, classifyYtdlpError(rawURL, err, stderrBuf.String())
 	}
 	var items []manifest.Item
 	for _, line := range strings.Split(stdoutBuf.String(), "\n") {
@@ -597,8 +625,11 @@ func YtdlpInfoToSource(info ytdlpInfo, rawURL string) (resolve.Source, []resolve
 
 func ScanYtdlpResolved(ctx context.Context, rawURL string, opts YtdlpOptions) (resolve.Source, error) {
 	if err := EnsureInstalled(ctx); err != nil {
-		return resolve.Source{}, fmt.Errorf("install yt-dlp: %w", err)
+		return resolve.Source{}, classifyYtdlpError(rawURL, err, "")
 	}
+	event.Emit(ctx, opts.Events, event.Event{
+		Kind: event.KindStageChanged, Stage: event.StageResolving, URL: rawURL,
+	})
 	cmd := ytdlp.New().Simulate().PrintJSON()
 	if opts.CookiesFile != "" {
 		cmd = cmd.Cookies(opts.CookiesFile)
@@ -610,7 +641,7 @@ func ScanYtdlpResolved(ctx context.Context, rawURL string, opts YtdlpOptions) (r
 	execCmd.Stdout = &stdoutBuf
 	execCmd.Stderr = &stderrBuf
 	if err := execCmd.Run(); err != nil {
-		return resolve.Source{}, fmt.Errorf("yt-dlp scan: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
+		return resolve.Source{}, classifyYtdlpError(rawURL, err, stderrBuf.String())
 	}
 	src := resolve.NewSource(rawURL, "", resolve.KindSingle, "yt-dlp")
 	itemCount := 0
