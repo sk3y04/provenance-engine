@@ -645,3 +645,64 @@ Download/Resolve path. The public `engine/` facade is still Phase 4.
   `internal/dispatcher/events_test.go`, `internal/extractor/events_test.go`,
   `internal/app/app_test.go` (asserts no stderr with a sink and legacy stderr
   without one). No test contacts a live service.
+
+---
+
+## 11. Phase 4 implementation status
+
+Phase 4 created the public `engine/` facade (§3/§4) wrapping the Phase 3
+event-driven internals. No `internal/*` implementation modules were moved or
+copied.
+
+### Added
+
+- `engine/` public package: `Config`, `ResolveRequest`, `DownloadRequest`,
+  `FilterOptions`, `Source`/`Item`/`MediaAsset`/`TextContent`, `Artifact`,
+  `Counts`, `Result`; `Event`/`EventKind`/`Stage`/`EventSink` plus `NopSink`
+  and `SinkFunc`; `Error`/`ErrorKind` with `ErrorKindOf`/`IsErrorKind`.
+- `Engine.New` (explicit construction, no globals), `Engine.Config`,
+  `Engine.Resolve`, `Engine.Download`.
+- Bounded, panic-recovering event delivery via the Phase 3
+  `internal/event.Notifier`; a nil public sink becomes a discarding sink so the
+  wrapped paths never fall back to terminal output.
+- Artifact discovery: every regular file under `Config.WorkDir`, excluding
+  `_provenance_cache`/`.provenance` and `.part` files, with absolute path,
+  size, MIME type, and SHA-256.
+- Boundary defenses: request/URL/scheme/filter validation, `MaxItems` clamping,
+  per-call `Timeout`, pre-flight cancellation checks, and conversion of
+  recovered panics (e.g. the third-party yt-dlp installer) into typed errors so
+  a server cannot crash on them.
+- `engine/externaltest/` — a standalone external Go module (`replace ../..`)
+  importing only the facade; `make engine-example` builds it.
+- Tests: `engine/engine_test.go` (public API), `engine/engine_internal_test.go`
+  (mapping, artifact scan, error categorization, sinks),
+  `engine/example_test.go` (compile-time external usage). All hermetic; no live
+  service and no yt-dlp/ffmpeg invocation.
+- `docs/ENGINE.md`; `docs/ARCHITECTURE.md` facade layer and package entry.
+
+### Decisions taken (matching the approved document)
+
+- Public package location: `engine/` subpackage at the module root.
+- First web-supported operations: `Resolve` + `Download` only.
+- Error categories as §4.2; cancellation never re-categorized; unknown causes
+  map to `temporary` so they stay retryable by default.
+- Artifact output: controlled `WorkDir` only; `ArtifactSink` remains deferred.
+- The public event type keeps the Phase 3 field set (`Reason`, `Detail`, `Err`,
+  `Summary`) rather than the single `Message` string drafted in §4.2, so stable
+  facts stay machine-readable.
+
+### Deferred (unchanged from Phase 3)
+
+- CLI/TUI are not yet wired to the facade; wiring is Phase 5.
+- Native custom extractors (Instagram/X/Reddit/Album/browser narration) still
+  write some text directly to the terminal; event conversion of those paths
+  continues as needed. The generic yt-dlp path and top-level coordination are
+  fully event-driven.
+- `ArtifactSink`, and facades for archive/vault/encode/import remain deferred.
+
+### Verified
+
+- `go test -race ./engine/`, `go vet ./engine/`, and
+  `golangci-lint run ./...` pass; `go build ./cmd/provenance` still succeeds.
+- `cd engine/externaltest && go build ./...` compiles against the facade with
+  only exported identifiers.
