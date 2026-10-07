@@ -58,15 +58,21 @@ must never import, copy, or otherwise depend on private product code.
 ## Canonical commands
 
 ```bash
-make vet      # go vet ./...
-make lint     # golangci-lint run ./...
-make test     # go test -race ./...
-make build    # go build -o provenance ./cmd/provenance/
-gofmt -l .    # formatting check
+make vet              # go vet ./...
+make lint             # golangci-lint run ./...
+make test             # go test -race ./...
+make build            # go build -o provenance ./cmd/provenance/
+make engine-example   # compile the external-consumer module (engine/externaltest)
+make release-dry-run  # cross-compile release artifacts + checksums into dist/
+make fmt              # gofmt -l . (must print nothing)
+gofmt -l .            # formatting check
 ```
 
-CI additionally runs `go mod tidy` + diff check, installs ffmpeg, builds with
-`CGO_ENABLED=0` on Linux/macOS/Windows, and runs Snyk/dependency review.
+Release preparation, artifact naming, versioning, and open licensing questions
+are documented in `docs/RELEASING.md`. CI additionally runs `go mod tidy` + diff
+check, installs ffmpeg, builds with `CGO_ENABLED=0` on Linux/macOS/Windows,
+compiles the external consumer without a `replace` directive, and runs
+Snyk/dependency review.
 
 ## Environment prerequisites
 

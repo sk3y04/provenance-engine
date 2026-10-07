@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label for the dry run (builds artifacts, publishes nothing)'
+        required: false
+        default: 'dev'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${DISPATCH_VERSION:-dev}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run tests
+        run: make test
+
+      - name: Build provenance
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          rm -rf dist && mkdir -p dist
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            goos="${platform%/*}"
+            goarch="${platform#*/}"
+            ext=""
+            [[ "${goos}" == "windows" ]] && ext=".exe"
+            out="dist/provenance_${VERSION}_${goos}_${goarch}${ext}"
+            echo "building ${out}"
+            GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -o "${out}" ./cmd/provenance
+          done
+          (cd dist && sha256sum * > checksums.txt)
+          ls -l dist
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "See CHANGELOG for details." \
+            dist/*

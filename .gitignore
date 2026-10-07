@@ -5,6 +5,7 @@ _provenance_cache/
 __debug_bin
 *.test
 *.out
+/dist/
 .DS_Store
 **/.DS_Store
 .idea/

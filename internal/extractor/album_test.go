@@ -110,11 +110,11 @@ func TestAlbumScrapeFileListFromFixture(t *testing.T) {
 	}
 
 	want := []struct {
-		slug  string
-		name  string
-		kind  string
-		ext   string
-		page  string
+		slug string
+		name string
+		kind string
+		ext  string
+		page string
 	}{
 		{"aaa111bbb222", "pika_vid_01.mp4", "video", "mp4", fmt.Sprintf("https://%s/f/aaa111bbb222", host)},
 		{"ccc333ddd444", "pika_pic_02.jpg", "image", "jpg", fmt.Sprintf("https://%s/f/ccc333ddd444", host)},
@@ -181,14 +181,14 @@ func TestAlbumMaintenanceVID(t *testing.T) {
 // images/ vs videos/ subdirectory.
 func TestAlbumKindForName(t *testing.T) {
 	cases := map[string]string{
-		"f.mp4":   "video",
-		"f.webm":  "video",
-		"f.gifv":  "video",
-		"f.jpg":   "image",
-		"f.png":   "image",
-		"f.webp":  "image",
-		"noext":   "image", // default
-		"f.Bmp":   "image", // case-insensitive
+		"f.mp4":  "video",
+		"f.webm": "video",
+		"f.gifv": "video",
+		"f.jpg":  "image",
+		"f.png":  "image",
+		"f.webp": "image",
+		"noext":  "image", // default
+		"f.Bmp":  "image", // case-insensitive
 	}
 	for name, want := range cases {
 		if got := albKindForName(name); got != want {
