@@ -3,12 +3,15 @@
 ## Repository role
 
 This repository is the **public engine and CLI/TUI** repository.
-It is currently named `provenance` and will be renamed to `provenance-engine`
-(module path `github.com/sk3y04/provenance-engine`). A separate **private**
-repository will later take the name `provenance` and own the SaaS product.
+Its GitHub repository name and Go module path are still `provenance`
+(`github.com/sk3y04/provenance`) and will be renamed to `provenance-engine`
+(module path `github.com/sk3y04/provenance-engine`) in Phase 2. A separate
+**private** repository will later take the name `provenance` and own the SaaS
+product.
 
-The end-user command and built binary remain named **`provenance`** across the
-rename.
+The local checkout directory is already named `provenance-engine`; only the
+module path and remote repository name still need to change. The end-user
+command and built binary remain named **`provenance`** across the rename.
 
 Dependency direction is strictly one way:
 

@@ -8,16 +8,35 @@ snapshot, not a plan. The refactor plan is `docs/ENGINE_REFACTOR.md` (Phase 1).
 
 | Item | Observed |
 |------|----------|
-| Directory | `/home/anima/projects/provenance` |
-| Git repository | **Not a git repository** (`git status` fails: no `.git`) |
-| Branch / working tree | Not applicable — no VCS metadata present |
-| Uncommitted work | Cannot be determined; no VCS history is present on disk |
+| Working copy | `/home/anima/projects/provenance-workspace/provenance-engine` |
+| Git repository | Initialized for this phase (`git init`); no prior history on disk |
+| Branch | `master` (matches the branch targeted by CI) |
+| Baseline commit | `9a50a0f` — `chore: import public provenance baseline before phase 0` |
+| Working tree at baseline | Clean; binary and `downloads/` excluded by `.gitignore` |
 
-> Phase 0 expects a working tree and branch. This checkout has no `.git`
-> directory, so the "confirm branch / do not discard uncommitted work" step
-> cannot be satisfied locally. The human gate (`git commit`) is therefore
-> blocked until the directory is placed under version control or the real
-> working copy is used.
+### How this working copy was assembled
+
+The Phase 0 checkout was staged from the canonical working tree at
+`/home/anima/projects/provenance`, whose tracked engine source is byte-identical
+to this copy. The following tracked repository files were missing from the
+staging copy and were restored from that canonical checkout before the baseline
+commit, because Phase 0 must inventory CI and the canonical lint command:
+
+- `.github/workflows/ci.yml`
+- `.github/workflows/dependency-review.yml`
+- `.github/workflows/security.yml`
+- `.golangci.yml`
+- `.gitignore`
+
+Two items present in the canonical checkout are intentionally **not** part of
+this repository and remain at the workspace root:
+
+- `implementation-phases.md` (the migration execution plan).
+- `provenance-agent-rules/` (the private-repository rules pack, to be installed
+  in Phase 7).
+
+Local-only state (`.idea/`, `downloads/`, the built `provenance` binary) is
+git-ignored and was neither copied nor committed.
 
 ## Module path and Go version
 
@@ -26,15 +45,14 @@ snapshot, not a plan. The refactor plan is `docs/ENGINE_REFACTOR.md` (Phase 1).
 | Module path (current) | `github.com/sk3y04/provenance` |
 | Module path (target, Phase 2) | `github.com/sk3y04/provenance-engine` |
 | Go directive | `go 1.26.0` |
-| Toolchain observed | `go1.26.8-X:nodwarf5` |
+| Toolchain observed | `go1.26.8-X:nodwarf5 linux/amd64` |
 | Binary / command name | `provenance` (must remain unchanged) |
 | License | GPL-3.0 |
-| Root files | `README.md`, `TREEVIEW.md`, `CHANGELOG`, `CONTRIBUTING.md`, `Makefile`, `.golangci.yml`, `.gitignore`, `LICENSE`, `implementation-phases.md` |
-| Extra directory | `provenance-agent-rules/` (staging pack; see note below) |
+| Tracked root files | `AGENTS.md`, `CHANGELOG`, `CONTRIBUTING.md`, `LICENSE`, `Makefile`, `README.md`, `TREEVIEW.md`, `go.mod`, `go.sum`, `.gitignore`, `.golangci.yml`, `.github/` |
 
 ## Package inventory
 
-22 Go packages (`go list ./...`), 93 Go files, 28 test files.
+22 Go packages (`go list ./...`), 93 Go files, 29 test files.
 
 | Package | Role | Test files |
 |---------|------|-----------|
@@ -71,7 +89,7 @@ Root binary: `provenance`. Registered commands:
 - `status SESSION`
 - `resume SESSION`
 - `retry-failed SESSION`
-- `sessions` → `list`, `export <SESSION> <FILE>`, `clean <SESSION>`, `failed <SESSION> [FILE]`
+- `sessions` → `list`, `export SESSION FILE`, `clean SESSION`, `failed SESSION [FILE]`
 - `watch` → `add NAME URL`, `list`, `remove NAME`, `run [NAME]`
 - `collect` → `add NAME URL`, `list`, `show NAME`, `remove NAME`, `sync [NAME]`
 - `manifest` → `show PATH`, `verify DIR`
@@ -99,7 +117,7 @@ Branch targeted by CI is `master`, not `main`.
 
 ## Baseline check results
 
-Run from the repository root on the dates shown, without modifying behavior.
+Run from the repository root without modifying behavior.
 
 | Command | Result |
 |---------|--------|
@@ -108,8 +126,8 @@ Run from the repository root on the dates shown, without modifying behavior.
 | `go vet ./...` | Exit 0, no output |
 | `gofmt -l .` | **`internal/extractor/album_test.go` is unformatted** (pre-existing) |
 | `go test -race ./...` | Exit 0, all packages pass (no live-service tests) |
-| `go build -o /tmp/opencode/provenance-baseline ./cmd/provenance` | Exit 0, 27,763,490-byte binary |
-| `golangci-lint run ./...` | Exit 0, `0 issues` |
+| `go build -o /tmp/opencode/provenance-baseline ./cmd/provenance` | Exit 0, 27,767,890-byte binary |
+| `golangci-lint run ./...` | Exit 0, `0 issues` (v2.13.2) |
 | `go mod tidy -diff` | Exit 0, no changes (module files clean) |
 
 There are **no failing tests**. The only baseline defect is the unformatted
@@ -164,25 +182,17 @@ No secret values are recorded here; only locations.
 | `cookies.txt` (user-supplied, referenced by `--cookies`) | Platform session cookies |
 | `~/.cache/provenance/` | Default sessions/watch/history/collections storage |
 | GitHub `secrets.SNYK_TOKEN`, `vars.SNYK_ORG` | CI-only credentials/variables |
-| `.idea/` | JetBrains project files (git-ignored) |
 
 No `.env` file, credential file, or committed secret was found in the
-repository root.
-
-## Agent-instruction conflict note
-
-`provenance-agent-rules/` contains a staging pack whose root `AGENTS.md`
-declares itself "authoritative for the private `provenance` repository". That
-pack physically sits inside this public repository. Per the implementation
-plan, it is intended to be copied into the future private repository in
-Phase 7, not to govern this public repository now. The authoritative rules for
-this repository are the root `AGENTS.md` created in Phase 0. The staging pack
-was left in place unchanged because Phase 0 forbids file moves.
+repository. `.gitignore` excludes the build binary, `downloads/`,
+`_provenance_cache/`, and IDE files.
 
 ## Phase 0 acceptance status
 
 - Existing build/test status recorded honestly — yes (above).
 - Root `AGENTS.md` describes the public repository boundary — yes.
-- No runtime Go source changed — yes.
-- `git diff` contains only agent/documentation changes — **cannot be verified,
-  because the directory is not a git repository.**
+- No runtime Go source changed — yes; the only tracked changes are agent and
+  documentation files.
+- `git diff` contains only agent/documentation changes — verifiable now that
+  the repository is under version control; see `git status` / `git diff`
+  against baseline commit `9a50a0f`.
