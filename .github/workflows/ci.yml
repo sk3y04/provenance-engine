@@ -100,3 +100,28 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: go build -trimpath -o provenance ./cmd/provenance
+
+  external:
+    name: External consumer
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      # Compiles a separate module that imports only the public engine facade.
+      # It resolves the parent through the repository go.work, so no replace
+      # directive is used. See docs/RELEASING.md.
+      - name: Compile external consumer
+        run: make engine-example

@@ -1,0 +1,9 @@
+go 1.26.0
+
+// The workspace exists so the external-consumer module under engine/externaltest
+// can be compiled against this not-yet-tagged facade without a replace
+// directive. CI uses pinned tags instead. See docs/RELEASING.md.
+use (
+	.
+	./engine/externaltest
+)
