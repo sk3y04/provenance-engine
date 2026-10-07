@@ -10,6 +10,8 @@ provenance is a single-binary Go CLI/TUI tool that downloads media from diverse 
 ┌─────────────────────────────────────────────┐
 │  CLI (cobra)         │  TUI (Bubble Tea)    │  ← Transport
 ├─────────────────────────────────────────────┤
+│  engine (public facade)                     │  ← Public API
+├─────────────────────────────────────────────┤
 │  app.Download / app.Scan                    │  ← Application
 ├─────────────────────────────────────────────┤
 │  dispatcher.Classify → extractor → downloader│  ← Core
@@ -19,6 +21,7 @@ provenance is a single-binary Go CLI/TUI tool that downloads media from diverse 
 ```
 
 - **Transport layer** (`cmd/provenance/main.go`, `internal/tui/`): Accepts user input and renders output. The CLI is a cobra command tree; the TUI uses Bubble Tea's Elm Architecture (Model/Update/View).
+- **Public API layer** (`engine/`): A small, stable facade (`Engine.Resolve`, `Engine.Download`) over the application layer for external Go consumers such as a private server-side worker. It exposes only facade-owned DTOs, structured `Event`s, and typed `*Error`s; it never exposes `internal/*` types and never requires a terminal. See [`ENGINE.md`](ENGINE.md).
 - **Application layer** (`internal/app/app.go`): `app.Download`, `app.Scan`, and `app.ScanResolved` coordinate between transport and core. They receive URLs + options, call into the dispatcher, and surface errors with diagnostic hints.
 - **Core layer** (`internal/dispatcher/`, `internal/extractor/`, `internal/downloader/`, `internal/resolve/`): Classifies URLs, routes to extractors, downloads files, normalizes results into shared types.
 - **Shared services** (`internal/session/`, `internal/watch/`, `internal/history/`, `internal/manifest/`, `internal/resolve/`, `internal/config/`, `internal/worker/`, `internal/ratelimit/`, `internal/diagnose/`): Persistence, filtering, concurrency, rate limiting, failure diagnostics, shared result types.
@@ -318,6 +321,9 @@ Twitter imposes aggressive rate limits on guest tokens (~150 requests/15min). Re
 ---
 
 ## Package Reference
+
+### `engine`
+Public importable facade (`github.com/sk3y04/provenance-engine/engine`). Exposes `Config`, `ResolveRequest`, `DownloadRequest`, source/item/artifact/result DTOs, structured `Event`/`EventSink`, and typed `*Error` kinds. `Engine.Resolve` and `Engine.Download` wrap `internal/app`/`internal/dispatcher` and are safe for concurrent use with no package globals. The facade never exposes `internal/*` types, raw yt-dlp arguments, or output templates. Details and the external-consumer example live in [`ENGINE.md`](ENGINE.md).
 
 ### `config`
 `Config` struct with all user-configurable download options. JSON-serializable for session/watch/history persistence.
