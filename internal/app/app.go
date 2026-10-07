@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/sk3y04/provenance/internal/diagnose"
-	"github.com/sk3y04/provenance/internal/dispatcher"
-	"github.com/sk3y04/provenance/internal/manifest"
-	"github.com/sk3y04/provenance/internal/resolve"
+	"github.com/sk3y04/provenance-engine/internal/diagnose"
+	"github.com/sk3y04/provenance-engine/internal/dispatcher"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/resolve"
 )
 
 // Download dispatches one or more URLs for downloading. When batchPath is

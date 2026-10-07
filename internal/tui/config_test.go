@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/sk3y04/provenance/internal/ratelimit"
+	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 )
 
 func TestConfigPersistsFormValues(t *testing.T) {

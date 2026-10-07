@@ -13,7 +13,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/sk3y04/provenance/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
 )
 
 // ---------------------------------------------------------------------------

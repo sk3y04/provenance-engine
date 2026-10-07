@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/sk3y04/provenance/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/config"
 )
 
 func TestCollectionLifecycle(t *testing.T) {

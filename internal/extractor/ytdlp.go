@@ -18,9 +18,9 @@ import (
 
 	"github.com/lrstanley/go-ytdlp"
 
-	"github.com/sk3y04/provenance/internal/downloader"
-	"github.com/sk3y04/provenance/internal/manifest"
-	"github.com/sk3y04/provenance/internal/resolve"
+	"github.com/sk3y04/provenance-engine/internal/downloader"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/resolve"
 )
 
 // ffmpeg detection (cached). go-ytdlp does NOT auto-install ffmpeg, so we

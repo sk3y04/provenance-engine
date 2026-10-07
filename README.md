@@ -49,10 +49,17 @@ Single binary. No Python, Node, or runtime dependencies beyond [yt-dlp](https://
 ## Install
 
 ```bash
+# from a clone
 go build -o provenance ./cmd/provenance
 # or
 go install ./cmd/provenance
+
+# or install the module directly
+go install github.com/sk3y04/provenance-engine/cmd/provenance@latest
 ```
+
+The repository/module is `github.com/sk3y04/provenance-engine`; the installed
+binary and command remain `provenance`.
 
 Pre-warm tools into cache:
 

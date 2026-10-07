@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/sk3y04/provenance/internal/archive"
+	"github.com/sk3y04/provenance-engine/internal/archive"
 )
 
 var mu sync.Mutex

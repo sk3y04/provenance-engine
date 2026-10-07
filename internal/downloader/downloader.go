@@ -20,7 +20,7 @@ import (
 
 	"github.com/schollz/progressbar/v3"
 
-	"github.com/sk3y04/provenance/internal/ratelimit"
+	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 )
 
 const userAgent = "provenance/1.0"

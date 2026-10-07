@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/sk3y04/provenance/internal/config"
-	"github.com/sk3y04/provenance/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
 )
 
 func TestPartitionNewItemsSkipsSeenHashtagPosts(t *testing.T) {

@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sk3y04/provenance/internal/worker"
+	"github.com/sk3y04/provenance-engine/internal/worker"
 )
 
 // Options holds every flag for `provenance encode`, populated directly from

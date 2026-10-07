@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sk3y04/provenance/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/config"
 )
 
 func TestSessionLifecycle(t *testing.T) {

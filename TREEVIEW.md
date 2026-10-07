@@ -8,7 +8,7 @@ Every source and config file in the repository, with purpose, key exports, and i
 
 | Path | Purpose |
 |---|---|
-| `go.mod` | Go module `github.com/sk3y04/provenance`, Go 1.26, 11 direct dependencies |
+| `go.mod` | Go module `github.com/sk3y04/provenance-engine`, Go 1.26, 11 direct dependencies |
 | `go.sum` | Go module checksums |
 | `.gitignore` | Git ignore rules (binary, IDE files, `.cache`) |
 

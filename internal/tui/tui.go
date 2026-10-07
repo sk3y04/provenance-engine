@@ -9,14 +9,14 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/sk3y04/provenance/internal/archive"
-	"github.com/sk3y04/provenance/internal/collection"
-	"github.com/sk3y04/provenance/internal/config"
-	"github.com/sk3y04/provenance/internal/history"
-	"github.com/sk3y04/provenance/internal/manifest"
-	"github.com/sk3y04/provenance/internal/ratelimit"
-	"github.com/sk3y04/provenance/internal/session"
-	"github.com/sk3y04/provenance/internal/watch"
+	"github.com/sk3y04/provenance-engine/internal/archive"
+	"github.com/sk3y04/provenance-engine/internal/collection"
+	"github.com/sk3y04/provenance-engine/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/history"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/ratelimit"
+	"github.com/sk3y04/provenance-engine/internal/session"
+	"github.com/sk3y04/provenance-engine/internal/watch"
 )
 
 // Run launches the TUI and blocks until the user quits.

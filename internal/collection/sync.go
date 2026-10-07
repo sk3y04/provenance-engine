@@ -7,12 +7,12 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/sk3y04/provenance/internal/app"
-	"github.com/sk3y04/provenance/internal/config"
-	"github.com/sk3y04/provenance/internal/dispatcher"
-	"github.com/sk3y04/provenance/internal/manifest"
-	"github.com/sk3y04/provenance/internal/ratelimit"
-	"github.com/sk3y04/provenance/internal/session"
+	"github.com/sk3y04/provenance-engine/internal/app"
+	"github.com/sk3y04/provenance-engine/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/dispatcher"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/ratelimit"
+	"github.com/sk3y04/provenance-engine/internal/session"
 )
 
 type SyncOptions struct {

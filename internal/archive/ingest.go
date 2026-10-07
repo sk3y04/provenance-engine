@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sk3y04/provenance/internal/blobstore"
-	"github.com/sk3y04/provenance/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/blobstore"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
 )
 
 type IngestOptions struct {

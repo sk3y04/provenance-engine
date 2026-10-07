@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sk3y04/provenance/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
 )
 
 func TestParseIgURL(t *testing.T) {

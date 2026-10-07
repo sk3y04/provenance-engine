@@ -10,8 +10,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/sk3y04/provenance/internal/archive"
-	"github.com/sk3y04/provenance/internal/blobstore"
+	"github.com/sk3y04/provenance-engine/internal/archive"
+	"github.com/sk3y04/provenance-engine/internal/blobstore"
 )
 
 func newRevision(srcURL string, tool, toolVersion string) *archive.Revision {

@@ -7,8 +7,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/sk3y04/provenance/internal/archive"
-	"github.com/sk3y04/provenance/internal/catalog"
+	"github.com/sk3y04/provenance-engine/internal/archive"
+	"github.com/sk3y04/provenance-engine/internal/catalog"
 )
 
 func (m *model) loadVaultCmd() tea.Cmd {
