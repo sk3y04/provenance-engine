@@ -1,4 +1,4 @@
-module github.com/sk3y04/provenance
+module github.com/sk3y04/provenance-engine
 
 go 1.26.0
 

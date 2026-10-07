@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/sk3y04/provenance/internal/blobstore"
+	"github.com/sk3y04/provenance-engine/internal/blobstore"
 )
 
 func GarbageCollect(vaultRoot string, dryRun bool) ([]string, error) {

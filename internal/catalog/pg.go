@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/sk3y04/provenance/internal/archive"
+	"github.com/sk3y04/provenance-engine/internal/archive"
 )
 
 type PgStore struct {

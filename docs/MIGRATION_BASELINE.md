@@ -42,8 +42,12 @@ git-ignored and was neither copied nor committed.
 
 | Item | Value |
 |------|-------|
-| Module path (current) | `github.com/sk3y04/provenance` |
+| Module path (at Phase 0) | `github.com/sk3y04/provenance` |
 | Module path (target, Phase 2) | `github.com/sk3y04/provenance-engine` |
+
+> Phase 2 has since changed the module path to
+> `github.com/sk3y04/provenance-engine`; see `docs/MIGRATION.md`. The row above
+> records the Phase 0 snapshot.
 | Go directive | `go 1.26.0` |
 | Toolchain observed | `go1.26.8-X:nodwarf5 linux/amd64` |
 | Binary / command name | `provenance` (must remain unchanged) |

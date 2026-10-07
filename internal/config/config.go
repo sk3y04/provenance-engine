@@ -2,7 +2,7 @@
 // the dispatcher, session, watch, and history packages.
 package config
 
-import "github.com/sk3y04/provenance/internal/manifest"
+import "github.com/sk3y04/provenance-engine/internal/manifest"
 
 type Config struct {
 	OutputDir          string                 `json:"output_dir"`

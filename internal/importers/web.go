@@ -12,8 +12,8 @@ import (
 
 	"github.com/chromedp/chromedp"
 
-	"github.com/sk3y04/provenance/internal/archive"
-	"github.com/sk3y04/provenance/internal/blobstore"
+	"github.com/sk3y04/provenance-engine/internal/archive"
+	"github.com/sk3y04/provenance-engine/internal/blobstore"
 )
 
 func ImportWeb(vaultRoot, seedURL, scope string, maxPages int, screenshot bool, collectionName, chromePath string) (*archive.Revision, error) {

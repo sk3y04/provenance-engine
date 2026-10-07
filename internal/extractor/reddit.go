@@ -15,11 +15,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sk3y04/provenance/internal/downloader"
-	"github.com/sk3y04/provenance/internal/manifest"
-	"github.com/sk3y04/provenance/internal/ratelimit"
-	"github.com/sk3y04/provenance/internal/resolve"
-	"github.com/sk3y04/provenance/internal/worker"
+	"github.com/sk3y04/provenance-engine/internal/downloader"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/ratelimit"
+	"github.com/sk3y04/provenance-engine/internal/resolve"
+	"github.com/sk3y04/provenance-engine/internal/worker"
 )
 
 const (

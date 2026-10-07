@@ -9,8 +9,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/sk3y04/provenance/internal/dispatcher"
-	"github.com/sk3y04/provenance/internal/session"
+	"github.com/sk3y04/provenance-engine/internal/dispatcher"
+	"github.com/sk3y04/provenance-engine/internal/session"
 )
 
 // ---------------------------------------------------------------------------

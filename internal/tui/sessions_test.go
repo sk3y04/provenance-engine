@@ -7,9 +7,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/sk3y04/provenance/internal/config"
-	"github.com/sk3y04/provenance/internal/ratelimit"
-	"github.com/sk3y04/provenance/internal/session"
+	"github.com/sk3y04/provenance-engine/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/ratelimit"
+	"github.com/sk3y04/provenance-engine/internal/session"
 )
 
 // TestFKeyFromSessionsList ensures pressing "f" in the sessions list opens

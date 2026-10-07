@@ -7,8 +7,8 @@ import (
 
 	"github.com/ledongthuc/pdf"
 
-	"github.com/sk3y04/provenance/internal/archive"
-	"github.com/sk3y04/provenance/internal/blobstore"
+	"github.com/sk3y04/provenance-engine/internal/archive"
+	"github.com/sk3y04/provenance-engine/internal/blobstore"
 )
 
 func ImportPDF(vaultRoot, pdfPath, collectionName string) (*archive.Revision, error) {

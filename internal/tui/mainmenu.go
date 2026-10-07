@@ -11,15 +11,15 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/sk3y04/provenance/internal/archive"
-	"github.com/sk3y04/provenance/internal/catalog"
-	"github.com/sk3y04/provenance/internal/config"
-	"github.com/sk3y04/provenance/internal/dispatcher"
-	"github.com/sk3y04/provenance/internal/encode"
-	"github.com/sk3y04/provenance/internal/extractor"
-	"github.com/sk3y04/provenance/internal/importers"
-	"github.com/sk3y04/provenance/internal/manifest"
-	"github.com/sk3y04/provenance/internal/session"
+	"github.com/sk3y04/provenance-engine/internal/archive"
+	"github.com/sk3y04/provenance-engine/internal/catalog"
+	"github.com/sk3y04/provenance-engine/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/dispatcher"
+	"github.com/sk3y04/provenance-engine/internal/encode"
+	"github.com/sk3y04/provenance-engine/internal/extractor"
+	"github.com/sk3y04/provenance-engine/internal/importers"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/session"
 )
 
 // ---------------------------------------------------------------------------

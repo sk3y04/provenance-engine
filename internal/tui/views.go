@@ -13,8 +13,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/sk3y04/provenance/internal/history"
-	"github.com/sk3y04/provenance/internal/session"
+	"github.com/sk3y04/provenance-engine/internal/history"
+	"github.com/sk3y04/provenance-engine/internal/session"
 )
 
 // ---------------------------------------------------------------------------

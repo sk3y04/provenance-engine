@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sk3y04/provenance/internal/ratelimit"
+	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 )
 
 // twRequireAuthCookies validates that the supplied Netscape cookie file carries

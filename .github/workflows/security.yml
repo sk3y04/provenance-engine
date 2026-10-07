@@ -54,7 +54,7 @@ jobs:
             --file=go.mod
             --severity-threshold=high
             --fail-on=upgradable
-            --project-name=sk3y04/provenance
+            --project-name=sk3y04/provenance-engine
             --target-reference="${TARGET_REF}"
             --sarif-file-output=snyk.sarif
           )

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sk3y04/provenance/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/config"
 )
 
 func TestWatchStoreLifecycle(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sk3y04/provenance/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
 )
 
 func loadTestFixture(t *testing.T, name string) []byte {

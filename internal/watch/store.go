@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sk3y04/provenance/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/config"
 )
 
 var storeMu sync.Mutex

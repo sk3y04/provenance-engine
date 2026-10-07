@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sk3y04/provenance/internal/resolve"
+	"github.com/sk3y04/provenance-engine/internal/resolve"
 )
 
 func TestYtdlpInfoToSource(t *testing.T) {
