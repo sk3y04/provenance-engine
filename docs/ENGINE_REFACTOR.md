@@ -706,3 +706,77 @@ copied.
   `golangci-lint run ./...` pass; `go build ./cmd/provenance` still succeeds.
 - `cd engine/externaltest && go build ./...` compiles against the facade with
   only exported identifiers.
+
+---
+
+## 12. Phase 5 implementation status
+
+Phase 5 wires the public CLI's canonical Download workflow through the Phase 4
+facade. No `internal/*` implementation was moved or copied and the public
+facade API was not changed.
+
+### Added
+
+- `cmd/provenance/engine_adapter.go` — the CLI adapter:
+  - `facadeGrabCompatible` decides whether an invocation can run through the
+    facade without behavior change.
+  - `engineConfigFromOptions` / `engineFilterFromOptions` map the parsed cobra
+    flags onto `engine.Config` / `engine.FilterOptions`. The CLI's unbounded
+    default (`--limit 0`) maps to a large sentinel `MaxItems` so the facade's
+    required positive bound preserves the historical "no limit" behavior.
+  - `runGrabViaFacade` invokes `Engine.Download` once per URL, aggregates the
+    typed `Result.Counts`, and reuses `dispatcher.PrintSummary` for the exact
+    legacy summary (including the `output:` line).
+  - `cliEventSink` implements `engine.EventSink`, reusing the shared
+    `internal/render.Sink` formatting for stage/warning/retry/item events and
+    suppressing the per-call `EventSummary` so the caller can emit one legacy
+    summary at the end.
+  - `exitCode` documents the engine-error → exit-code mapping.
+- `cmd/provenance/engine_adapter_test.go` — flag mapping, facade-compatibility
+  decisions, event-sink rendering, and exit-code regression tests. No test
+  contacts a live service.
+
+### Wired
+
+- `cmd/provenance/main.go` `grab`: when `facadeGrabCompatible` is true the
+  command calls `runGrabViaFacade`; otherwise it keeps the legacy
+  `app.Download` path. `main` now exits via `exitCode(err)`.
+- The same `Engine.Download` a future private worker imports is therefore
+  exercised by normal CLI downloads.
+
+### Decisions taken
+
+- End-user rendering reuses `internal/render.Sink` (the Phase 3 tested adapter)
+  by converting the facade event back to the internal event type. Terminal
+  formatting stays out of the facade and out of reusable paths.
+- Stage events are now rendered by the CLI for the generic path where yt-dlp
+  narration previously wrote directly; this is an intentional, documented
+  stderr change (event-driven output replaces tool narration).
+- `exitCode` maps every engine category to `1` today, preserving the historical
+  `0` success / `1` error contract; the switch is the single place to add
+  distinct codes later.
+
+### Transitional paths (documented bypasses)
+
+- `--dry-run`, `--filename-template`, `--batch`, and `--session` keep the
+  legacy internal path because the facade deliberately does not expose them.
+- Non-standard `--quality` values and bare (non-http/https, non-hashtag)
+  sources keep the legacy path, since the facade validates both.
+- `scan` (including `--json` raw `resolve.Source` and `--save`
+  `[]manifest.Manifest`) stays on internals; the facade's `Resolve` returns a
+  facade-owned `Source`, so routing scan through it would change the documented
+  JSON/match contract.
+- TUI (`internal/tui`) still uses the dispatcher directly; it is not yet a
+  facade consumer.
+- Native custom extractors still write some narration to the terminal.
+
+These are the only remaining direct Resolve/Download bypasses.
+
+### Verified
+
+- `gofmt -l cmd/provenance` clean; `go vet ./...`; `golangci-lint run ./...`
+  (0 issues); `go test ./...` and `go test -race ./cmd/provenance/` pass;
+  `go build ./cmd/provenance/` and `make engine-example` succeed.
+- Smoke: `provenance grab "https://"` exercises the facade path (typed
+  validation error, exit 1); `provenance grab` with no args preserves the
+  legacy validation message.

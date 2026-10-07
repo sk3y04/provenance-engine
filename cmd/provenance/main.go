@@ -189,7 +189,7 @@ search. No runtime dependencies beyond yt-dlp + ffmpeg.`,
 		if hint := diagnose.Hint(err); hint != "" {
 			fmt.Fprintln(os.Stderr, "hint:", hint)
 		}
-		os.Exit(1)
+		os.Exit(exitCode(err))
 	}
 }
 
@@ -228,6 +228,14 @@ func downloadCmd() *cobra.Command {
 			}
 			if flagSession != "" {
 				return runSessionDownload(ctx, flagSession, args, flagBatch, opts)
+			}
+			// Route the canonical single/multi-URL grab through the public
+			// engine facade. Invocations using flags the facade does not expose
+			// (dry-run, batch, filename template, non-standard quality) or
+			// non-http sources keep the legacy internal path. See
+			// docs/ENGINE_REFACTOR.md.
+			if facadeGrabCompatible(args) {
+				return runGrabViaFacade(ctx, args, opts)
 			}
 			return app.Download(ctx, args, flagBatch, opts)
 		},
