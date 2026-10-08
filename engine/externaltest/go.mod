@@ -6,4 +6,4 @@
 // run `go mod tidy` here before the tag. See docs/RELEASING.md.
 module github.com/sk3y04/provenance-engine/engine/externaltest
 
-go 1.26.0
+go 1.27.2

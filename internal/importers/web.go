@@ -149,18 +149,26 @@ func capturePage(ctx context.Context, pageURL string, screenshot bool) (*pageDat
 	timeoutCtx, cancelTimeout := context.WithTimeout(tabCtx, 30*time.Second)
 	defer cancelTimeout()
 
-	var title, html, text string
-
-	actions := []chromedp.Action{
+	if err := chromedp.Do(timeoutCtx,
 		chromedp.Navigate(pageURL),
-		chromedp.WaitReady("body"),
-		chromedp.Sleep(3 * time.Second),
-		chromedp.Title(&title),
-		chromedp.OuterHTML("html", &html),
-		chromedp.JavascriptAttribute("document.body", "innerText", &text, chromedp.ByJSPath),
+		chromedp.WaitReady(chromedp.CSS("body")),
+		chromedp.Sleep(3*time.Second),
+	); err != nil {
+		return nil, fmt.Errorf("capture %s: %w", pageURL, err)
 	}
 
-	if err := chromedp.Run(timeoutCtx, actions...); err != nil {
+	title, err := chromedp.Run(timeoutCtx, chromedp.Title())
+	if err != nil {
+		return nil, fmt.Errorf("capture %s: %w", pageURL, err)
+	}
+
+	html, err := chromedp.Run(timeoutCtx, chromedp.OuterHTML(chromedp.CSS("html")))
+	if err != nil {
+		return nil, fmt.Errorf("capture %s: %w", pageURL, err)
+	}
+
+	text, err := chromedp.Run(timeoutCtx, chromedp.Evaluate[string]("document.body.innerText"))
+	if err != nil {
 		return nil, fmt.Errorf("capture %s: %w", pageURL, err)
 	}
 
@@ -179,13 +187,15 @@ func discoverLinks(ctx context.Context, pageURL string) ([]string, error) {
 	timeoutCtx, cancelTimeout := context.WithTimeout(tabCtx, 15*time.Second)
 	defer cancelTimeout()
 
-	var links []string
 	js := `Array.from(document.querySelectorAll('a[href]')).map(a => a.href).filter(h => h.startsWith('http'))`
-	if err := chromedp.Run(timeoutCtx,
+	if err := chromedp.Do(timeoutCtx,
 		chromedp.Navigate(pageURL),
-		chromedp.WaitReady("body"),
-		chromedp.Evaluate(js, &links),
+		chromedp.WaitReady(chromedp.CSS("body")),
 	); err != nil {
+		return nil, err
+	}
+	links, err := chromedp.Run(timeoutCtx, chromedp.Evaluate[[]string](js))
+	if err != nil {
 		return nil, err
 	}
 

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Minimum Go version is now 1.27** (`go.mod` `go 1.27.2`), required by the
+  upgraded `github.com/lrstanley/go-ytdlp v1.5.4`. Consumers must build with
+  Go 1.27 or newer.
+- Dependency refresh: `chromedp` v0.20.1 (and `cdproto` v0.157.9), `pgx/v5`
+  v5.11.0, `go-ytdlp` v1.5.4, `klauspost/compress` v1.20.1, and current
+  `golang.org/x/{crypto,sync,sys,term,text,time}`. The headless-Chrome paths
+  were migrated to chromedp's generic action API (`Action[T]`, typed selectors,
+  `Events` iterators); behavior is unchanged.
+
 ## [0.7.0] - 2026-10-08
 
 ### Added
