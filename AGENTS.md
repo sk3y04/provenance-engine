@@ -76,7 +76,7 @@ Snyk/dependency review.
 
 ## Environment prerequisites
 
-- Go 1.26+ (see `go.mod`).
+- Go 1.27+ (see `go.mod`).
 - `golangci-lint` v2.x for `make lint`.
 - `cc`/race support for `make test` (`-race`).
 - `ffmpeg` and `yt-dlp` for full download/integration behavior (yt-dlp auto-installs on first use; tests must not depend on live services).

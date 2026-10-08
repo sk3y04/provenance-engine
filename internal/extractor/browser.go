@@ -102,8 +102,12 @@ func SniffMediaURL(ctx context.Context, pageURL string, opts BrowserOptions) (st
 	found := make(chan string, 1)
 	fetchSem := make(chan struct{}, 20)
 
-	chromedp.ListenTarget(timeoutCtx, func(ev interface{}) {
-		if e, ok := ev.(*fetch.EventRequestPaused); ok {
+	events := chromedp.Events(timeoutCtx, fetch.RequestPaused)
+	go func() {
+		for e, err := range events {
+			if err != nil {
+				return
+			}
 			u := e.Request.URL
 			if looksLikeMedia(u) {
 				select {
@@ -114,40 +118,40 @@ func SniffMediaURL(ctx context.Context, pageURL string, opts BrowserOptions) (st
 			fetchSem <- struct{}{}
 			go func(id fetch.RequestID) {
 				defer func() { <-fetchSem }()
-				_ = fetch.ContinueRequest(id).Do(timeoutCtx)
+				_, _ = chromedp.Call(timeoutCtx, fetch.ContinueRequest, fetch.ContinueRequestParams{RequestID: id})
 			}(e.RequestID)
 		}
-	})
-
-	actions := []chromedp.Action{fetch.Enable()}
-
-	if opts.CookiesFile != "" {
-		cookies, err := loadNetscapeCookies(opts.CookiesFile)
-		if err != nil {
-			return "", fmt.Errorf("load cookies: %w", err)
-		}
-		actions = append(actions, chromedp.ActionFunc(func(c context.Context) error {
-			for _, ck := range cookies {
-				exp := cdp.TimeSinceEpoch(time.Unix(ck.Expires, 0))
-				if err := network.SetCookie(ck.Name, ck.Value).
-					WithDomain(ck.Domain).
-					WithPath(ck.Path).
-					WithSecure(ck.Secure).
-					WithHTTPOnly(ck.HTTPOnly).
-					WithExpires(&exp).
-					Do(c); err != nil {
-					return err
-				}
-			}
-			return nil
-		}))
-	}
-
-	actions = append(actions, chromedp.Navigate(pageURL))
+	}()
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- chromedp.Run(timeoutCtx, actions...)
+		if _, err := chromedp.Call(timeoutCtx, fetch.Enable, fetch.EnableParams{}); err != nil {
+			errCh <- fmt.Errorf("enable fetch: %w", err)
+			return
+		}
+		if opts.CookiesFile != "" {
+			cookies, err := loadNetscapeCookies(opts.CookiesFile)
+			if err != nil {
+				errCh <- fmt.Errorf("load cookies: %w", err)
+				return
+			}
+			for _, ck := range cookies {
+				params := network.SetCookieParams{
+					Name:     ck.Name,
+					Value:    ck.Value,
+					Domain:   ck.Domain,
+					Path:     ck.Path,
+					Secure:   &ck.Secure,
+					HTTPOnly: &ck.HTTPOnly,
+					Expires:  cdp.TimeSinceEpoch(ck.Expires),
+				}
+				if _, err := chromedp.Call(timeoutCtx, network.SetCookie, params); err != nil {
+					errCh <- fmt.Errorf("set cookie: %w", err)
+					return
+				}
+			}
+		}
+		errCh <- chromedp.Do(timeoutCtx, chromedp.Navigate(pageURL))
 	}()
 
 	select {
@@ -321,38 +325,36 @@ func ScrapeVideoLinks(ctx context.Context, pageURL, cookiesFile string, timeout 
 	timeoutCtx, cancelTimeout := context.WithTimeout(browserCtx, timeout)
 	defer cancelTimeout()
 
-	actions := []chromedp.Action{}
-
 	if cookiesFile != "" {
 		cookies, err := loadNetscapeCookies(cookiesFile)
 		if err != nil {
 			return nil, fmt.Errorf("load cookies: %w", err)
 		}
-		actions = append(actions, chromedp.ActionFunc(func(c context.Context) error {
-			for _, ck := range cookies {
-				exp := cdp.TimeSinceEpoch(time.Unix(ck.Expires, 0))
-				if err := network.SetCookie(ck.Name, ck.Value).
-					WithDomain(ck.Domain).
-					WithPath(ck.Path).
-					WithSecure(ck.Secure).
-					WithHTTPOnly(ck.HTTPOnly).
-					WithExpires(&exp).
-					Do(c); err != nil {
-					return err
-				}
+		for _, ck := range cookies {
+			params := network.SetCookieParams{
+				Name:     ck.Name,
+				Value:    ck.Value,
+				Domain:   ck.Domain,
+				Path:     ck.Path,
+				Secure:   &ck.Secure,
+				HTTPOnly: &ck.HTTPOnly,
+				Expires:  cdp.TimeSinceEpoch(ck.Expires),
 			}
-			return nil
-		}))
+			if _, err := chromedp.Call(timeoutCtx, network.SetCookie, params); err != nil {
+				return nil, fmt.Errorf("set cookie: %w", err)
+			}
+		}
 	}
 
-	var hrefs []string
-	actions = append(actions,
+	if err := chromedp.Do(timeoutCtx,
 		chromedp.Navigate(pageURL),
-		chromedp.WaitReady("body", chromedp.ByQuery),
-		chromedp.Evaluate(`Array.from(document.querySelectorAll('a[href]')).map(a => a.href)`, &hrefs),
-	)
+		chromedp.WaitReady(chromedp.CSS("body")),
+	); err != nil {
+		return nil, fmt.Errorf("chromedp run: %w", err)
+	}
 
-	if err := chromedp.Run(timeoutCtx, actions...); err != nil {
+	hrefs, err := chromedp.Run(timeoutCtx, chromedp.Evaluate[[]string](`Array.from(document.querySelectorAll('a[href]')).map(a => a.href)`))
+	if err != nil {
 		return nil, fmt.Errorf("chromedp run: %w", err)
 	}
 
@@ -442,25 +444,22 @@ func ScrapePlaylistVideoLinks(ctx context.Context, pageURL, cookiesFile, chromeP
 			return nil, fmt.Errorf("load cookies: %w", err)
 		}
 		injectCtx, cancelInject := context.WithTimeout(browserCtx, 15*time.Second)
-		err = chromedp.Run(injectCtx, chromedp.ActionFunc(func(c context.Context) error {
-			for _, ck := range cookies {
-				exp := cdp.TimeSinceEpoch(time.Unix(ck.Expires, 0))
-				if err := network.SetCookie(ck.Name, ck.Value).
-					WithDomain(ck.Domain).
-					WithPath(ck.Path).
-					WithSecure(ck.Secure).
-					WithHTTPOnly(ck.HTTPOnly).
-					WithExpires(&exp).
-					Do(c); err != nil {
-					return err
-				}
+		for _, ck := range cookies {
+			params := network.SetCookieParams{
+				Name:     ck.Name,
+				Value:    ck.Value,
+				Domain:   ck.Domain,
+				Path:     ck.Path,
+				Secure:   &ck.Secure,
+				HTTPOnly: &ck.HTTPOnly,
+				Expires:  cdp.TimeSinceEpoch(ck.Expires),
 			}
-			return nil
-		}))
-		cancelInject()
-		if err != nil {
-			return nil, fmt.Errorf("inject cookies: %w", err)
+			if _, err := chromedp.Call(injectCtx, network.SetCookie, params); err != nil {
+				cancelInject()
+				return nil, fmt.Errorf("inject cookies: %w", err)
+			}
 		}
+		cancelInject()
 	}
 
 	videoPatterns := []string{"/video", "/videos/", "/watch", "/embed/", "/v/", "/player/"}
@@ -470,9 +469,11 @@ func ScrapePlaylistVideoLinks(ctx context.Context, pageURL, cookiesFile, chromeP
 	// into returning "context canceled" on subsequent Runs (the browser target
 	// goroutine reacts to cancel signals). Instead we run in a goroutine and
 	// select on time.After for the per-page timeout.
-	if err := runChromedpWithTimeout(ctx, browserCtx, perPageTimeout, "initial navigate",
-		chromedp.Navigate(pageURL),
-		chromedp.WaitReady("body", chromedp.ByQuery),
+	if _, err := runChromedpWithTimeout(ctx, browserCtx, perPageTimeout, "initial navigate",
+		chromedp.Steps(
+			chromedp.Navigate(pageURL),
+			chromedp.WaitReady(chromedp.CSS("body")),
+		),
 	); err != nil {
 		return nil, err
 	}
@@ -485,10 +486,10 @@ func ScrapePlaylistVideoLinks(ctx context.Context, pageURL, cookiesFile, chromeP
 	// scrapeVideoHrefs returns the set of href values on the current page that
 	// look like individual video pages on the same host.
 	scrapeVideoHrefs := func() ([]string, error) {
-		var hrefs []string
-		if err := runChromedpWithTimeout(ctx, browserCtx, perPageTimeout, "scrape hrefs",
-			chromedp.Evaluate(`Array.from(document.querySelectorAll('a[href]')).map(a => a.href)`, &hrefs),
-		); err != nil {
+		hrefs, err := runChromedpWithTimeout(ctx, browserCtx, perPageTimeout, "scrape hrefs",
+			chromedp.Evaluate[[]string](`Array.from(document.querySelectorAll('a[href]')).map(a => a.href)`),
+		)
+		if err != nil {
 			return nil, err
 		}
 		var out []string
@@ -576,23 +577,15 @@ func ScrapePlaylistVideoLinks(ctx context.Context, pageURL, cookiesFile, chromeP
 `
 
 	clickNext := func() (bool, error) {
-		var clicked bool
-		if err := runChromedpWithTimeout(ctx, browserCtx, perPageTimeout, "click next",
-			chromedp.Evaluate(clickNextJS, &clicked),
-		); err != nil {
-			return false, err
-		}
-		return clicked, nil
+		return runChromedpWithTimeout(ctx, browserCtx, perPageTimeout, "click next",
+			chromedp.Evaluate[bool](clickNextJS),
+		)
 	}
 
 	fingerprint := func() (string, error) {
-		var fp string
-		if err := runChromedpWithTimeout(ctx, browserCtx, perPageTimeout, "fingerprint",
-			chromedp.Evaluate(fingerprintJS, &fp),
-		); err != nil {
-			return "", err
-		}
-		return fp, nil
+		return runChromedpWithTimeout(ctx, browserCtx, perPageTimeout, "fingerprint",
+			chromedp.Evaluate[string](fingerprintJS),
+		)
 	}
 
 	// waitForChange polls the page fingerprint until it differs from `prev`
@@ -689,24 +682,30 @@ func matchesAny(s string, subs []string) bool {
 // clock timeout by deriving a child context from chromeCtx. chromedp.Run
 // respects context cancellation, so when the timeout fires chromedp stops
 // cleanly without leaking goroutines or browser targets.
-func runChromedpWithTimeout(parent context.Context, chromeCtx context.Context, timeout time.Duration, label string, actions ...chromedp.Action) error {
+func runChromedpWithTimeout[T any](parent context.Context, chromeCtx context.Context, timeout time.Duration, label string, action chromedp.Action[T]) (T, error) {
+	var zero T
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 	runCtx, cancel := context.WithTimeout(chromeCtx, timeout)
 	defer cancel()
 
-	done := make(chan error, 1)
+	type result struct {
+		value T
+		err   error
+	}
+	done := make(chan result, 1)
 	go func() {
-		done <- chromedp.Run(runCtx, actions...)
+		value, err := chromedp.Run(runCtx, action)
+		done <- result{value: value, err: err}
 	}()
 	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("%s: %w", label, err)
+	case r := <-done:
+		if r.err != nil {
+			return zero, fmt.Errorf("%s: %w", label, r.err)
 		}
-		return nil
+		return r.value, nil
 	case <-parent.Done():
-		return fmt.Errorf("%s: %w", label, parent.Err())
+		return zero, fmt.Errorf("%s: %w", label, parent.Err())
 	}
 }

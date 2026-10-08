@@ -12,7 +12,7 @@ legal review before the first tag.
 | Public facade | `github.com/sk3y04/provenance-engine/engine` |
 | CLI binary / command | `provenance` (unchanged across the repository rename) |
 | License | MIT (`LICENSE`) |
-| Go version | 1.26 (see `go.mod`) |
+| Go version | 1.27 (see `go.mod`) |
 
 Published release assets are the `provenance` CLI, named
 `provenance_<version>_<os>_<arch>[.exe]`, plus `checksums.txt`. The Go module

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Go 1.26** or later
+- **Go 1.27** or later
 - **Chrome/Chromium** (for browser extractor tests - not required for unit tests)
 - **yt-dlp** auto-installed on first build (no manual setup needed)
 
