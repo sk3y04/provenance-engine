@@ -86,9 +86,9 @@ tag (then `go mod tidy` is safe again).
 - The CHANGELOG already consumed `0.1.0` through `0.6.1` and the CLI reports
   `0.7.0`, so the first engine release is **`v0.7.0`**, continuing the existing
   sequence rather than restarting at `v0.1.0`.
-- The CLI's `--version` string is hardcoded (`0.7.0` in `cmd/provenance/main.go`)
-  and now matches the first release tag; future releases should keep them in
-  step or inject the version via `-ldflags`.
+- The CLI's `--version` string is hardcoded (`0.8.0` in `cmd/provenance/main.go`)
+  and is kept in step with each release tag; alternatively inject the version
+  via `-ldflags`.
 - The rename from `github.com/sk3y04/provenance` is a breaking import-path
   change; it is recorded in `CHANGELOG` and `docs/MIGRATION.md` and must be
   called out in the release notes.
@@ -122,11 +122,11 @@ These are recorded as open questions; no legal conclusion is drawn here.
 
 ## Tagging (manual, after review)
 
-The first engine tag is `v0.7.0` (see Versioning above). After the human review
+The current release is `v0.8.0` (see Versioning above). After the human review
 gate:
 
 ```bash
-git tag -a v0.7.0 -m "Expose reusable Provenance engine"
+git tag -a v0.8.0 -m "Upgrade to Go 1.27 and refresh dependencies"
 git push origin master --tags
 ```
 

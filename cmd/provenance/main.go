@@ -99,7 +99,7 @@ func main() {
 
 	root := &cobra.Command{
 		Use:     "provenance",
-		Version: "0.7.0",
+		Version: "0.8.0",
 		Short:   "provenance - universal media collector, source archive, and knowledge vault",
 		Long: `provenance is a single-binary tool for collecting, preserving, searching, and citing
 digital content — media, social posts, documentation, Git repos, and more.
