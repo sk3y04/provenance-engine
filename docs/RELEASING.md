@@ -11,7 +11,7 @@ legal review before the first tag.
 | Go module | `github.com/sk3y04/provenance-engine` |
 | Public facade | `github.com/sk3y04/provenance-engine/engine` |
 | CLI binary / command | `provenance` (unchanged across the repository rename) |
-| License | GPL-3.0 (`LICENSE`) |
+| License | MIT (`LICENSE`) |
 | Go version | 1.26 (see `go.mod`) |
 
 Published release assets are the `provenance` CLI, named
@@ -83,20 +83,24 @@ tag (then `go mod tidy` is safe again).
 - Follow [Semantic Versioning](https://semver.org/). The module path has no
   `/vN` suffix, so breaking exported-API changes require a major tag and, when
   major > 1, a module-path change.
-- The module has **no existing git tags**; the first engine release is therefore
-  recommended as **`v0.1.0`**, before the API is declared stable.
-- The CLI's `--version` string is currently hardcoded (`0.7.0` in
-  `cmd/provenance/main.go`) and is independent of the module tag. Reconciling
-  it (bump, inject via `-ldflags`, or leave independent) is an owner decision
-  and is intentionally not changed in this phase.
+- The CHANGELOG already consumed `0.1.0` through `0.6.1` and the CLI reports
+  `0.7.0`, so the first engine release is **`v0.7.0`**, continuing the existing
+  sequence rather than restarting at `v0.1.0`.
+- The CLI's `--version` string is hardcoded (`0.7.0` in `cmd/provenance/main.go`)
+  and now matches the first release tag; future releases should keep them in
+  step or inject the version via `-ldflags`.
 - The rename from `github.com/sk3y04/provenance` is a breaking import-path
   change; it is recorded in `CHANGELOG` and `docs/MIGRATION.md` and must be
   called out in the release notes.
+- The module was also relicensed from GPL-3.0 to MIT in the same release; the
+  release notes must state this.
 
 ## Licensing and third-party notices
 
-- The repository is licensed GPL-3.0 (`LICENSE`). This phase does not change the
-  license.
+- The repository is licensed **MIT** (`LICENSE`). It was relicensed from
+  GPL-3.0 for the `v0.7.0` release so the private product can embed the engine
+  without copyleft obligations. Only the copyright holder can relicense; the
+  change was made by the repository owner.
 - There is **no `NOTICE` or third-party-license file**. Go dependencies are
   declared in `go.mod`/`go.sum`; a transitive license audit has not been
   performed.
@@ -108,24 +112,21 @@ tag (then `go mod tidy` is safe again).
 
 These are recorded as open questions; no legal conclusion is drawn here.
 
-1. **GPL-3.0 and the private SaaS.** The private `provenance` product imports
-   the engine in-process and may distribute container images containing it.
-   Whether that triggers GPL-3.0 copyleft obligations (and whether network-only
-   use avoids them, as it would not with AGPL-3.0) requires legal review before
-   the private product ships.
-2. **Bundled vs. runtime-fetched tools.** If a future release bundles `yt-dlp`
+1. **Bundled vs. runtime-fetched tools.** If a future release bundles `yt-dlp`
    or `ffmpeg` rather than fetching them at runtime, their licenses (for
    example, ffmpeg builds may be LGPL or GPL depending on configuration) must be
    reviewed and a third-party notice added.
-3. **Transitive Go dependency licenses.** A tool such as `go-licenses` should be
-   run and its output reviewed before the first public release.
+2. **Transitive Go dependency licenses.** A tool such as `go-licenses` should be
+   run and its output reviewed; the MIT license requires retaining third-party
+   copyright notices in distributions.
 
 ## Tagging (manual, after review)
 
-Do not tag from an automated agent session. After the human review gate:
+The first engine tag is `v0.7.0` (see Versioning above). After the human review
+gate:
 
 ```bash
-git tag -a v0.1.0 -m "Expose reusable Provenance engine"
+git tag -a v0.7.0 -m "Expose reusable Provenance engine"
 git push origin master --tags
 ```
 
