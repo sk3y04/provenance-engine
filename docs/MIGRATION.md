@@ -43,7 +43,8 @@ facade arrives in Phase 4 (`engine/`).
 - Cookies/credential handling and environment variables (for example
   `PROVENANCE_DATABASE_URL`, `CHROME_PATH`).
 - yt-dlp progress protocol marker (`PROVENANCE_YTDLP_PROGRESS:`).
-- License (GPL-3.0).
+- License at the time of the rename (GPL-3.0). The project was subsequently
+  relicensed under MIT; see `CHANGELOG`.
 
 ## Consumer steps
 

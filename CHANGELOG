@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Downloader media sniffing** (`internal/downloader/sniff.go`): `SniffExt` returns the canonical extension from magic bytes for png, jpg, gif, webp, mp4, webm, and bmp.
 
 ### Changed
+- **Relicensed from GPL-3.0 to MIT**: the project is now distributed under the MIT license (`LICENSE`) so the private product can embed the engine without copyleft obligations. Redistribution must retain the copyright and license notice. This is a licensing change, not a functional one.
 - **Repository/module rename (breaking import path)**: the Go module path is now `github.com/sk3y04/provenance-engine` (was `github.com/sk3y04/provenance`) and the GitHub repository is renamed to `provenance-engine`. The CLI binary and command remain `provenance`; no command, flag, exit-code, persistence, or output changes. External importers must update their import paths. See `docs/MIGRATION.md`.
 - **Twitter/X animated GIFs**: `animated_gif` media now selects the highest-bitrate MP4 variant (as the downloader and `--include mp4` expect) instead of the still thumbnail; falls back to the still image only when no video variant is present.
 - **TUI main menu**: expanded to 14 items (added Archive, Manifest, Encode videos); view enum grew from 12 to 25 views.
