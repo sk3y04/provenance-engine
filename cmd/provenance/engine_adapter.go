@@ -87,6 +87,9 @@ func engineConfigFromOptions(o dispatcher.Options) engine.Config {
 		NoArchive:          o.NoArchive,
 		OutputLayout:       o.OutputLayout,
 		ChromePath:         o.ChromePath,
+		// The CLI keeps its historical auto-install behavior; a hosted caller
+		// leaves AutoInstall false so an operation cannot mutate the filesystem.
+		AutoInstall: true,
 	}
 }
 
@@ -135,7 +138,7 @@ func runGrabViaFacade(ctx context.Context, args []string, opts dispatcher.Option
 			firstErr = derr
 		}
 	}
-	dispatcher.PrintSummary(&counts, opts.OutputDir, "")
+	dispatcher.PrintSummary(os.Stderr, &counts, opts.OutputDir, "")
 	return firstErr
 }
 

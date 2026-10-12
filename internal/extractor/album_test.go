@@ -2,7 +2,6 @@ package extractor
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -231,20 +230,20 @@ func TestAlbumParseFilePage(t *testing.T) {
 
 // swapAlbumCDN points the CDN tables and transport at a TLS test server and
 // returns a restore function.
-func swapAlbumCDN(t *testing.T, server *httptest.Server) func() {
+func swapAlbumCDN(t *testing.T, server *httptest.Server) *Deps {
 	t.Helper()
 	host := strings.TrimPrefix(server.URL, "https://")
-	origTransport := albClient.Transport
 	origCDN := albCDNHosts
 	origSuffix := albAPIPathSuffixes
-	albClient.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	albCDNHosts = []string{host}
 	albAPIPathSuffixes = []string{"/api/_001"}
-	return func() {
-		albClient.Transport = origTransport
+	t.Cleanup(func() {
 		albCDNHosts = origCDN
 		albAPIPathSuffixes = origSuffix
-	}
+	})
+	// The engine-owned Deps carries the test server's client, so no
+	// process-global transport is mutated.
+	return &Deps{HTTPClient: server.Client(), QueryIDs: &QueryIDCache{}}
 }
 
 // TestAlbumResolveViaAPIProbing drives the legacy POST-to-API flow against a
@@ -266,13 +265,12 @@ func TestAlbumResolveViaAPIProbing(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	restore := swapAlbumCDN(t, ts)
-	defer restore()
+	d := swapAlbumCDN(t, ts)
 
 	state := newAlbResolverState()
 	info := &albFileInfo{PageURL: fmt.Sprintf("https://%s/f/abc", albAlbumHosts[0]), Slug: "abc", FileID: "63031538"}
 
-	u1, ref, err := resolveFileViaAPI(context.Background(), info, state, nil)
+	u1, ref, err := resolveFileViaAPI(context.Background(), d, info, state, nil)
 	if err != nil {
 		t.Fatalf("resolveFileViaAPI (file 1) error: %v", err)
 	}
@@ -286,7 +284,7 @@ func TestAlbumResolveViaAPIProbing(t *testing.T) {
 	// Second file: the working endpoint should be reused (same single server
 	// endpoint), so calls only increase for the new file's id.
 	info2 := &albFileInfo{PageURL: fmt.Sprintf("https://%s/f/def", albAlbumHosts[0]), Slug: "def", FileID: "999"}
-	u2, _, err := resolveFileViaAPI(context.Background(), info2, state, nil)
+	u2, _, err := resolveFileViaAPI(context.Background(), d, info2, state, nil)
 	if err != nil {
 		t.Fatalf("resolveFileViaAPI (file 2) error: %v", err)
 	}
@@ -309,8 +307,7 @@ func TestAlbumResolveViaSigning(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer ts.Close()
-	restore := swapAlbumCDN(t, ts)
-	defer restore()
+	d := swapAlbumCDN(t, ts)
 
 	info := &albFileInfo{
 		PageURL: fmt.Sprintf("https://%s/f/MnqoeFhfK72tE", albAlbumHosts[0]),
@@ -321,7 +318,7 @@ func TestAlbumResolveViaSigning(t *testing.T) {
 	}
 
 	state := newAlbResolverState()
-	dlURL, ref, err := state.resolveDownloadURLForInfo(context.Background(), info, nil)
+	dlURL, ref, err := state.resolveDownloadURLForInfo(context.Background(), d, info, nil)
 	if err != nil {
 		t.Fatalf("resolveDownloadURLForInfo error: %v", err)
 	}
@@ -347,11 +344,10 @@ func TestAlbumAPIMaintenance(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	restore := swapAlbumCDN(t, ts)
-	defer restore()
+	d := swapAlbumCDN(t, ts)
 
 	info := &albFileInfo{PageURL: fmt.Sprintf("https://%s/f/m", albAlbumHosts[0]), Slug: "m", FileID: "1"}
-	u, _, ok, err := albAPIGet(context.Background(), strings.TrimPrefix(ts.URL, "https://"), "/api/_001", info, newAlbResolverState(), nil)
+	u, _, ok, err := albAPIGet(context.Background(), d, strings.TrimPrefix(ts.URL, "https://"), "/api/_001", info, newAlbResolverState(), nil)
 	if err == nil {
 		t.Fatalf("expected maintenance error, got url %q", u)
 	}

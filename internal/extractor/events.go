@@ -15,28 +15,36 @@ import (
 // existing yt-dlp/HTTP progress machinery can feed structured events.
 type eventProgress struct {
 	sink event.Sink
+	ctx  context.Context
 }
 
-func newEventProgress(sink event.Sink) downloader.ProgressReporter {
-	return &eventProgress{sink: sink}
+// newEventProgress adapts an event.Sink to downloader.ProgressReporter so the
+// existing yt-dlp/HTTP progress machinery can feed structured events. The
+// operation context is carried so progress emission stops when the operation is
+// canceled.
+func newEventProgress(ctx context.Context, sink event.Sink) downloader.ProgressReporter {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &eventProgress{sink: sink, ctx: ctx}
 }
 
 func (p *eventProgress) OnStart(url, dest string, total int64) {
-	event.Emit(context.Background(), p.sink, event.Event{
+	event.Emit(p.ctx, p.sink, event.Event{
 		Kind: event.KindProgress, Stage: event.StageDownloading,
 		URL: url, ItemRef: dest, Total: total, Reason: "start",
 	})
 }
 
 func (p *eventProgress) OnProgress(url string, written, total int64) {
-	event.Emit(context.Background(), p.sink, event.Event{
+	event.Emit(p.ctx, p.sink, event.Event{
 		Kind: event.KindProgress, Stage: event.StageDownloading,
 		URL: url, Written: written, Total: total,
 	})
 }
 
 func (p *eventProgress) OnDone(url string, err error) {
-	event.Emit(context.Background(), p.sink, event.Event{
+	event.Emit(p.ctx, p.sink, event.Event{
 		Kind: event.KindItemDone, Stage: event.StageDownloading,
 		URL: url, Err: err,
 	})

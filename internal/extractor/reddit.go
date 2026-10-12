@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sk3y04/provenance-engine/internal/downloader"
+	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 	"github.com/sk3y04/provenance-engine/internal/resolve"
@@ -44,13 +45,6 @@ func rdOAuthToken() string {
 		return "Basic " + base64.StdEncoding.EncodeToString([]byte(clientID+":"+clientSecret))
 	}
 	return ""
-}
-
-func rdClient(cookiesFile string) (*http.Client, error) {
-	return &http.Client{
-		Timeout:       30 * time.Second,
-		CheckRedirect: downloader.SafeRedirect,
-	}, nil
 }
 
 type rdGalleryItem struct {
@@ -140,6 +134,11 @@ type RdOptions struct {
 	IncludePosts    bool
 	IncludeComments bool
 	CommentLimit    int
+	// Events, when set, receives presentation-neutral structured events. When
+	// set, this path does not write to the terminal.
+	Events event.Sink
+	// Deps are the engine-owned dependencies for this operation.
+	Deps *Deps
 }
 
 type RdTarget struct {
@@ -205,7 +204,8 @@ func rdHeaders(cookiesFile, referer string) (http.Header, error) {
 	return h, nil
 }
 
-func fetchRdPage(ctx context.Context, client *http.Client, cookiesFile string, target RdTarget, after string, rl *ratelimit.Manager) ([]rdPost, string, error) {
+func fetchRdPage(ctx context.Context, d *Deps, cookiesFile string, target RdTarget, after string, rl *ratelimit.Manager) ([]rdPost, string, error) {
+	client := d.HTTPClient
 	u, _ := url.Parse(rdAPIBase)
 	u.Path = target.apiPath()
 	params := url.Values{}
@@ -251,7 +251,7 @@ func fetchRdPage(ctx context.Context, client *http.Client, cookiesFile string, t
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("reddit status %d", resp.StatusCode)
-			fmt.Fprintf(os.Stderr, "[reddit] response: %s\n", sanitizeErrorBody(body))
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[reddit] response: %s\n", sanitizeErrorBody(body))
 			if resp.StatusCode == http.StatusTooManyRequests {
 				time.Sleep(rdMaxRetryBackoff)
 				continue
@@ -277,11 +277,11 @@ func fetchRdPage(ctx context.Context, client *http.Client, cookiesFile string, t
 	return nil, "", lastErr
 }
 
-func FetchAllRdPosts(ctx context.Context, client *http.Client, cookiesFile string, target RdTarget, rl *ratelimit.Manager) ([]rdPost, error) {
+func FetchAllRdPosts(ctx context.Context, d *Deps, cookiesFile string, target RdTarget, rl *ratelimit.Manager) ([]rdPost, error) {
 	var all []rdPost
 	after := ""
 	for {
-		page, nextAfter, err := fetchRdPage(ctx, client, cookiesFile, target, after, rl)
+		page, nextAfter, err := fetchRdPage(ctx, d, cookiesFile, target, after, rl)
 		if err != nil {
 			return nil, err
 		}
@@ -416,7 +416,7 @@ func rdPostMedia(d rdPostData) []rdMediaItem {
 // its extension does not match the actual content (e.g. a file named
 // ".Image" that is really a PNG). Files with an unrecognized format, or a
 // rename that would clobber an existing file, are left untouched.
-func fixMediaExt(dest string) error {
+func fixMediaExt(ctx context.Context, dest string) error {
 	ext, ok := downloader.SniffExt(dest)
 	if !ok {
 		return nil
@@ -432,7 +432,7 @@ func fixMediaExt(dest string) error {
 	if err := os.Rename(dest, newDest); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "[provenance] renamed %s -> %s\n", filepath.Base(dest), filepath.Base(newDest))
+	narratef(ctx, kindInfo, event.ReasonRenamed, "", "", "[provenance] renamed %s -> %s\n", filepath.Base(dest), filepath.Base(newDest))
 	return nil
 }
 
@@ -555,15 +555,13 @@ func rdPostItems(rawURL, outDir string, posts []rdPost, includePosts bool) []man
 }
 
 func ScanReddit(ctx context.Context, rawURL, outDir string, cookiesFile string, opts RdOptions) (manifest.Manifest, error) {
+	dep := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
 	target, err := ParseRdURL(rawURL)
 	if err != nil {
 		return manifest.Manifest{}, err
 	}
-	client, err := rdClient(cookiesFile)
-	if err != nil {
-		return manifest.Manifest{}, fmt.Errorf("create client: %w", err)
-	}
-	posts, err := FetchAllRdPosts(ctx, client, cookiesFile, target, opts.RateLimiter)
+	posts, err := FetchAllRdPosts(ctx, dep, cookiesFile, target, opts.RateLimiter)
 	if err != nil {
 		return manifest.Manifest{}, err
 	}
@@ -575,15 +573,12 @@ func ScanReddit(ctx context.Context, rawURL, outDir string, cookiesFile string, 
 }
 
 func DownloadReddit(ctx context.Context, rawURL, outDir string, cookiesFile string, opts RdOptions, dryRun bool) error {
+	dep := depsFor(opts.Deps)
 	target, err := ParseRdURL(rawURL)
 	if err != nil {
 		return err
 	}
-	client, err := rdClient(cookiesFile)
-	if err != nil {
-		return fmt.Errorf("create client: %w", err)
-	}
-	posts, err := FetchAllRdPosts(ctx, client, cookiesFile, target, opts.RateLimiter)
+	posts, err := FetchAllRdPosts(ctx, dep, cookiesFile, target, opts.RateLimiter)
 	if err != nil {
 		return err
 	}
@@ -612,7 +607,7 @@ func DownloadReddit(ctx context.Context, rawURL, outDir string, cookiesFile stri
 		failMu.Lock()
 		failed[url] = err.Error()
 		failMu.Unlock()
-		fmt.Fprintf(os.Stderr, "[provenance] reddit download failed: %s: %v\n", url, err)
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] reddit download failed: %s: %v\n", url, err)
 	}
 
 	for _, p := range posts {
@@ -623,12 +618,12 @@ func DownloadReddit(ctx context.Context, rawURL, outDir string, cookiesFile stri
 			postDest := postItem.Destination
 			postContent := rdPostMarkdown(d)
 			if dryRun {
-				fmt.Printf("[dry-run] reddit post: %s -> %s\n", d.ID, postDest)
+				narrateOut(ctx, kindInfo, reasonInfo, "", "", "[dry-run] reddit post: %s -> %s\n", d.ID, postDest)
 			} else {
 				pool.SubmitWithHooks(func() error {
 					return writeFile(postDest, postContent)
 				}, func() {
-					fmt.Fprintf(os.Stderr, "[provenance] reddit post saved: %s\n", postDest)
+					narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] reddit post saved: %s\n", postDest)
 				}, func(err error) {
 					recordFailure("post:"+d.ID, err)
 				})
@@ -655,17 +650,17 @@ func DownloadReddit(ctx context.Context, rawURL, outDir string, cookiesFile stri
 					dest = filepath.Join(base, sanitizeFilename(name))
 				}
 				if dryRun {
-					fmt.Printf("[dry-run] reddit: %s -> %s\n", mi.URL, dest)
+					narrateOut(ctx, kindInfo, reasonInfo, "", "", "[dry-run] reddit: %s -> %s\n", mi.URL, dest)
 					continue
 				}
 				furl := mi.URL
 				if mi.Kind == "external-video" {
 					pool.SubmitWithHooks(func() error {
-						return RunYtdlp(ctx, furl, YtdlpOptions{
+						return RunYtdlp(ctx, dep, furl, YtdlpOptions{
 							OutputDir:   base,
 							CookiesFile: cookiesFile,
 							SpeedLimit:  opts.SpeedLimit,
-							Progress:    opts.Progress,
+							Progress:    progressFor(ctx, opts.Progress),
 						})
 					}, nil, func(err error) {
 						recordFailure(furl, err)
@@ -675,11 +670,11 @@ func DownloadReddit(ctx context.Context, rawURL, outDir string, cookiesFile stri
 				pool.SubmitWithHooks(func() error {
 					dl := downloader.New()
 					dl.SpeedLimit = opts.SpeedLimit
-					dl.Progress = opts.Progress
+					dl.Progress = progressFor(ctx, opts.Progress)
 					if err := dl.Download(ctx, furl, dest, ""); err != nil {
 						return err
 					}
-					return fixMediaExt(dest)
+					return fixMediaExt(ctx, dest)
 				}, nil, func(err error) {
 					recordFailure(furl, err)
 				})
@@ -742,15 +737,13 @@ func RdPostToItem(d rdPostData) resolve.Item {
 }
 
 func ScanRedditResolved(ctx context.Context, rawURL, outDir, cookiesFile string, opts RdOptions) (resolve.Source, error) {
+	dep := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
 	target, err := ParseRdURL(rawURL)
 	if err != nil {
 		return resolve.Source{}, err
 	}
-	client, err := rdClient(cookiesFile)
-	if err != nil {
-		return resolve.Source{}, fmt.Errorf("create client: %w", err)
-	}
-	posts, err := FetchAllRdPosts(ctx, client, cookiesFile, target, opts.RateLimiter)
+	posts, err := FetchAllRdPosts(ctx, dep, cookiesFile, target, opts.RateLimiter)
 	if err != nil {
 		return resolve.Source{}, err
 	}
@@ -785,7 +778,8 @@ type rdComment struct {
 	Replies   []rdComment `json:"replies"`
 }
 
-func fetchRdComments(ctx context.Context, client *http.Client, cookiesFile string, permalink string, maxComments int, rl *ratelimit.Manager) ([]rdComment, error) {
+func fetchRdComments(ctx context.Context, d *Deps, cookiesFile string, permalink string, maxComments int, rl *ratelimit.Manager) ([]rdComment, error) {
+	client := d.HTTPClient
 	u := "https://www.reddit.com" + permalink + ".json"
 	if maxComments <= 0 {
 		maxComments = 100

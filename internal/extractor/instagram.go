@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,26 +16,12 @@ import (
 	"time"
 
 	"github.com/sk3y04/provenance-engine/internal/downloader"
+	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 	"github.com/sk3y04/provenance-engine/internal/resolve"
 	"github.com/sk3y04/provenance-engine/internal/worker"
 )
-
-var igTransport = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
-	DialContext: (&net.Dialer{
-		Timeout:   15 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).DialContext,
-	ForceAttemptHTTP2:     true,
-	MaxIdleConns:          10,
-	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:   15 * time.Second,
-	ResponseHeaderTimeout: 30 * time.Second,
-}
-
-var igAPIClient = &http.Client{Timeout: 30 * time.Second, Transport: igTransport, CheckRedirect: downloader.SafeRedirect}
 
 const (
 	igAPIBase           = "https://i.instagram.com/api/v1"
@@ -71,9 +56,9 @@ func igSessionRejected(err error) bool {
 
 // igNoteLoginState prints a hint when an API response is an HTML login page,
 // which usually means the exported cookies do not apply to that host.
-func igNoteLoginState(base, body string) {
+func igNoteLoginState(ctx context.Context, base, body string) {
 	if strings.Contains(body, "not-logged-in") {
-		fmt.Fprintf(os.Stderr, "[instagram] %s served a not-logged-in page; the exported cookies may not cover this host (check that cookies.txt contains .instagram.com domain cookies such as sessionid)\n", base)
+		narratef(ctx, kindWarn, event.ReasonNotLoggedIn, "", "", "[instagram] %s served a not-logged-in page; the exported cookies may not cover this host (check that cookies.txt contains .instagram.com domain cookies such as sessionid)\n", base)
 	}
 }
 
@@ -120,6 +105,11 @@ type IgOptions struct {
 	Limit        int
 	RateLimiter  *ratelimit.Manager
 	IncludePosts bool
+	// Events, when set, receives presentation-neutral structured events. When
+	// set, this path does not write to the terminal.
+	Events event.Sink
+	// Deps are the engine-owned dependencies for this operation.
+	Deps *Deps
 }
 
 type IgTarget struct {
@@ -179,13 +169,13 @@ func ParseIgURL(rawURL string) (IgTarget, error) {
 	return IgTarget{Type: "profile", Username: name}, nil
 }
 
-func igClient(cookiesFile string) (*http.Client, string, error) {
+func igClient(d *Deps, cookiesFile string) (string, error) {
 	if cookiesFile == "" {
-		return nil, "", fmt.Errorf("cookies file is required for Instagram (sessionid cookie needed; export from browser with an extension)")
+		return "", fmt.Errorf("cookies file is required for Instagram (sessionid cookie needed; export from browser with an extension)")
 	}
 	cookies, err := loadNetscapeCookies(cookiesFile)
 	if err != nil {
-		return nil, "", fmt.Errorf("load cookies: %w", err)
+		return "", fmt.Errorf("load cookies: %w", err)
 	}
 	var csrfToken string
 	for _, ck := range cookies {
@@ -194,7 +184,7 @@ func igClient(cookiesFile string) (*http.Client, string, error) {
 			break
 		}
 	}
-	return igAPIClient, csrfToken, nil
+	return csrfToken, nil
 }
 
 func igHeaders(cookiesFile, csrfToken string) (http.Header, error) {
@@ -282,8 +272,9 @@ type igMediaInfoResponse struct {
 	Items []igFeedMedia `json:"items"`
 }
 
-func resolveIgUserID(ctx context.Context, client *http.Client, cookiesFile, csrfToken, username string, rl *ratelimit.Manager) (string, error) {
-	fmt.Fprintf(os.Stderr, "[instagram] resolving user @%s ...\n", username)
+func resolveIgUserID(ctx context.Context, d *Deps, cookiesFile, csrfToken, username string, rl *ratelimit.Manager) (string, error) {
+	client := d.HTTPClient
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] resolving user @%s ...\n", username)
 
 	params := url.Values{}
 	params.Set("username", username)
@@ -325,7 +316,7 @@ func resolveIgUserID(ctx context.Context, client *http.Client, cookiesFile, csrf
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("instagram status %d", resp.StatusCode)
-			fmt.Fprintf(os.Stderr, "[instagram] response: %s\n", sanitizeErrorBody(body))
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] response: %s\n", sanitizeErrorBody(body))
 			if resp.StatusCode == http.StatusTooManyRequests {
 				delay := igMaxRetryBackoff
 				if ra := resp.Header.Get("Retry-After"); ra != "" {
@@ -333,7 +324,7 @@ func resolveIgUserID(ctx context.Context, client *http.Client, cookiesFile, csrf
 						delay = time.Duration(sec) * time.Second
 					}
 				}
-				fmt.Fprintf(os.Stderr, "[instagram] rate limited (429), waiting %v...\n", delay)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited (429), waiting %v...\n", delay)
 				time.Sleep(delay)
 				continue
 			}
@@ -362,53 +353,54 @@ func resolveIgUserID(ctx context.Context, client *http.Client, cookiesFile, csrf
 			userID = result.Data.User.ID
 		}
 		if userID == "" {
-			fmt.Fprintf(os.Stderr, "[instagram] web_profile_info returned empty user id, response: %s\n", sanitizeErrorBody(string(respBody[:min(len(respBody), 512)])))
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web_profile_info returned empty user id, response: %s\n", sanitizeErrorBody(string(respBody[:min(len(respBody), 512)])))
 			lastErr = fmt.Errorf("instagram: user not found: %s", username)
 			break
 		}
 		return userID, nil
 	}
 
-	fmt.Fprintf(os.Stderr, "[instagram] api lookup failed (%v), trying web scrape ...\n", lastErr)
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] api lookup failed (%v), trying web scrape ...\n", lastErr)
 
-	if userID, err := resolveIgUserIDFromWeb(ctx, cookiesFile, username); err == nil {
-		fmt.Fprintf(os.Stderr, "[instagram] resolved user @%s -> %s via web scrape\n", username, userID)
+	if userID, err := resolveIgUserIDFromWeb(ctx, d, cookiesFile, username); err == nil {
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] resolved user @%s -> %s via web scrape\n", username, userID)
 		return userID, nil
 	} else {
-		fmt.Fprintf(os.Stderr, "[instagram] web scrape failed: %v\n", err)
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web scrape failed: %v\n", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "[instagram] trying www api host ...\n")
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] trying www api host ...\n")
 
-	if userID, err := resolveIgUserIDWWW(ctx, client, cookiesFile, csrfToken, username); err == nil {
-		fmt.Fprintf(os.Stderr, "[instagram] resolved user @%s -> %s via www api\n", username, userID)
+	if userID, err := resolveIgUserIDWWW(ctx, d, cookiesFile, csrfToken, username); err == nil {
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] resolved user @%s -> %s via www api\n", username, userID)
 		return userID, nil
 	} else {
-		fmt.Fprintf(os.Stderr, "[instagram] www api failed: %v\n", err)
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] www api failed: %v\n", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "[instagram] trying json endpoint ...\n")
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] trying json endpoint ...\n")
 
-	if userID, err := resolveIgUserIDJSON(ctx, cookiesFile, csrfToken, username); err == nil {
-		fmt.Fprintf(os.Stderr, "[instagram] resolved user @%s -> %s via json endpoint\n", username, userID)
+	if userID, err := resolveIgUserIDJSON(ctx, d, cookiesFile, csrfToken, username); err == nil {
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] resolved user @%s -> %s via json endpoint\n", username, userID)
 		return userID, nil
 	} else {
-		fmt.Fprintf(os.Stderr, "[instagram] json endpoint failed: %v\n", err)
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] json endpoint failed: %v\n", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "[instagram] trying users/search ...\n")
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] trying users/search ...\n")
 
-	if userID, err := resolveIgUserIDSearch(ctx, client, cookiesFile, csrfToken, username); err == nil {
-		fmt.Fprintf(os.Stderr, "[instagram] resolved user @%s -> %s via users/search\n", username, userID)
+	if userID, err := resolveIgUserIDSearch(ctx, d, cookiesFile, csrfToken, username); err == nil {
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] resolved user @%s -> %s via users/search\n", username, userID)
 		return userID, nil
 	} else {
-		fmt.Fprintf(os.Stderr, "[instagram] users/search failed: %v\n", err)
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] users/search failed: %v\n", err)
 	}
 
 	return "", fmt.Errorf("resolve user id: all methods failed; api: %w", lastErr)
 }
 
-func resolveIgUserIDWWW(ctx context.Context, client *http.Client, cookiesFile, csrfToken, username string) (string, error) {
+func resolveIgUserIDWWW(ctx context.Context, d *Deps, cookiesFile, csrfToken, username string) (string, error) {
+	client := d.HTTPClient
 	wwwBase := "https://www.instagram.com/api/v1"
 	params := url.Values{}
 	params.Set("username", username)
@@ -452,7 +444,7 @@ func resolveIgUserIDWWW(ctx context.Context, client *http.Client, cookiesFile, c
 	return userID, nil
 }
 
-func resolveIgUserIDFromWeb(ctx context.Context, cookiesFile, username string) (string, error) {
+func resolveIgUserIDFromWeb(ctx context.Context, d *Deps, cookiesFile, username string) (string, error) {
 	profileURL := fmt.Sprintf("https://www.instagram.com/%s/", username)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, profileURL, nil)
 	if err != nil {
@@ -477,7 +469,7 @@ func resolveIgUserIDFromWeb(ctx context.Context, cookiesFile, username string) (
 	}
 	req.Header = h
 
-	resp, err := igAPIClient.Do(req)
+	resp, err := d.HTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("fetch profile page: %w", err)
 	}
@@ -495,22 +487,22 @@ func resolveIgUserIDFromWeb(ctx context.Context, cookiesFile, username string) (
 	}
 
 	html := string(body)
-	fmt.Fprintf(os.Stderr, "[instagram] web scrape: status %d, body length %d\n", resp.StatusCode, len(body))
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web scrape: status %d, body length %d\n", resp.StatusCode, len(body))
 
 	if userID := extractIgUserID(html); userID != "" {
 		return userID, nil
 	}
 
 	if strings.Contains(html, `"native_client_redesign"`) || strings.Contains(html, `"entry_data"`) {
-		fmt.Fprintf(os.Stderr, "[instagram] web scrape: page structure looks like profile but no ID patterns matched, preview:\n%s\n", sanitizeErrorBody(html[:min(len(html), 1024)]))
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web scrape: page structure looks like profile but no ID patterns matched, preview:\n%s\n", sanitizeErrorBody(html[:min(len(html), 1024)]))
 	} else {
-		fmt.Fprintf(os.Stderr, "[instagram] web scrape: page does not look like a profile page (possibly login/challenge wall), preview:\n%s\n", sanitizeErrorBody(html[:min(len(html), 1024)]))
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web scrape: page does not look like a profile page (possibly login/challenge wall), preview:\n%s\n", sanitizeErrorBody(html[:min(len(html), 1024)]))
 	}
 
 	return "", fmt.Errorf("could not find user id in profile page html")
 }
 
-func resolveIgUserIDJSON(ctx context.Context, cookiesFile, csrfToken, username string) (string, error) {
+func resolveIgUserIDJSON(ctx context.Context, d *Deps, cookiesFile, csrfToken, username string) (string, error) {
 	jsonURL := fmt.Sprintf("https://www.instagram.com/%s/?__a=1&__d=1", username)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, jsonURL, nil)
 	if err != nil {
@@ -526,7 +518,7 @@ func resolveIgUserIDJSON(ctx context.Context, cookiesFile, csrfToken, username s
 	headers.Set("Referer", fmt.Sprintf("https://www.instagram.com/%s/", username))
 	req.Header = headers
 
-	resp, err := igAPIClient.Do(req)
+	resp, err := d.HTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("json endpoint request: %w", err)
 	}
@@ -557,7 +549,8 @@ func resolveIgUserIDJSON(ctx context.Context, cookiesFile, csrfToken, username s
 	return "", fmt.Errorf("json endpoint returned empty user id")
 }
 
-func resolveIgUserIDSearch(ctx context.Context, client *http.Client, cookiesFile, csrfToken, username string) (string, error) {
+func resolveIgUserIDSearch(ctx context.Context, d *Deps, cookiesFile, csrfToken, username string) (string, error) {
+	client := d.HTTPClient
 	params := url.Values{}
 	params.Set("q", username)
 	params.Set("count", "1")
@@ -662,10 +655,10 @@ func extractIgUserID(html string) string {
 	return ""
 }
 
-func fetchIgMediaPage(ctx context.Context, client *http.Client, cookiesFile, csrfToken, userID, cursor string, rl *ratelimit.Manager) ([]igFeedMedia, string, error) {
+func fetchIgMediaPage(ctx context.Context, d *Deps, cookiesFile, csrfToken, userID, cursor string, rl *ratelimit.Manager) ([]igFeedMedia, string, error) {
 	var lastErr error
 	for i, base := range igAPIHosts {
-		items, next, err := fetchIgMediaPageHost(ctx, client, cookiesFile, csrfToken, userID, cursor, base, rl)
+		items, next, err := fetchIgMediaPageHost(ctx, d, cookiesFile, csrfToken, userID, cursor, base, rl)
 		if err == nil {
 			return items, next, nil
 		}
@@ -673,12 +666,13 @@ func fetchIgMediaPage(ctx context.Context, client *http.Client, cookiesFile, csr
 		if i == len(igAPIHosts)-1 || !igSessionRejected(err) {
 			return nil, "", err
 		}
-		fmt.Fprintf(os.Stderr, "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
 	}
 	return nil, "", lastErr
 }
 
-func fetchIgMediaPageHost(ctx context.Context, client *http.Client, cookiesFile, csrfToken, userID, cursor, base string, rl *ratelimit.Manager) ([]igFeedMedia, string, error) {
+func fetchIgMediaPageHost(ctx context.Context, d *Deps, cookiesFile, csrfToken, userID, cursor, base string, rl *ratelimit.Manager) ([]igFeedMedia, string, error) {
+	client := d.HTTPClient
 	params := url.Values{}
 	params.Set("count", strconv.Itoa(igPageSize))
 	if cursor != "" {
@@ -720,8 +714,8 @@ func fetchIgMediaPageHost(ctx context.Context, client *http.Client, cookiesFile,
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("instagram status %d", resp.StatusCode)
-			fmt.Fprintf(os.Stderr, "[instagram] response: %s\n", sanitizeErrorBody(body))
-			igNoteLoginState(base, body)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] response: %s\n", sanitizeErrorBody(body))
+			igNoteLoginState(ctx, base, body)
 			if resp.StatusCode == http.StatusTooManyRequests {
 				delay := igMaxRetryBackoff
 				if ra := resp.Header.Get("Retry-After"); ra != "" {
@@ -729,7 +723,7 @@ func fetchIgMediaPageHost(ctx context.Context, client *http.Client, cookiesFile,
 						delay = time.Duration(sec) * time.Second
 					}
 				}
-				fmt.Fprintf(os.Stderr, "[instagram] rate limited (429), waiting %v...\n", delay)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited (429), waiting %v...\n", delay)
 				time.Sleep(delay)
 				continue
 			}
@@ -754,15 +748,15 @@ func fetchIgMediaPageHost(ctx context.Context, client *http.Client, cookiesFile,
 	return nil, "", lastErr
 }
 
-func FetchAllIgPosts(ctx context.Context, client *http.Client, cookiesFile, csrfToken, userID string, limit int, rl *ratelimit.Manager) ([]igFeedMedia, error) {
+func FetchAllIgPosts(ctx context.Context, d *Deps, cookiesFile, csrfToken, userID string, limit int, rl *ratelimit.Manager) ([]igFeedMedia, error) {
 	var all []igFeedMedia
 	cursor := ""
 	pages := 0
 	for {
-		page, nextCursor, err := fetchIgMediaPage(ctx, client, cookiesFile, csrfToken, userID, cursor, rl)
+		page, nextCursor, err := fetchIgMediaPage(ctx, d, cookiesFile, csrfToken, userID, cursor, rl)
 		if err != nil {
 			if len(all) > 0 && strings.Contains(err.Error(), "429") {
-				fmt.Fprintf(os.Stderr, "[instagram] rate limited mid-scan, returning %d items from %d pages\n", len(all), pages)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited mid-scan, returning %d items from %d pages\n", len(all), pages)
 				return all, nil
 			}
 			return nil, err
@@ -772,7 +766,7 @@ func FetchAllIgPosts(ctx context.Context, client *http.Client, cookiesFile, csrf
 		}
 		pages++
 		all = append(all, page...)
-		fmt.Fprintf(os.Stderr, "[instagram] page %d: %d posts (%d total)\n", pages, len(page), len(all))
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] page %d: %d posts (%d total)\n", pages, len(page), len(all))
 		if limit > 0 && len(all) >= limit {
 			all = all[:limit]
 			break
@@ -785,14 +779,14 @@ func FetchAllIgPosts(ctx context.Context, client *http.Client, cookiesFile, csrf
 	return all, nil
 }
 
-func fetchSingleIgPost(ctx context.Context, client *http.Client, cookiesFile, csrfToken, shortcode string, rl *ratelimit.Manager) (*igFeedMedia, error) {
+func fetchSingleIgPost(ctx context.Context, d *Deps, cookiesFile, csrfToken, shortcode string, rl *ratelimit.Manager) (*igFeedMedia, error) {
 	mediaID := igShortcodeToID(shortcode)
 	if mediaID == 0 {
 		return nil, fmt.Errorf("invalid instagram shortcode: %s", shortcode)
 	}
 	var lastErr error
 	for i, base := range igAPIHosts {
-		post, err := fetchSingleIgPostHost(ctx, client, cookiesFile, csrfToken, mediaID, shortcode, base, rl)
+		post, err := fetchSingleIgPostHost(ctx, d, cookiesFile, csrfToken, mediaID, shortcode, base, rl)
 		if err == nil {
 			return post, nil
 		}
@@ -800,12 +794,13 @@ func fetchSingleIgPost(ctx context.Context, client *http.Client, cookiesFile, cs
 		if i == len(igAPIHosts)-1 || !igSessionRejected(err) {
 			return nil, err
 		}
-		fmt.Fprintf(os.Stderr, "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
 	}
 	return nil, lastErr
 }
 
-func fetchSingleIgPostHost(ctx context.Context, client *http.Client, cookiesFile, csrfToken string, mediaID int64, shortcode, base string, rl *ratelimit.Manager) (*igFeedMedia, error) {
+func fetchSingleIgPostHost(ctx context.Context, d *Deps, cookiesFile, csrfToken string, mediaID int64, shortcode, base string, rl *ratelimit.Manager) (*igFeedMedia, error) {
+	client := d.HTTPClient
 	endpoint := fmt.Sprintf("%s/media/%d/info/", base, mediaID)
 
 	var lastErr error
@@ -842,8 +837,8 @@ func fetchSingleIgPostHost(ctx context.Context, client *http.Client, cookiesFile
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("instagram status %d", resp.StatusCode)
-			fmt.Fprintf(os.Stderr, "[instagram] response: %s\n", sanitizeErrorBody(body))
-			igNoteLoginState(base, body)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] response: %s\n", sanitizeErrorBody(body))
+			igNoteLoginState(ctx, base, body)
 			if resp.StatusCode == http.StatusTooManyRequests {
 				delay := igMaxRetryBackoff
 				if ra := resp.Header.Get("Retry-After"); ra != "" {
@@ -851,7 +846,7 @@ func fetchSingleIgPostHost(ctx context.Context, client *http.Client, cookiesFile
 						delay = time.Duration(sec) * time.Second
 					}
 				}
-				fmt.Fprintf(os.Stderr, "[instagram] rate limited (429), waiting %v...\n", delay)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited (429), waiting %v...\n", delay)
 				time.Sleep(delay)
 				continue
 			}
@@ -879,10 +874,10 @@ func fetchSingleIgPostHost(ctx context.Context, client *http.Client, cookiesFile
 	return nil, lastErr
 }
 
-func fetchIgStories(ctx context.Context, client *http.Client, cookiesFile, csrfToken, userID string, rl *ratelimit.Manager) ([]igFeedMedia, error) {
+func fetchIgStories(ctx context.Context, d *Deps, cookiesFile, csrfToken, userID string, rl *ratelimit.Manager) ([]igFeedMedia, error) {
 	var lastErr error
 	for i, base := range igAPIHosts {
-		items, err := fetchIgStoriesHost(ctx, client, cookiesFile, csrfToken, userID, base, rl)
+		items, err := fetchIgStoriesHost(ctx, d, cookiesFile, csrfToken, userID, base, rl)
 		if err == nil {
 			return items, nil
 		}
@@ -890,12 +885,13 @@ func fetchIgStories(ctx context.Context, client *http.Client, cookiesFile, csrfT
 		if i == len(igAPIHosts)-1 || !igSessionRejected(err) {
 			return nil, err
 		}
-		fmt.Fprintf(os.Stderr, "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
 	}
 	return nil, lastErr
 }
 
-func fetchIgStoriesHost(ctx context.Context, client *http.Client, cookiesFile, csrfToken, userID, base string, rl *ratelimit.Manager) ([]igFeedMedia, error) {
+func fetchIgStoriesHost(ctx context.Context, d *Deps, cookiesFile, csrfToken, userID, base string, rl *ratelimit.Manager) ([]igFeedMedia, error) {
+	client := d.HTTPClient
 	params := url.Values{}
 	params.Set("reel_ids", userID)
 	endpoint := fmt.Sprintf("%s/feed/reels_media/?%s", base, params.Encode())
@@ -934,8 +930,8 @@ func fetchIgStoriesHost(ctx context.Context, client *http.Client, cookiesFile, c
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("instagram stories status %d", resp.StatusCode)
-			fmt.Fprintf(os.Stderr, "[instagram] response: %s\n", sanitizeErrorBody(body))
-			igNoteLoginState(base, body)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] response: %s\n", sanitizeErrorBody(body))
+			igNoteLoginState(ctx, base, body)
 			if resp.StatusCode == http.StatusTooManyRequests {
 				delay := igMaxRetryBackoff
 				if ra := resp.Header.Get("Retry-After"); ra != "" {
@@ -943,7 +939,7 @@ func fetchIgStoriesHost(ctx context.Context, client *http.Client, cookiesFile, c
 						delay = time.Duration(sec) * time.Second
 					}
 				}
-				fmt.Fprintf(os.Stderr, "[instagram] rate limited (429), waiting %v...\n", delay)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited (429), waiting %v...\n", delay)
 				time.Sleep(delay)
 				continue
 			}
@@ -974,7 +970,7 @@ func fetchIgStoriesHost(ctx context.Context, client *http.Client, cookiesFile, c
 
 		for _, reel := range result.Reels {
 			if len(reel.Items) > 0 {
-				fmt.Fprintf(os.Stderr, "[instagram] found %d stories\n", len(reel.Items))
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] found %d stories\n", len(reel.Items))
 				return reel.Items, nil
 			}
 		}
@@ -1037,10 +1033,10 @@ func pickReelItems(reels map[string]reelEntry, reelKey string) ([]igFeedMedia, s
 // combinations, a second attempt as a form POST additionally advertises
 // supported_capabilities_new — the JSON-encoded capability list the web/mobile
 // clients send with reels_media — which resolves it in practice.
-func fetchIgHighlightStories(ctx context.Context, client *http.Client, cookiesFile, csrfToken, highlightID string, rl *ratelimit.Manager) ([]igFeedMedia, string, error) {
+func fetchIgHighlightStories(ctx context.Context, d *Deps, cookiesFile, csrfToken, highlightID string, rl *ratelimit.Manager) ([]igFeedMedia, string, error) {
 	var lastErr error
 	for i, base := range igAPIHosts {
-		items, username, err := fetchIgHighlightStoriesHost(ctx, client, cookiesFile, csrfToken, highlightID, base, rl)
+		items, username, err := fetchIgHighlightStoriesHost(ctx, d, cookiesFile, csrfToken, highlightID, base, rl)
 		if err == nil {
 			return items, username, nil
 		}
@@ -1048,12 +1044,13 @@ func fetchIgHighlightStories(ctx context.Context, client *http.Client, cookiesFi
 		if i == len(igAPIHosts)-1 || !igSessionRejected(err) {
 			return nil, "", err
 		}
-		fmt.Fprintf(os.Stderr, "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
 	}
 	return nil, "", lastErr
 }
 
-func fetchIgHighlightStoriesHost(ctx context.Context, client *http.Client, cookiesFile, csrfToken, highlightID, base string, rl *ratelimit.Manager) ([]igFeedMedia, string, error) {
+func fetchIgHighlightStoriesHost(ctx context.Context, d *Deps, cookiesFile, csrfToken, highlightID, base string, rl *ratelimit.Manager) ([]igFeedMedia, string, error) {
+	client := d.HTTPClient
 	reelKey := "highlight:" + highlightID
 	params := url.Values{}
 	params.Set("reel_ids", reelKey)
@@ -1093,8 +1090,8 @@ func fetchIgHighlightStoriesHost(ctx context.Context, client *http.Client, cooki
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("instagram highlight status %d", resp.StatusCode)
-			fmt.Fprintf(os.Stderr, "[instagram] response: %s\n", sanitizeErrorBody(body))
-			igNoteLoginState(base, body)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] response: %s\n", sanitizeErrorBody(body))
+			igNoteLoginState(ctx, base, body)
 			if resp.StatusCode == http.StatusTooManyRequests {
 				delay := igMaxRetryBackoff
 				if ra := resp.Header.Get("Retry-After"); ra != "" {
@@ -1102,7 +1099,7 @@ func fetchIgHighlightStoriesHost(ctx context.Context, client *http.Client, cooki
 						delay = time.Duration(sec) * time.Second
 					}
 				}
-				fmt.Fprintf(os.Stderr, "[instagram] rate limited (429), waiting %v...\n", delay)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited (429), waiting %v...\n", delay)
 				time.Sleep(delay)
 				continue
 			}
@@ -1128,14 +1125,14 @@ func fetchIgHighlightStoriesHost(ctx context.Context, client *http.Client, cooki
 		}
 
 		if items, username := pickReelItems(result.Reels, reelKey); len(items) > 0 {
-			fmt.Fprintf(os.Stderr, "[instagram] found %d stories in highlight %s\n", len(items), highlightID)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] found %d stories in highlight %s\n", len(items), highlightID)
 			return items, username, nil
 		}
 
 		// Bare reel_ids=highlight:<id> occasionally returns an empty highlight.
 		// A POST that also advertises supported_capabilities_new recovers it.
-		if items, username, ok := fetchIgHighlightStoriesWithCaps(ctx, client, cookiesFile, csrfToken, reelKey, base, rl); ok {
-			fmt.Fprintf(os.Stderr, "[instagram] found %d stories in highlight %s (capability retry)\n", len(items), highlightID)
+		if items, username, ok := fetchIgHighlightStoriesWithCaps(ctx, d, cookiesFile, csrfToken, reelKey, base, rl); ok {
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] found %d stories in highlight %s (capability retry)\n", len(items), highlightID)
 			return items, username, nil
 		}
 	}
@@ -1170,7 +1167,8 @@ var igHighlightCapabilities = []string{
 // fetchIgHighlightStoriesWithCaps retries a highlight fetch as a form POST that
 // additionally advertises supported_capabilities_new. Returns ok=false if the
 // attempt fails or still yields no items.
-func fetchIgHighlightStoriesWithCaps(ctx context.Context, client *http.Client, cookiesFile, csrfToken, reelKey, base string, rl *ratelimit.Manager) ([]igFeedMedia, string, bool) {
+func fetchIgHighlightStoriesWithCaps(ctx context.Context, d *Deps, cookiesFile, csrfToken, reelKey, base string, rl *ratelimit.Manager) ([]igFeedMedia, string, bool) {
+	client := d.HTTPClient
 	capsJSON, err := json.Marshal(igHighlightCapabilities)
 	if err != nil {
 		return nil, "", false
@@ -1425,11 +1423,13 @@ func igCarouselExt(cm igCarouselMedia) string {
 }
 
 func ScanInstagram(ctx context.Context, rawURL, outDir string, cookiesFile string, opts IgOptions) (manifest.Manifest, error) {
+	d := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
 	target, err := ParseIgURL(rawURL)
 	if err != nil {
 		return manifest.Manifest{}, err
 	}
-	client, csrfToken, err := igClient(cookiesFile)
+	csrfToken, err := igClient(d, cookiesFile)
 	if err != nil {
 		return manifest.Manifest{}, fmt.Errorf("create client: %w", err)
 	}
@@ -1439,29 +1439,29 @@ func ScanInstagram(ctx context.Context, rawURL, outDir string, cookiesFile strin
 
 	switch target.Type {
 	case "profile":
-		userID, err := resolveIgUserID(ctx, client, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
+		userID, err := resolveIgUserID(ctx, d, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
 		if err != nil {
 			return manifest.Manifest{}, fmt.Errorf("resolve user id: %w", err)
 		}
-		posts, err = FetchAllIgPosts(ctx, client, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
+		posts, err = FetchAllIgPosts(ctx, d, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
 		if err != nil {
 			return manifest.Manifest{}, err
 		}
 		username = target.Username
 
 	case "stories":
-		userID, err := resolveIgUserID(ctx, client, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
+		userID, err := resolveIgUserID(ctx, d, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
 		if err != nil {
 			return manifest.Manifest{}, fmt.Errorf("resolve user id: %w", err)
 		}
-		posts, err = fetchIgStories(ctx, client, cookiesFile, csrfToken, userID, opts.RateLimiter)
+		posts, err = fetchIgStories(ctx, d, cookiesFile, csrfToken, userID, opts.RateLimiter)
 		if err != nil {
 			return manifest.Manifest{}, err
 		}
 		username = target.Username
 
 	case "highlight":
-		posts, username, err = fetchIgHighlightStories(ctx, client, cookiesFile, csrfToken, target.HighlightID, opts.RateLimiter)
+		posts, username, err = fetchIgHighlightStories(ctx, d, cookiesFile, csrfToken, target.HighlightID, opts.RateLimiter)
 		if err != nil {
 			return manifest.Manifest{}, fmt.Errorf("fetch highlight: %w", err)
 		}
@@ -1470,7 +1470,7 @@ func ScanInstagram(ctx context.Context, rawURL, outDir string, cookiesFile strin
 		}
 
 	case "post", "reel":
-		post, err := fetchSingleIgPost(ctx, client, cookiesFile, csrfToken, target.Shortcode, opts.RateLimiter)
+		post, err := fetchSingleIgPost(ctx, d, cookiesFile, csrfToken, target.Shortcode, opts.RateLimiter)
 		if err != nil {
 			return manifest.Manifest{}, err
 		}
@@ -1492,11 +1492,12 @@ func ScanInstagram(ctx context.Context, rawURL, outDir string, cookiesFile strin
 }
 
 func DownloadInstagram(ctx context.Context, rawURL, outDir string, cookiesFile string, opts IgOptions, dryRun bool) error {
+	d := depsFor(opts.Deps)
 	target, err := ParseIgURL(rawURL)
 	if err != nil {
 		return err
 	}
-	client, csrfToken, err := igClient(cookiesFile)
+	csrfToken, err := igClient(d, cookiesFile)
 	if err != nil {
 		return fmt.Errorf("create client: %w", err)
 	}
@@ -1506,29 +1507,29 @@ func DownloadInstagram(ctx context.Context, rawURL, outDir string, cookiesFile s
 
 	switch target.Type {
 	case "profile":
-		userID, err := resolveIgUserID(ctx, client, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
+		userID, err := resolveIgUserID(ctx, d, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
 		if err != nil {
 			return fmt.Errorf("resolve user id: %w", err)
 		}
-		posts, err = FetchAllIgPosts(ctx, client, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
+		posts, err = FetchAllIgPosts(ctx, d, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
 		if err != nil {
 			return err
 		}
 		username = target.Username
 
 	case "stories":
-		userID, err := resolveIgUserID(ctx, client, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
+		userID, err := resolveIgUserID(ctx, d, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
 		if err != nil {
 			return fmt.Errorf("resolve user id: %w", err)
 		}
-		posts, err = fetchIgStories(ctx, client, cookiesFile, csrfToken, userID, opts.RateLimiter)
+		posts, err = fetchIgStories(ctx, d, cookiesFile, csrfToken, userID, opts.RateLimiter)
 		if err != nil {
 			return err
 		}
 		username = target.Username
 
 	case "highlight":
-		posts, username, err = fetchIgHighlightStories(ctx, client, cookiesFile, csrfToken, target.HighlightID, opts.RateLimiter)
+		posts, username, err = fetchIgHighlightStories(ctx, d, cookiesFile, csrfToken, target.HighlightID, opts.RateLimiter)
 		if err != nil {
 			return fmt.Errorf("fetch highlight: %w", err)
 		}
@@ -1537,7 +1538,7 @@ func DownloadInstagram(ctx context.Context, rawURL, outDir string, cookiesFile s
 		}
 
 	case "post", "reel":
-		post, err := fetchSingleIgPost(ctx, client, cookiesFile, csrfToken, target.Shortcode, opts.RateLimiter)
+		post, err := fetchSingleIgPost(ctx, d, cookiesFile, csrfToken, target.Shortcode, opts.RateLimiter)
 		if err != nil {
 			return err
 		}
@@ -1577,7 +1578,7 @@ func DownloadInstagram(ctx context.Context, rawURL, outDir string, cookiesFile s
 		failMu.Lock()
 		failed[id] = err.Error()
 		failMu.Unlock()
-		fmt.Fprintf(os.Stderr, "[provenance] instagram download failed: %s: %v\n", id, err)
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] instagram download failed: %s: %v\n", id, err)
 	}
 
 	for _, p := range posts {
@@ -1588,12 +1589,12 @@ func DownloadInstagram(ctx context.Context, rawURL, outDir string, cookiesFile s
 			postDest := postItem.Destination
 			postContent := igPostMarkdown(p, username)
 			if dryRun {
-				fmt.Printf("[dry-run] instagram post: %s -> %s\n", p.Code, postDest)
+				narrateOut(ctx, kindInfo, reasonInfo, "", "", "[dry-run] instagram post: %s -> %s\n", p.Code, postDest)
 			} else {
 				pool.SubmitWithHooks(func() error {
 					return writeFile(postDest, postContent)
 				}, func() {
-					fmt.Fprintf(os.Stderr, "[provenance] instagram post saved: %s\n", postDest)
+					narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] instagram post saved: %s\n", postDest)
 				}, func(err error) {
 					recordFailure("post:"+p.Code, err)
 				})
@@ -1620,14 +1621,14 @@ func DownloadInstagram(ctx context.Context, rawURL, outDir string, cookiesFile s
 							dest = filepath.Join(base, "images", sanitizeFilename(name))
 						}
 						if dryRun {
-							fmt.Printf("[dry-run] instagram: %s -> %s\n", mediaURL, dest)
+							narrateOut(ctx, kindInfo, reasonInfo, "", "", "[dry-run] instagram: %s -> %s\n", mediaURL, dest)
 							continue
 						}
 						furl := mediaURL
 						pool.SubmitWithHooks(func() error {
 							dl := downloader.New()
 							dl.SpeedLimit = opts.SpeedLimit
-							dl.Progress = opts.Progress
+							dl.Progress = progressFor(ctx, opts.Progress)
 							return dl.Download(ctx, furl, dest, "")
 						}, nil, func(err error) {
 							recordFailure(furl, err)
@@ -1666,14 +1667,14 @@ func DownloadInstagram(ctx context.Context, rawURL, outDir string, cookiesFile s
 					dest = filepath.Join(base, subdir, sanitizeFilename(name))
 				}
 				if dryRun {
-					fmt.Printf("[dry-run] instagram: %s -> %s\n", mediaURL, dest)
+					narrateOut(ctx, kindInfo, reasonInfo, "", "", "[dry-run] instagram: %s -> %s\n", mediaURL, dest)
 					continue
 				}
 				furl := mediaURL
 				pool.SubmitWithHooks(func() error {
 					dl := downloader.New()
 					dl.SpeedLimit = opts.SpeedLimit
-					dl.Progress = opts.Progress
+					dl.Progress = progressFor(ctx, opts.Progress)
 					return dl.Download(ctx, furl, dest, "")
 				}, nil, func(err error) {
 					recordFailure(furl, err)
@@ -1749,11 +1750,13 @@ func IgPostToItem(p igFeedMedia, username, targetType string) resolve.Item {
 }
 
 func ScanInstagramResolved(ctx context.Context, rawURL, outDir, cookiesFile string, opts IgOptions) (resolve.Source, error) {
+	d := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
 	target, err := ParseIgURL(rawURL)
 	if err != nil {
 		return resolve.Source{}, err
 	}
-	client, csrfToken, err := igClient(cookiesFile)
+	csrfToken, err := igClient(d, cookiesFile)
 	if err != nil {
 		return resolve.Source{}, fmt.Errorf("create client: %w", err)
 	}
@@ -1763,29 +1766,29 @@ func ScanInstagramResolved(ctx context.Context, rawURL, outDir, cookiesFile stri
 
 	switch target.Type {
 	case "profile":
-		userID, err := resolveIgUserID(ctx, client, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
+		userID, err := resolveIgUserID(ctx, d, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
 		if err != nil {
 			return resolve.Source{}, fmt.Errorf("resolve user id: %w", err)
 		}
-		posts, err = FetchAllIgPosts(ctx, client, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
+		posts, err = FetchAllIgPosts(ctx, d, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
 		if err != nil {
 			return resolve.Source{}, err
 		}
 		username = target.Username
 
 	case "stories":
-		userID, err := resolveIgUserID(ctx, client, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
+		userID, err := resolveIgUserID(ctx, d, cookiesFile, csrfToken, target.Username, opts.RateLimiter)
 		if err != nil {
 			return resolve.Source{}, fmt.Errorf("resolve user id: %w", err)
 		}
-		posts, err = fetchIgStories(ctx, client, cookiesFile, csrfToken, userID, opts.RateLimiter)
+		posts, err = fetchIgStories(ctx, d, cookiesFile, csrfToken, userID, opts.RateLimiter)
 		if err != nil {
 			return resolve.Source{}, err
 		}
 		username = target.Username
 
 	case "highlight":
-		posts, username, err = fetchIgHighlightStories(ctx, client, cookiesFile, csrfToken, target.HighlightID, opts.RateLimiter)
+		posts, username, err = fetchIgHighlightStories(ctx, d, cookiesFile, csrfToken, target.HighlightID, opts.RateLimiter)
 		if err != nil {
 			return resolve.Source{}, fmt.Errorf("fetch highlight: %w", err)
 		}
@@ -1794,7 +1797,7 @@ func ScanInstagramResolved(ctx context.Context, rawURL, outDir, cookiesFile stri
 		}
 
 	case "post", "reel":
-		post, err := fetchSingleIgPost(ctx, client, cookiesFile, csrfToken, target.Shortcode, opts.RateLimiter)
+		post, err := fetchSingleIgPost(ctx, d, cookiesFile, csrfToken, target.Shortcode, opts.RateLimiter)
 		if err != nil {
 			return resolve.Source{}, err
 		}

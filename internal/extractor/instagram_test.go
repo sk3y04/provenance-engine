@@ -589,7 +589,7 @@ func TestFetchIgMediaPageHostFallback(t *testing.T) {
 	igAPIHosts = []string{iSrv.URL, wSrv.URL}
 	defer func() { igAPIHosts = old }()
 
-	items, next, err := fetchIgMediaPage(context.Background(), &http.Client{}, "", "", "12345", "", nil)
+	items, next, err := fetchIgMediaPage(context.Background(), testDeps(&http.Client{}), "", "", "12345", "", nil)
 	if err != nil {
 		t.Fatalf("expected fallback to second host, got: %v", err)
 	}

@@ -8,11 +8,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 )
 
@@ -73,15 +73,16 @@ type twSearchResponse struct {
 // POST + JSON body shape currently served by X's web client; the method/body
 // detail is isolated here so it can be updated without touching pagination or
 // media handling. Stale query IDs trigger a single invalidate/refresh/retry.
-func fetchTwSearchPage(ctx context.Context, client *http.Client, cookiesFile, csrfToken, query, cursor string, rl *ratelimit.Manager) ([]twTweetResult, string, error) {
+func fetchTwSearchPage(ctx context.Context, d *Deps, cookiesFile, csrfToken, query, cursor string, rl *ratelimit.Manager) ([]twTweetResult, string, error) {
+	client := d.HTTPClient
 	for refresh := 0; refresh < 2; refresh++ {
 		// Only discover the query ID when it is not already known (env override
 		// or a previous page in this process), so bundles are fetched at most
 		// once per process rather than once per page.
-		if twSearchQueryID() == "" {
-			twRefreshQueryIDs(ctx, cookiesFile)
+		if twSearchQueryID(d.QueryIDs) == "" {
+			twRefreshQueryIDs(ctx, d, cookiesFile)
 		}
-		queryID := twSearchQueryID()
+		queryID := twSearchQueryID(d.QueryIDs)
 		if queryID == "" {
 			return nil, "", twSearchQueryIDError()
 		}
@@ -114,7 +115,7 @@ func fetchTwSearchPage(ctx context.Context, client *http.Client, cookiesFile, cs
 			if err != nil {
 				return nil, "", fmt.Errorf("new request: %w", err)
 			}
-			headers, err := twHeaders(cookiesFile, csrfToken)
+			headers, err := twHeaders(d, cookiesFile, csrfToken)
 			if err != nil {
 				return nil, "", err
 			}
@@ -143,14 +144,14 @@ func fetchTwSearchPage(ctx context.Context, client *http.Client, cookiesFile, cs
 				bodyStr := string(preview)
 				if twIsStaleQueryError(resp.StatusCode, bodyStr) && refresh == 0 {
 					staleQuery = true
-					fmt.Fprintf(os.Stderr, "[twitter] search query ID stale (status %d), refreshing...\n", resp.StatusCode)
+					narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] search query ID stale (status %d), refreshing...\n", resp.StatusCode)
 					break
 				}
 				if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 					return nil, "", fmt.Errorf("twitter search authentication failed (status %d): re-export cookies from a logged-in x.com session", resp.StatusCode)
 				}
 				lastErr = fmt.Errorf("twitter status %d", resp.StatusCode)
-				fmt.Fprintf(os.Stderr, "[twitter] search response: %s\n", sanitizeErrorBody(bodyStr))
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] search response: %s\n", sanitizeErrorBody(bodyStr))
 				if resp.StatusCode == http.StatusTooManyRequests {
 					delay := twMaxRetryBackoff
 					if ra := resp.Header.Get("Retry-After"); ra != "" {
@@ -158,7 +159,7 @@ func fetchTwSearchPage(ctx context.Context, client *http.Client, cookiesFile, cs
 							delay = time.Duration(sec) * time.Second
 						}
 					}
-					fmt.Fprintf(os.Stderr, "[twitter] search rate limited (429), waiting %v...\n", delay)
+					narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] search rate limited (429), waiting %v...\n", delay)
 					time.Sleep(delay)
 					continue
 				}
@@ -193,7 +194,7 @@ func fetchTwSearchPage(ctx context.Context, client *http.Client, cookiesFile, cs
 			return tweets, nextCursor, nil
 		}
 		if staleQuery {
-			twInvalidateQueryIDs()
+			twInvalidateQueryIDs(d)
 			continue
 		}
 		return nil, "", lastErr
@@ -223,7 +224,7 @@ func twSearchErrorMessages(errs []struct {
 // far (matching the profile extractor's convention); any other failure after
 // results were collected returns them alongside an explicit error so a partial
 // scan is never reported as complete.
-func FetchAllTwSearchPosts(ctx context.Context, client *http.Client, cookiesFile, csrfToken, query string, limit int, rl *ratelimit.Manager) ([]twTweetResult, error) {
+func FetchAllTwSearchPosts(ctx context.Context, d *Deps, cookiesFile, csrfToken, query string, limit int, rl *ratelimit.Manager) ([]twTweetResult, error) {
 	var all []twTweetResult
 	seen := map[string]bool{}
 	seenCursors := map[string]bool{}
@@ -232,10 +233,10 @@ func FetchAllTwSearchPosts(ctx context.Context, client *http.Client, cookiesFile
 	noProgress := 0
 
 	for {
-		page, nextCursor, err := fetchTwSearchPage(ctx, client, cookiesFile, csrfToken, query, cursor, rl)
+		page, nextCursor, err := fetchTwSearchPage(ctx, d, cookiesFile, csrfToken, query, cursor, rl)
 		if err != nil {
 			if len(all) > 0 && isRateLimitError(err) {
-				fmt.Fprintf(os.Stderr, "[twitter] search rate limited mid-scan, returning %d post(s) from %d page(s)\n", len(all), pages)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] search rate limited mid-scan, returning %d post(s) from %d page(s)\n", len(all), pages)
 				return all, nil
 			}
 			if len(all) > 0 {
@@ -254,7 +255,7 @@ func FetchAllTwSearchPosts(ctx context.Context, client *http.Client, cookiesFile
 			all = append(all, t)
 			newCount++
 		}
-		fmt.Fprintf(os.Stderr, "[twitter] search page %d: %d result(s), %d new, %d total\n", pages, len(page), newCount, len(all))
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] search page %d: %d result(s), %d new, %d total\n", pages, len(page), newCount, len(all))
 
 		if limit > 0 && len(all) >= limit {
 			all = all[:limit]
@@ -264,7 +265,7 @@ func FetchAllTwSearchPosts(ctx context.Context, client *http.Client, cookiesFile
 			break
 		}
 		if seenCursors[nextCursor] {
-			fmt.Fprintf(os.Stderr, "[twitter] search: repeated cursor detected, stopping pagination\n")
+			narratef(ctx, kindInfo, event.ReasonDuplicateCursor, "", "", "[twitter] search: repeated cursor detected, stopping pagination\n")
 			break
 		}
 		seenCursors[nextCursor] = true
@@ -272,7 +273,7 @@ func FetchAllTwSearchPosts(ctx context.Context, client *http.Client, cookiesFile
 		if newCount == 0 {
 			noProgress++
 			if noProgress >= 2 {
-				fmt.Fprintf(os.Stderr, "[twitter] search: no new posts across consecutive pages, stopping pagination\n")
+				narratef(ctx, kindInfo, event.ReasonNoNewPosts, "", "", "[twitter] search: no new posts across consecutive pages, stopping pagination\n")
 				break
 			}
 		} else {

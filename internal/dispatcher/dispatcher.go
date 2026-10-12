@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -40,6 +41,8 @@ type Options struct {
 	// Events, when set, receives presentation-neutral structured events. When
 	// set, the generic/yt-dlp execution path does not write to the terminal.
 	Events event.Sink
+	// Deps are the engine-owned dependencies for this operation.
+	Deps *extractor.Deps
 }
 
 // Reporter receives user-visible URL lifecycle events. It is intentionally tiny
@@ -103,15 +106,21 @@ func (r *CountsReporter) Skip(url, reason string) {
 	r.Counts.Skipped.Add(1)
 }
 
-func PrintSummary(c *Counts, outputDir, sessionName string) {
-	_, _ = fmt.Fprintf(os.Stderr, "\n")
-	_, _ = fmt.Fprintf(os.Stderr, "discovered: %d\n", c.Discovered.Load())
-	_, _ = fmt.Fprintf(os.Stderr, "downloaded: %d\n", c.Succeeded.Load())
-	_, _ = fmt.Fprintf(os.Stderr, "skipped:    %d\n", c.Skipped.Load())
-	_, _ = fmt.Fprintf(os.Stderr, "failed:     %d\n", c.Failed.Load())
-	_, _ = fmt.Fprintf(os.Stderr, "output:     %s\n", outputDir)
+// PrintSummary writes the count summary to w. It is a presentation adapter: the
+// reusable paths emit an EventSummary instead of writing to a terminal, and only
+// the CLI adapter calls this with its own writer.
+func PrintSummary(w io.Writer, c *Counts, outputDir, sessionName string) {
+	if w == nil || c == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(w, "\n")
+	_, _ = fmt.Fprintf(w, "discovered: %d\n", c.Discovered.Load())
+	_, _ = fmt.Fprintf(w, "downloaded: %d\n", c.Succeeded.Load())
+	_, _ = fmt.Fprintf(w, "skipped:    %d\n", c.Skipped.Load())
+	_, _ = fmt.Fprintf(w, "failed:     %d\n", c.Failed.Load())
+	_, _ = fmt.Fprintf(w, "output:     %s\n", outputDir)
 	if sessionName != "" {
-		_, _ = fmt.Fprintf(os.Stderr, "session:    %s\n", sessionName)
+		_, _ = fmt.Fprintf(w, "session:    %s\n", sessionName)
 	}
 }
 
@@ -177,6 +186,8 @@ func Classify(rawURL string) (Site, error) {
 
 // Dispatch routes `rawURL` to the appropriate extractor based on its hostname.
 func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
+	d := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
 	if opts.Reporter != nil {
 		opts.Reporter.Queue(rawURL, "input")
 		opts.Reporter.Start(rawURL)
@@ -214,7 +225,7 @@ func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
 
 	switch site {
 	case SitePatreon:
-		return extractor.RunYtdlp(ctx, rawURL, ytOpts)
+		return extractor.RunYtdlp(ctx, d, rawURL, ytOpts)
 
 	case SiteTwitter:
 		return extractor.DownloadTwitter(ctx, rawURL, opts.OutputDir, opts.CookiesFile, extractor.TwOptions{
@@ -260,7 +271,7 @@ func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
 		event.Emit(ctx, opts.Events, event.Event{
 			Kind: event.KindStageChanged, Stage: event.StageDownloading, URL: rawURL,
 		})
-		stderr, err := extractor.RunYtdlpCaptured(ctx, rawURL, ytOpts)
+		stderr, err := extractor.RunYtdlpCaptured(ctx, d, rawURL, ytOpts)
 		if err == nil {
 			return nil
 		}
@@ -268,13 +279,14 @@ func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
 		if !shouldBrowserFallback(combined) {
 			return err
 		}
-		return browserFallback(ctx, rawURL, opts, ytOpts, err)
+		return browserFallback(ctx, d, rawURL, opts, ytOpts, err)
 	}
 	return engineerr.New(engineerr.UnsupportedSource, "dispatch", rawURL,
 		fmt.Errorf("no extractor for url: %s", rawURL))
 }
 
-func browserFallback(ctx context.Context, rawURL string, opts Options, ytOpts extractor.YtdlpOptions, originalErr error) error {
+func browserFallback(ctx context.Context, d *extractor.Deps, rawURL string, opts Options, ytOpts extractor.YtdlpOptions, originalErr error) error {
+	ctx = event.WithSink(ctx, opts.Events)
 	if !extractor.IsBrowserCandidate(rawURL) {
 		return engineerr.New(engineerr.UnsupportedSource, "browser-fallback", rawURL,
 			fmt.Errorf("browser fallback unavailable: %w", originalErr))
@@ -287,9 +299,9 @@ func browserFallback(ctx context.Context, rawURL string, opts Options, ytOpts ex
 			Detail: "crawling the page (and any pagination) for video links",
 		})
 	} else {
-		fmt.Println("[provenance] crawling the page (and any pagination) for video links...")
+		narrateOut(ctx, kindInfo, event.ReasonBrowserCrawl, rawURL, "crawling the page (and any pagination) for video links", "[provenance] crawling the page (and any pagination) for video links...\n")
 	}
-	links, scrapeErr := extractor.ScrapePlaylistVideoLinks(ctx, rawURL, opts.CookiesFile, opts.ChromePath, 30*time.Second, 500)
+	links, scrapeErr := extractor.ScrapePlaylistVideoLinks(ctx, d, rawURL, opts.CookiesFile, opts.ChromePath, 30*time.Second, 500)
 	if scrapeErr == nil && len(links) > 0 {
 		if cachePath, cerr := writeLinkCache(opts.OutputDir, rawURL, links); cerr == nil {
 			if opts.Events != nil {
@@ -298,13 +310,13 @@ func browserFallback(ctx context.Context, rawURL string, opts Options, ytOpts ex
 					Detail: fmt.Sprintf("saved %d link(s) to %s", len(links), cachePath),
 				})
 			} else {
-				fmt.Fprintf(os.Stderr, "[provenance] saved %d link(s) to %s\n", len(links), cachePath)
-				fmt.Fprintf(os.Stderr, "[provenance]   (re-run later with: provenance grab --batch %q)\n", cachePath)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] saved %d link(s) to %s\n", len(links), cachePath)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance]   (re-run later with: provenance grab --batch %q)\n", cachePath)
 			}
 		} else if opts.Events == nil {
-			fmt.Fprintf(os.Stderr, "[provenance] WARNING: could not save link cache: %v\n", cerr)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] WARNING: could not save link cache: %v\n", cerr)
 		}
-		return downloadVideoLinks(ctx, links, opts)
+		return downloadVideoLinks(ctx, d, links, opts)
 	}
 	if scrapeErr != nil {
 		if opts.Events != nil {
@@ -313,13 +325,13 @@ func browserFallback(ctx context.Context, rawURL string, opts Options, ytOpts ex
 				Detail: scrapeErr.Error(),
 			})
 		} else {
-			fmt.Printf("[provenance] link scrape failed: %v - falling back to media-URL sniffer\n", scrapeErr)
+			narrateOut(ctx, kindInfo, reasonInfo, "", "", "[provenance] link scrape failed: %v - falling back to media-URL sniffer\n", scrapeErr)
 		}
 	} else if opts.Events == nil {
-		fmt.Println("[provenance] no video links found on page - falling back to media-URL sniffer")
+		narrateOut(ctx, kindInfo, event.ReasonLinkScrapeFailed, rawURL, "no video links found on page - falling back to media-URL sniffer", "[provenance] no video links found on page - falling back to media-URL sniffer\n")
 	}
 
-	resolved, berr := extractor.SniffOrFallback(ctx, rawURL, opts.CookiesFile, opts.ChromePath)
+	resolved, berr := extractor.SniffOrFallback(ctx, d, rawURL, opts.CookiesFile, opts.ChromePath)
 	if berr != nil {
 		return engineerr.New(engineerr.ExternalTool, "browser-fallback", rawURL,
 			fmt.Errorf("browser fallback: %w (original error: %v)", berr, originalErr))
@@ -330,15 +342,17 @@ func browserFallback(ctx context.Context, rawURL string, opts Options, ytOpts ex
 			Detail: resolved.MediaURL,
 		})
 	} else {
-		fmt.Printf("[provenance] sniffed media URL: %s\n", resolved.MediaURL)
+		narrateOut(ctx, kindInfo, reasonInfo, "", "", "[provenance] sniffed media URL: %s\n", resolved.MediaURL)
 	}
-	return extractor.RunYtdlp(ctx, resolved.MediaURL, ytOpts)
+	return extractor.RunYtdlp(ctx, d, resolved.MediaURL, ytOpts)
 }
 
 // Scan discovers downloadable items without writing media files. Native
 // extractors return richer metadata; generic URLs use yt-dlp's JSON simulation
 // where possible and fall back to a single URL item.
 func Scan(ctx context.Context, rawURL string, opts Options) (manifest.Manifest, error) {
+	d := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
 	site, err := Classify(rawURL)
 	if err != nil {
 		return manifest.Manifest{}, engineerr.New(engineerr.Validation, "classify", rawURL, err)
@@ -378,7 +392,7 @@ func Scan(ctx context.Context, rawURL string, opts Options) (manifest.Manifest, 
 			RateLimiter: opts.RateLimiter,
 		})
 	default:
-		m, err = extractor.ScanYtdlp(ctx, rawURL, extractor.YtdlpOptions{
+		m, err = extractor.ScanYtdlp(ctx, d, rawURL, extractor.YtdlpOptions{
 			OutputDir:          opts.OutputDir,
 			CookiesFile:        opts.CookiesFile,
 			CookiesFromBrowser: opts.CookiesFromBrowser,
@@ -397,6 +411,8 @@ func Scan(ctx context.Context, rawURL string, opts Options) (manifest.Manifest, 
 }
 
 func ScanResolved(ctx context.Context, rawURL string, opts Options) (resolve.Source, error) {
+	d := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
 	site, err := Classify(rawURL)
 	if err != nil {
 		return resolve.Source{}, engineerr.New(engineerr.Validation, "classify", rawURL, err)
@@ -435,7 +451,7 @@ func ScanResolved(ctx context.Context, rawURL string, opts Options) (resolve.Sou
 			RateLimiter: opts.RateLimiter,
 		})
 	default:
-		return extractor.ScanYtdlpResolved(ctx, rawURL, extractor.YtdlpOptions{
+		return extractor.ScanYtdlpResolved(ctx, d, rawURL, extractor.YtdlpOptions{
 			OutputDir:          opts.OutputDir,
 			CookiesFile:        opts.CookiesFile,
 			CookiesFromBrowser: opts.CookiesFromBrowser,
@@ -478,7 +494,8 @@ func shouldBrowserFallback(haystack string) bool {
 // full Dispatch path) because we already know yt-dlp's generic extractor can
 // handle individual video pages - going through Dispatch again would risk a
 // recursive browser crawl on a transient yt-dlp failure.
-func downloadVideoLinks(ctx context.Context, links []string, opts Options) error {
+func downloadVideoLinks(ctx context.Context, d *extractor.Deps, links []string, opts Options) error {
+	ctx = event.WithSink(ctx, opts.Events)
 	links = dedupeLinks(links)
 	if len(links) > 0 {
 		items := make([]manifest.Item, 0, len(links))
@@ -521,7 +538,7 @@ func downloadVideoLinks(ctx context.Context, links []string, opts Options) error
 		var err error
 		grabArch, err = openURLArchive(filepath.Join(cacheDir, "archive.txt"))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[provenance] WARNING: could not open URL archive: %v\n", err)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] WARNING: could not open URL archive: %v\n", err)
 			grabArch = nil
 		}
 		ytdlpArchivePath = filepath.Join(cacheDir, "ytdlp_archive.txt")
@@ -536,7 +553,7 @@ func downloadVideoLinks(ctx context.Context, links []string, opts Options) error
 		var filtered []string
 		for _, l := range links {
 			if grabArch.hasSuccessful(l) {
-				fmt.Fprintf(os.Stderr, "[provenance] skip (already downloaded): %s\n", l)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] skip (already downloaded): %s\n", l)
 				if opts.Reporter != nil {
 					opts.Reporter.Skip(l, "already downloaded")
 				}
@@ -545,17 +562,17 @@ func downloadVideoLinks(ctx context.Context, links []string, opts Options) error
 			}
 		}
 		if skipped := before - len(filtered); skipped > 0 {
-			fmt.Fprintf(os.Stderr, "[provenance] skipped %d already-downloaded URL(s)\n", skipped)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] skipped %d already-downloaded URL(s)\n", skipped)
 		}
 		links = filtered
 	}
 
 	total := len(links)
 	if total == 0 {
-		fmt.Fprintln(os.Stderr, "[provenance] nothing to download (all URLs already in archive)")
+		narratef(ctx, kindInfo, event.ReasonNothing, "", "", "[provenance] nothing to download (all URLs already in archive)\n")
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "[provenance] downloading %d item(s) with concurrency=%d\n", total, concurrency)
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] downloading %d item(s) with concurrency=%d\n", total, concurrency)
 
 	ytOpts := extractor.YtdlpOptions{
 		OutputDir:          opts.OutputDir,
@@ -591,15 +608,15 @@ func downloadVideoLinks(ctx context.Context, links []string, opts Options) error
 			a := atomic.AddInt64(&attempt, 1)
 			if a == 1 {
 				n := started.Add(1)
-				fmt.Fprintf(os.Stderr, "[provenance] (%d/%d) starting: %s\n", n, total, link)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] (%d/%d) starting: %s\n", n, total, link)
 				if opts.Reporter != nil {
 					opts.Reporter.Start(link)
 				}
 			} else {
-				fmt.Fprintf(os.Stderr, "[provenance] retry %d/3 for %s\n", a, link)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] retry %d/3 for %s\n", a, link)
 			}
 
-			stderr, err := extractor.RunYtdlpCaptured(ctx, link, ytOpts)
+			stderr, err := extractor.RunYtdlpCaptured(ctx, d, link, ytOpts)
 			if err == nil {
 				return nil
 			}
@@ -609,7 +626,7 @@ func downloadVideoLinks(ctx context.Context, links []string, opts Options) error
 			return err
 		}, func() {
 			c := completed.Add(1)
-			fmt.Fprintf(os.Stderr, "[provenance] OK (%d/%d done, %d failed): %s\n",
+			narratef(ctx, kindInfo, reasonInfo, link, "", "[provenance] OK (%d/%d done, %d failed): %s\n",
 				c, total, failed.Load(), link)
 			if opts.Reporter != nil {
 				opts.Reporter.Success(link)
@@ -624,7 +641,7 @@ func downloadVideoLinks(ctx context.Context, links []string, opts Options) error
 				firstErr = err
 			}
 			errMu.Unlock()
-			fmt.Fprintf(os.Stderr, "[provenance] FAILED %s: %v\n", link, err)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] FAILED %s: %v\n", link, err)
 			if opts.Reporter != nil {
 				opts.Reporter.Failure(link, err)
 			}
@@ -636,7 +653,7 @@ func downloadVideoLinks(ctx context.Context, links []string, opts Options) error
 	}
 	pool.Wait()
 
-	fmt.Fprintf(os.Stderr, "[provenance] batch complete: %d/%d succeeded, %d failed\n",
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] batch complete: %d/%d succeeded, %d failed\n",
 		completed.Load(), total, failed.Load())
 	return firstErr
 }
@@ -647,6 +664,8 @@ func downloadVideoLinks(ctx context.Context, links []string, opts Options) error
 // Non-yt-dlp-friendly URLs still go through the full Dispatch path so
 // their custom extractors run.
 func BatchDispatch(ctx context.Context, path string, opts Options) error {
+	d := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open batch file: %w", err)
@@ -669,7 +688,7 @@ func BatchDispatch(ctx context.Context, path string, opts Options) error {
 	if len(urls) == 0 {
 		return fmt.Errorf("batch file %q contained no URLs", path)
 	}
-	fmt.Fprintf(os.Stderr, "[provenance] batch: %d URL(s) loaded from %s\n", len(urls), path)
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] batch: %d URL(s) loaded from %s\n", len(urls), path)
 
 	// Decide per URL: yt-dlp-friendly hosts (anything that classifies as
 	// SiteGeneric or SitePatreon) go straight to RunYtdlp in the worker pool.
@@ -691,13 +710,13 @@ func BatchDispatch(ctx context.Context, path string, opts Options) error {
 
 	var firstErr error
 	if len(fast) > 0 {
-		if err := downloadVideoLinks(ctx, fast, opts); err != nil && firstErr == nil {
+		if err := downloadVideoLinks(ctx, d, fast, opts); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	for _, u := range slow {
 		if err := Dispatch(ctx, u, opts); err != nil {
-			fmt.Fprintf(os.Stderr, "[provenance] %s: %v\n", u, err)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] %s: %v\n", u, err)
 			if firstErr == nil {
 				firstErr = err
 			}

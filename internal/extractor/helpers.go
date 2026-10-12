@@ -2,8 +2,9 @@ package extractor
 
 import (
 	"os"
-	"path/filepath"
 	"strings"
+
+	"path/filepath"
 )
 
 var sanitizeReplacer = strings.NewReplacer(

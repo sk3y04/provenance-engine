@@ -1,20 +1,18 @@
 package tui
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/gen2brain/beeep"
-
 	"github.com/sk3y04/provenance-engine/internal/dispatcher"
+	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/history"
+	"github.com/sk3y04/provenance-engine/internal/render"
 	"github.com/sk3y04/provenance-engine/internal/session"
 )
 
@@ -59,13 +57,15 @@ func (m *model) startRunner(title string, urls []string, opts dispatcher.Options
 	opts.Reporter = rep
 	opts.FileProgress = &fileReporter{prog: prog}
 
-	// Hijack both stdout and stderr so dispatcher / yt-dlp output shows up
-	// in the runner log instead of trashing the TUI alt-screen.
-	restore := redirectStdStreams(prog)
+	// The TUI is an event consumer. Reusable paths never write to a terminal
+	// when a sink is carried on the operation context, so no process-global
+	// stream redirection is needed (and none is safe in a shared process).
+	sink := newTeaSink(prog)
+	opts.Events = sink
+	ctx = event.WithSink(ctx, sink)
 
 	go func() {
 		defer cancel()
-		defer restore()
 		var firstErr error
 		for _, u := range urls {
 			if err := dispatcher.Dispatch(ctx, u, opts); err != nil && firstErr == nil {
@@ -303,64 +303,34 @@ func (r *fileReporter) OnDone(url string, err error) {
 	r.prog.Send(fileDoneMsg{url: url, err: err})
 }
 
-// redirectStdStreams replaces os.Stdout and os.Stderr with pipes whose lines
-// are forwarded to the TUI as runnerLogMsg. This keeps yt-dlp / dispatcher
-// output from corrupting the alt-screen rendering. It returns a function that
-// restores the originals and closes the pipes.
-func redirectStdStreams(prog *tea.Program) func() {
-	origOut, origErr := os.Stdout, os.Stderr
-	rOut, wOut, err1 := os.Pipe()
-	rErr, wErr, err2 := os.Pipe()
-	if err1 != nil || err2 != nil {
-		if rOut != nil {
-			_ = rOut.Close()
-		}
-		if wOut != nil {
-			_ = wOut.Close()
-		}
-		if rErr != nil {
-			_ = rErr.Close()
-		}
-		if wErr != nil {
-			_ = wErr.Close()
-		}
-		return func() {}
-	}
-	os.Stdout = wOut
-	os.Stderr = wErr
+// teaSink implements event.Sink for the runner view. Rendered event lines are
+// forwarded to the TUI as runnerLogMsg.
+type teaSink struct {
+	prog *tea.Program
+	r    *render.Sink
+}
 
-	var wg sync.WaitGroup
-	pump := func(r *os.File) {
-		defer wg.Done()
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 64*1024), 1024*1024)
-		for sc.Scan() {
-			line := stripANSI(sc.Text())
-			if line == "" {
-				continue
-			}
-			// Defensively swallow raw progress markers - the extractor strips
-			// them, but if any leak through (e.g. stdout buffering quirks) we
-			// don't want to dump JSON into the log.
-			if strings.Contains(line, "PROVENANCE_YTDLP_PROGRESS:") {
-				continue
-			}
-			prog.Send(runnerLogMsg{line: line})
-		}
-	}
-	wg.Add(2)
-	go pump(rOut)
-	go pump(rErr)
+func newTeaSink(prog *tea.Program) *teaSink {
+	return &teaSink{prog: prog, r: render.NewSink(lineWriter{prog: prog})}
+}
 
-	return func() {
-		os.Stdout = origOut
-		os.Stderr = origErr
-		_ = wOut.Close()
-		_ = wErr.Close()
-		_ = rOut.Close()
-		_ = rErr.Close()
-		wg.Wait()
+func (s *teaSink) Emit(ctx context.Context, e event.Event) { s.r.Emit(ctx, e) }
+
+// lineWriter forwards each written line to the TUI as a runner log line.
+type lineWriter struct{ prog *tea.Program }
+
+func (w lineWriter) Write(p []byte) (int, error) {
+	if w.prog == nil {
+		return len(p), nil
 	}
+	for _, line := range strings.Split(strings.TrimSuffix(string(p), "\n"), "\n") {
+		line = stripANSI(line)
+		if line == "" {
+			continue
+		}
+		w.prog.Send(runnerLogMsg{line: line})
+	}
+	return len(p), nil
 }
 
 // extractWatchName parses the watch subscription name from a runner title.

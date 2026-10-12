@@ -72,6 +72,12 @@ always gets bounded work even if a client sends an unbounded request.
 The facade deliberately does **not** expose raw yt-dlp arguments, output
 templates, proxy addresses, browser executable paths, or arbitrary headers.
 
+`AutoInstall` is false by default: a hosted operation must not mutate the
+filesystem, so a missing tool is reported as an `external_tool` failure. The CLI
+sets it to preserve its historical behavior. `IsolatedWorkspace` gives each
+operation its own subdirectory under `WorkDir`; a long-lived agent or worker
+sharing one work directory should set it.
+
 ## Lifecycle and concurrency
 
 - Construct one `Engine` with `New` and reuse it. It holds no package globals
@@ -79,8 +85,11 @@ templates, proxy addresses, browser executable paths, or arbitrary headers.
 - Each `Resolve`/`Download` call is independent; a shared per-host rate limiter
   is the only cross-call state, by design.
 - `Config.WorkDir` is engine-owned scratch for the duration of a call. A hosted
-  caller should use a fresh, dedicated directory per operation so concurrent
-  jobs cannot mix.
+  caller should use a fresh, dedicated directory per operation, or set
+  `IsolatedWorkspace`, so concurrent jobs cannot mix.
+- Mutable per-engine state (the X/Twitter query-ID cache and tool paths) lives on
+  an engine-owned `Deps`, not on package globals. The transport stays a package
+  level immutable, concurrency-safe shared service.
 
 ## Cancellation
 
@@ -102,17 +111,27 @@ not influence or cancel the operation. The engine delivers events through an
 internal bounded, panic-recovering notifier, so a slow or misbehaving sink drops
 events rather than stalling extraction.
 
-> Residual limitation: the native Instagram, X/Twitter, Reddit, Album, and
-> browser-fallback extractors still write some narration directly to the
-> terminal; typing and event conversion of those paths continues in Phases 4–5.
-> The generic yt-dlp path and the top-level download coordination are fully
-> event-driven.
+Every path reachable from `Resolve`/`Download` is event-driven: Instagram,
+X/Twitter, hashtag search, Reddit, Album, the browser fallback, and the batch and
+worker-pool paths. Legacy CLI narration is preserved byte-for-byte only when no
+sink is supplied.
+
+Event `Reason` values are stable machine-readable codes registered in
+`internal/event/reasons.go`. `Detail` is a redacted, bounded human hint: raw
+response bodies, cookies, authorization headers, tokens, and URL query strings
+never reach an event. `KindInfo` carries operation facts that are neither a
+warning nor a terminal item outcome.
+
+The sink may be carried on the operation context (`event.WithSink`), which is how
+nested extractor helpers emit without a sink parameter in every signature.
 
 ## Artifacts
 
-`Download` reports every regular file written under `Config.WorkDir` as an
-`Artifact`, excluding the engine's own `_provenance_cache` and `.provenance`
-bookkeeping directories and in-progress `.part` files. `Path` is absolute;
+`Download` reports only the files **created by that operation** as an `Artifact`.
+The operation records what already existed before it started, so a reused work
+directory can never leak another job's artifacts. Engine bookkeeping directories
+(`_provenance_cache`, `.provenance`) and in-progress `.part`/`.ytdl` files are
+never reported. `Path` is absolute;
 `SHA256`, `Size`, and `MIMEType` are computed for the caller. The caller owns
 the files after the call returns (typically: upload, then delete).
 
@@ -132,8 +151,13 @@ and `permanent`. Cancellation is never re-categorized. Unknown causes map to
 
 The generic download path requires the yt-dlp executable; audio-only extraction
 and stream merging require ffmpeg; browser fallback requires Chrome/Chromium.
-Hosted deployments should provision these tools ahead of time. The engine
-auto-installs yt-dlp on first use.
+Hosted deployments should provision these tools ahead of time.
+
+`Engine.Capabilities(ctx)` reports which tools are reachable (`ToolStatus` with
+name, required flag, availability, and resolved path). The probe is read-only: it
+never installs a tool, never downloads anything, and never mutates the
+filesystem, so a health check has no side effects. Auto-install happens only when
+`Config.AutoInstall` is explicitly set.
 
 ## Verifying the public surface
 

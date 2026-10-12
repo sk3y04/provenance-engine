@@ -34,6 +34,10 @@ const (
 	KindItemDone     Kind = "item_done"
 	KindRetry        Kind = "retry"
 	KindSummary      Kind = "summary"
+	// KindInfo carries an operation fact that is neither a warning nor a
+	// terminal item outcome (for example a pagination decision or a fallback
+	// that was taken). Adapters may render or persist it, or ignore it.
+	KindInfo Kind = "info"
 )
 
 // Counts is the terminal tally carried by KindSummary events.
@@ -98,8 +102,13 @@ func Func(fn func(context.Context, Event)) Sink {
 }
 
 // Emit delivers e to sink. It is nil-safe and drops the event if ctx is
-// already done.
+// already done. When sink is nil the sink carried on ctx (see WithSink) is used,
+// so deeply nested extraction paths can emit without threading a sink through
+// every signature.
 func Emit(ctx context.Context, sink Sink, e Event) {
+	if sink == nil {
+		sink = SinkFrom(ctx)
+	}
 	if sink == nil {
 		return
 	}
@@ -114,6 +123,29 @@ func Emit(ctx context.Context, sink Sink, e Event) {
 		e.At = time.Now()
 	}
 	sink.Emit(ctx, e)
+}
+
+type sinkCtxKey struct{}
+
+// WithSink returns a context carrying sink. Emit and Narrate resolve the sink
+// from the context, which keeps long extractor call chains transport-neutral
+// without adding a sink parameter to every helper.
+func WithSink(ctx context.Context, sink Sink) context.Context {
+	if ctx == nil || sink == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, sinkCtxKey{}, sink)
+}
+
+// SinkFrom returns the sink carried on ctx, or nil.
+func SinkFrom(ctx context.Context) Sink {
+	if ctx == nil {
+		return nil
+	}
+	if s, ok := ctx.Value(sinkCtxKey{}).(Sink); ok {
+		return s
+	}
+	return nil
 }
 
 // Notifier is the sanctioned wrapper for a potentially slow, sharing, or
@@ -191,9 +223,22 @@ func (n *Notifier) Emit(ctx context.Context, e Event) {
 	}
 }
 
+// closeGrace bounds how long Close waits for an in-flight delivery. A blocked
+// foreign sink must never stall the operation that produced the events.
+const closeGrace = time.Second
+
 // Close stops delivery and drains queued events. It is safe to call multiple
-// times and safe to call concurrently with Emit.
+// times and safe to call concurrently with Emit. Delivery is bounded by
+// closeGrace so a slow or blocked sink cannot stall the caller.
 func (n *Notifier) Close() {
 	n.once.Do(func() { close(n.quit) })
-	n.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		n.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(closeGrace):
+	}
 }

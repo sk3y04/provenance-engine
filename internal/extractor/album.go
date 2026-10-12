@@ -8,10 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -20,6 +18,7 @@ import (
 	"time"
 
 	"github.com/sk3y04/provenance-engine/internal/downloader"
+	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 	"github.com/sk3y04/provenance-engine/internal/resolve"
@@ -56,20 +55,6 @@ import (
 //	uses a signing endpoint discovered per page (jsCDN + signUrl), which is
 //	why the API path is treated as a fallback.
 // ---------------------------------------------------------------------------
-
-var (
-	albTransport = &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          10,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-	}
-
-	albClient = &http.Client{Timeout: 30 * time.Second, Transport: albTransport, CheckRedirect: downloader.SafeRedirect}
-)
 
 const (
 	albErrorPreviewLimit = 4 << 10
@@ -155,6 +140,11 @@ type AlbumOptions struct {
 	Progress    downloader.ProgressReporter
 	Limit       int
 	RateLimiter *ratelimit.Manager
+	// Events, when set, receives presentation-neutral structured events. When
+	// set, this path does not write to the terminal.
+	Events event.Sink
+	// Deps are the engine-owned dependencies for this operation.
+	Deps *Deps
 }
 
 // albFile is one media file discovered on an album page.
@@ -246,11 +236,13 @@ func albHostIsAlbum(host string) bool {
 // cookiesFile is accepted for signature parity with the other extractors but
 // is unused: public albums require no authentication.
 func ScanAlbum(ctx context.Context, rawURL, outDir, cookiesFile string, opts AlbumOptions) (manifest.Manifest, error) {
-	albumURL, err := resolveAlbumURL(ctx, rawURL, opts.RateLimiter)
+	d := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
+	albumURL, err := resolveAlbumURL(ctx, d, rawURL, opts.RateLimiter)
 	if err != nil {
 		return manifest.Manifest{}, err
 	}
-	album, err := scrapeAlbum(ctx, albumURL, opts.RateLimiter)
+	album, err := scrapeAlbum(ctx, d, albumURL, opts.RateLimiter)
 	if err != nil {
 		return manifest.Manifest{}, err
 	}
@@ -264,12 +256,13 @@ func ScanAlbum(ctx context.Context, rawURL, outDir, cookiesFile string, opts Alb
 // via the shared worker pool. cookiesFile is accepted for signature parity
 // but is unused (public albums need no auth).
 func DownloadAlbum(ctx context.Context, rawURL, outDir, cookiesFile string, opts AlbumOptions, dryRun bool) error {
+	d := depsFor(opts.Deps)
 	_ = cookiesFile
-	albumURL, err := resolveAlbumURL(ctx, rawURL, opts.RateLimiter)
+	albumURL, err := resolveAlbumURL(ctx, d, rawURL, opts.RateLimiter)
 	if err != nil {
 		return err
 	}
-	album, err := scrapeAlbum(ctx, albumURL, opts.RateLimiter)
+	album, err := scrapeAlbum(ctx, d, albumURL, opts.RateLimiter)
 	if err != nil {
 		return err
 	}
@@ -277,7 +270,7 @@ func DownloadAlbum(ctx context.Context, rawURL, outDir, cookiesFile string, opts
 	if title == "" {
 		title = albAlbumIDFromURL(albumURL)
 	}
-	fmt.Fprintf(os.Stderr, "[album] %q: %d file(s) at %s\n", sanitizeFilename(title), len(album.Files), albumURL)
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[album] %q: %d file(s) at %s\n", sanitizeFilename(title), len(album.Files), albumURL)
 
 	files := albApplyLimit(album.Files, opts.Limit)
 	items := albFileItems(title, rawURL, outDir, files)
@@ -299,24 +292,24 @@ func DownloadAlbum(ctx context.Context, rawURL, outDir, cookiesFile string, opts
 		failMu.Lock()
 		failed[id] = err.Error()
 		failMu.Unlock()
-		fmt.Fprintf(os.Stderr, "[provenance] album download failed: %s: %v\n", id, err)
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] album download failed: %s: %v\n", id, err)
 	}
 
 	for _, it := range items {
 		it := it
 		if dryRun {
-			fmt.Printf("[dry-run] album: %s -> %s\n", it.URL, it.Destination)
+			narrateOut(ctx, kindInfo, reasonInfo, "", "", "[dry-run] album: %s -> %s\n", it.URL, it.Destination)
 			continue
 		}
 		pageURL := it.URL
 		pool.SubmitWithHooks(func() error {
-			dlURL, ref, rerr := state.resolveDownloadURL(ctx, pageURL, opts.RateLimiter)
+			dlURL, ref, rerr := state.resolveDownloadURL(ctx, d, pageURL, opts.RateLimiter)
 			if rerr != nil {
 				return rerr
 			}
 			dl := downloader.New()
 			dl.SpeedLimit = opts.SpeedLimit
-			dl.Progress = opts.Progress
+			dl.Progress = progressFor(ctx, opts.Progress)
 			return dl.Download(ctx, dlURL, it.Destination, ref)
 		}, nil, func(err error) {
 			recordFailure(pageURL, err)
@@ -332,12 +325,14 @@ func DownloadAlbum(ctx context.Context, rawURL, outDir, cookiesFile string, opts
 
 // ScanAlbumResolved returns a resolve.Source describing the album's files.
 func ScanAlbumResolved(ctx context.Context, rawURL, outDir, cookiesFile string, opts AlbumOptions) (resolve.Source, error) {
+	d := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
 	_ = cookiesFile
-	albumURL, err := resolveAlbumURL(ctx, rawURL, opts.RateLimiter)
+	albumURL, err := resolveAlbumURL(ctx, d, rawURL, opts.RateLimiter)
 	if err != nil {
 		return resolve.Source{}, err
 	}
-	album, err := scrapeAlbum(ctx, albumURL, opts.RateLimiter)
+	album, err := scrapeAlbum(ctx, d, albumURL, opts.RateLimiter)
 	if err != nil {
 		return resolve.Source{}, err
 	}
@@ -370,12 +365,12 @@ func ScanAlbumResolved(ctx context.Context, rawURL, outDir, cookiesFile string, 
 // resolveAlbumURL turns the raw input into a direct /a/<id> album URL. A
 // direct album URL passes through untouched; an album-listing page is
 // fetched and the first outbound album link it contains is returned.
-func resolveAlbumURL(ctx context.Context, rawURL string, rl *ratelimit.Manager) (string, error) {
+func resolveAlbumURL(ctx context.Context, d *Deps, rawURL string, rl *ratelimit.Manager) (string, error) {
 	switch albURLKind(rawURL) {
 	case "album":
 		return rawURL, nil
 	case "index":
-		page, err := albFetchHTML(ctx, rawURL, rawURL, rl)
+		page, err := albFetchHTML(ctx, d, rawURL, rawURL, rl)
 		if err != nil {
 			return "", fmt.Errorf("fetch index listing: %w", err)
 		}
@@ -386,7 +381,7 @@ func resolveAlbumURL(ctx context.Context, rawURL string, rl *ratelimit.Manager) 
 		if link == "" {
 			return "", fmt.Errorf("index listing did not contain any album link (page structure may have changed)")
 		}
-		fmt.Fprintf(os.Stderr, "[album] resolved index listing -> %s\n", link)
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[album] resolved index listing -> %s\n", link)
 		return link, nil
 	default:
 		return "", fmt.Errorf("unsupported album or index url: %s (expected an /a/<id> album page or an index listing)", rawURL)
@@ -423,8 +418,8 @@ var albAlbumHrefRe = regexp.MustCompile(`(?i)href=["'](https?://[^"']+)["']`)
 // `.theName` paragraph echoing the filename. One stray anchor
 // (`href="/f/' + file.slug + '"`) is a server-side template fragment and is
 // skipped by albFileLinksRe because it does not match a plain slug.
-func scrapeAlbum(ctx context.Context, albumURL string, rl *ratelimit.Manager) (*albAlbum, error) {
-	page, err := albFetchHTML(ctx, albumURL, albumURL, rl)
+func scrapeAlbum(ctx context.Context, d *Deps, albumURL string, rl *ratelimit.Manager) (*albAlbum, error) {
+	page, err := albFetchHTML(ctx, d, albumURL, albumURL, rl)
 	if err != nil {
 		return nil, fmt.Errorf("fetch album page: %w", err)
 	}
@@ -504,7 +499,7 @@ func albNameInWindow(window string) string {
 
 // resolveDownloadURL resolves a single per-file page to a directly downloadable
 // CDN URL, caching per page and reusing any discovered-working CDN endpoint.
-func (s *albResolverState) resolveDownloadURL(ctx context.Context, pageURL string, rl *ratelimit.Manager) (string, string, error) {
+func (s *albResolverState) resolveDownloadURL(ctx context.Context, d *Deps, pageURL string, rl *ratelimit.Manager) (string, string, error) {
 	s.mu.Lock()
 	if u, ok := s.fileURLs[pageURL]; ok {
 		s.mu.Unlock()
@@ -512,11 +507,11 @@ func (s *albResolverState) resolveDownloadURL(ctx context.Context, pageURL strin
 	}
 	s.mu.Unlock()
 
-	info, err := fetchFilePage(ctx, pageURL, rl)
+	info, err := fetchFilePage(ctx, d, pageURL, rl)
 	if err != nil {
 		return "", "", err
 	}
-	dlURL, ref, err := s.resolveDownloadURLForInfo(ctx, info, rl)
+	dlURL, ref, err := s.resolveDownloadURLForInfo(ctx, d, info, rl)
 	if err != nil {
 		return "", "", err
 	}
@@ -530,18 +525,18 @@ func (s *albResolverState) resolveDownloadURL(ctx context.Context, pageURL strin
 // resolveDownloadURLForInfo resolves an already-parsed per-file info to a
 // directly downloadable CDN URL. It first tries the live signing flow (jsCDN +
 // signUrl) and falls back to the legacy POST-to-CDN-API flow.
-func (s *albResolverState) resolveDownloadURLForInfo(ctx context.Context, info *albFileInfo, rl *ratelimit.Manager) (string, string, error) {
+func (s *albResolverState) resolveDownloadURLForInfo(ctx context.Context, d *Deps, info *albFileInfo, rl *ratelimit.Manager) (string, string, error) {
 	// Primary live path: the per-file page exposes a storage URL (jsCDN) and a
 	// signing endpoint (signUrl); a signed GET yields the real file.
 	if info.SignURL != "" && info.CDNUri != "" {
-		if dlURL, ref, ok := albSigningDownloadURL(ctx, info, rl); ok {
+		if dlURL, ref, ok := albSigningDownloadURL(ctx, d, info, rl); ok {
 			return dlURL, ref, nil
 		}
 	}
 
 	// Fallback path: POST the file id to the CDN API (XOR-decrypting if the
 	// response is encrypted). Probes every (domain, suffix) pair.
-	return resolveFileViaAPI(ctx, info, s, rl)
+	return resolveFileViaAPI(ctx, d, info, s, rl)
 }
 
 // albParseFilePage parses a per-file page's h1, data-file-id, and (when present)
@@ -566,8 +561,8 @@ func albParseFilePage(pageURL, html string) *albFileInfo {
 }
 
 // fetchFilePage fetches a per-file page and parses it.
-func fetchFilePage(ctx context.Context, pageURL string, rl *ratelimit.Manager) (*albFileInfo, error) {
-	page, err := albFetchHTML(ctx, pageURL, pageURL, rl)
+func fetchFilePage(ctx context.Context, d *Deps, pageURL string, rl *ratelimit.Manager) (*albFileInfo, error) {
+	page, err := albFetchHTML(ctx, d, pageURL, pageURL, rl)
 	if err != nil {
 		return nil, fmt.Errorf("fetch per-file page: %w", err)
 	}
@@ -593,18 +588,18 @@ func albSlugFromPageURL(pageURL string) string {
 // albSigningDownloadURL performs the live signing flow: GET the sign endpoint
 // with the storage path, then append the returned token/expiration to jsCDN.
 // Returns ok=false when the sign response is missing a token or malformed.
-func albSigningDownloadURL(ctx context.Context, info *albFileInfo, rl *ratelimit.Manager) (string, string, bool) {
+func albSigningDownloadURL(ctx context.Context, d *Deps, info *albFileInfo, rl *ratelimit.Manager) (string, string, bool) {
 	raw, err := url.Parse(info.CDNUri)
 	if err != nil || raw.Path == "" {
 		return "", "", false
 	}
 	signURL := info.SignURL + "?path=" + url.PathEscape(raw.Path)
-	body, status, err := albFetchJSON(ctx, signURL, info.PageURL, "", rl, nil)
+	body, status, err := albFetchJSON(ctx, d, signURL, info.PageURL, "", rl, nil)
 	if err != nil {
 		return "", "", false
 	}
 	if status != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "[album] sign endpoint status %d: %s\n", status, sanitizeErrorBody(string(body)))
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[album] sign endpoint status %d: %s\n", status, sanitizeErrorBody(string(body)))
 		return "", "", false
 	}
 	var sig struct {
@@ -628,14 +623,14 @@ func albSigningDownloadURL(ctx context.Context, info *albFileInfo, rl *ratelimit
 // any working endpoint discovered earlier in this run and falling back across
 // the domain + suffix tables. Returns an error only after every option is
 // exhausted.
-func resolveFileViaAPI(ctx context.Context, info *albFileInfo, s *albResolverState, rl *ratelimit.Manager) (string, string, error) {
+func resolveFileViaAPI(ctx context.Context, d *Deps, info *albFileInfo, s *albResolverState, rl *ratelimit.Manager) (string, string, error) {
 	if info.Slug == "" && info.FileID == "" {
 		return "", "", fmt.Errorf("album: per-file page exposed no file id or slug")
 	}
 
 	// Reuse a working endpoint discovered for a previous file in this run.
 	if cdn, suffix, ok := s.workingAPIEndpoint(); ok {
-		u, ref, ok2, err := albAPIGet(ctx, cdn, suffix, info, s, rl)
+		u, ref, ok2, err := albAPIGet(ctx, d, cdn, suffix, info, s, rl)
 		if err == nil && ok2 {
 			return u, ref, nil
 		}
@@ -649,10 +644,10 @@ func resolveFileViaAPI(ctx context.Context, info *albFileInfo, s *albResolverSta
 				continue
 			}
 			s.apiMarkTried(key)
-			u, ref, ok, err := albAPIGet(ctx, cdn, suffix, info, s, rl)
+			u, ref, ok, err := albAPIGet(ctx, d, cdn, suffix, info, s, rl)
 			if err != nil {
 				lastErr = err
-				fmt.Fprintf(os.Stderr, "[album] API %s%s failed: %v\n", cdn, suffix, err)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[album] API %s%s failed: %v\n", cdn, suffix, err)
 				continue
 			}
 			if !ok {
@@ -678,14 +673,14 @@ type albAPIResponse struct {
 
 // albAPIGet POSTs the file id to one (domain, suffix) endpoint and interprets
 // the response. ok=false means "not usable right now, try another endpoint".
-func albAPIGet(ctx context.Context, cdn, suffix string, info *albFileInfo, s *albResolverState, rl *ratelimit.Manager) (string, string, bool, error) {
+func albAPIGet(ctx context.Context, d *Deps, cdn, suffix string, info *albFileInfo, s *albResolverState, rl *ratelimit.Manager) (string, string, bool, error) {
 	endpoint := "https://" + cdn + suffix
 	ref := "https://" + cdn + "/file/" + firstNonEmpty(info.FileID, info.Slug)
 	payload, err := json.Marshal(map[string]string{"id": firstNonEmpty(info.FileID, info.Slug)})
 	if err != nil {
 		return "", "", false, fmt.Errorf("marshal api body: %w", err)
 	}
-	body, status, err := albFetchJSON(ctx, endpoint, ref, "https://"+cdn, rl, payload)
+	body, status, err := albFetchJSON(ctx, d, endpoint, ref, "https://"+cdn, rl, payload)
 	if err != nil {
 		return "", "", false, err
 	}
@@ -906,7 +901,7 @@ func albUnescapeJS(s string) string {
 // extractors)
 // ---------------------------------------------------------------------------
 
-func albFetchHTML(ctx context.Context, rawURL, referer string, rl *ratelimit.Manager) ([]byte, error) {
+func albFetchHTML(ctx context.Context, d *Deps, rawURL, referer string, rl *ratelimit.Manager) ([]byte, error) {
 	var lastErr error
 	for attempt := 1; attempt <= albMaxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -925,7 +920,7 @@ func albFetchHTML(ctx context.Context, rawURL, referer string, rl *ratelimit.Man
 			_ = rl.GetLimiter(albHostFromURL(rawURL)).Wait(ctx)
 		}
 
-		resp, err := albClient.Do(req)
+		resp, err := d.HTTPClient.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, fmt.Errorf("http: %w", err)
@@ -942,7 +937,7 @@ func albFetchHTML(ctx context.Context, rawURL, referer string, rl *ratelimit.Man
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("album status %d", resp.StatusCode)
-			fmt.Fprintf(os.Stderr, "[album] response: %s\n", sanitizeErrorBody(body))
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[album] response: %s\n", sanitizeErrorBody(body))
 			if resp.StatusCode == http.StatusTooManyRequests {
 				time.Sleep(albMaxRetryBackoff)
 				continue
@@ -966,7 +961,7 @@ func albFetchHTML(ctx context.Context, rawURL, referer string, rl *ratelimit.Man
 	return nil, lastErr
 }
 
-func albFetchJSON(ctx context.Context, rawURL, referer, origin string, rl *ratelimit.Manager, payload []byte) ([]byte, int, error) {
+func albFetchJSON(ctx context.Context, d *Deps, rawURL, referer, origin string, rl *ratelimit.Manager, payload []byte) ([]byte, int, error) {
 	var lastErr error
 	for attempt := 1; attempt <= albMaxAttempts; attempt++ {
 		method := http.MethodGet
@@ -994,7 +989,7 @@ func albFetchJSON(ctx context.Context, rawURL, referer, origin string, rl *ratel
 			_ = rl.GetLimiter(albHostFromURL(rawURL)).Wait(ctx)
 		}
 
-		resp, err := albClient.Do(req)
+		resp, err := d.HTTPClient.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, 0, fmt.Errorf("http: %w", err)
@@ -1011,7 +1006,7 @@ func albFetchJSON(ctx context.Context, rawURL, referer, origin string, rl *ratel
 			_ = resp.Body.Close()
 			status := resp.StatusCode
 			lastErr = fmt.Errorf("album api status %d", status)
-			fmt.Fprintf(os.Stderr, "[album] api response: %s\n", sanitizeErrorBody(string(preview)))
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[album] api response: %s\n", sanitizeErrorBody(string(preview)))
 			if status == http.StatusTooManyRequests {
 				time.Sleep(albMaxRetryBackoff)
 				continue

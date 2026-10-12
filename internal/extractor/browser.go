@@ -290,7 +290,7 @@ type ResolvedTarget struct {
 }
 
 // SniffOrFallback runs the sniffer and packages the result.
-func SniffOrFallback(ctx context.Context, pageURL, cookiesFile, chromePath string) (ResolvedTarget, error) {
+func SniffOrFallback(ctx context.Context, d *Deps, pageURL, cookiesFile, chromePath string) (ResolvedTarget, error) {
 	media, err := SniffMediaURL(ctx, pageURL, BrowserOptions{
 		CookiesFile: cookiesFile,
 		Timeout:     30 * time.Second,
@@ -416,7 +416,7 @@ func ScrapeVideoLinks(ctx context.Context, pageURL, cookiesFile string, timeout 
 // A single browser instance is reused for the whole crawl. `perPageTimeout`
 // bounds how long we wait for each page transition. `maxPages` is a hard cap
 // on the number of distinct pages visited.
-func ScrapePlaylistVideoLinks(ctx context.Context, pageURL, cookiesFile, chromePath string, perPageTimeout time.Duration, maxPages int) ([]string, error) {
+func ScrapePlaylistVideoLinks(ctx context.Context, d *Deps, pageURL, cookiesFile, chromePath string, perPageTimeout time.Duration, maxPages int) ([]string, error) {
 	if perPageTimeout == 0 {
 		perPageTimeout = 30 * time.Second
 	}
@@ -620,7 +620,7 @@ func ScrapePlaylistVideoLinks(ctx context.Context, pageURL, cookiesFile, chromeP
 		// Harvest video links from the current page.
 		hrefs, err := scrapeVideoHrefs()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[provenance] page %d scrape failed: %v\n", pageNum, err)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] page %d scrape failed: %v\n", pageNum, err)
 			break
 		}
 		newVideos := 0
@@ -634,15 +634,15 @@ func ScrapePlaylistVideoLinks(ctx context.Context, pageURL, cookiesFile, chromeP
 
 		fp, err := fingerprint()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[provenance] page %d fingerprint failed: %v\n", pageNum, err)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] page %d fingerprint failed: %v\n", pageNum, err)
 			break
 		}
-		fmt.Printf("[provenance]   page %d: +%d videos (total: %d)\n", pageNum, newVideos, len(allVideos))
+		narrateOut(ctx, kindInfo, reasonInfo, "", "", "[provenance]   page %d: +%d videos (total: %d)\n", pageNum, newVideos, len(allVideos))
 
 		// Try to advance to the next page.
 		clicked, err := clickNext()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[provenance] click next failed: %v\n", err)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] click next failed: %v\n", err)
 			break
 		}
 		if !clicked {
@@ -652,7 +652,7 @@ func ScrapePlaylistVideoLinks(ctx context.Context, pageURL, cookiesFile, chromeP
 		// Wait for the DOM/URL to actually change.
 		newFp, err := waitForChange(fp)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[provenance] %v (stopping at page %d)\n", err, pageNum)
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] %v (stopping at page %d)\n", err, pageNum)
 			break
 		}
 		if newFp == prevFingerprint {
@@ -663,7 +663,7 @@ func ScrapePlaylistVideoLinks(ctx context.Context, pageURL, cookiesFile, chromeP
 	}
 
 	if pageNum >= maxPages {
-		fmt.Fprintf(os.Stderr, "[provenance] WARNING: hit maxPages=%d cap; some videos may have been missed\n", maxPages)
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] WARNING: hit maxPages=%d cap; some videos may have been missed\n", maxPages)
 	}
 	return allVideos, nil
 }

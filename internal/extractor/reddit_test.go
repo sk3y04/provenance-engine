@@ -1,6 +1,7 @@
 package extractor
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -61,7 +62,7 @@ func TestFixMediaExt(t *testing.T) {
 		if err := os.WriteFile(src, pngMagic, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := fixMediaExt(src); err != nil {
+		if err := fixMediaExt(context.Background(), src); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(filepath.Join(dir, "abc.png")); err != nil {
@@ -77,7 +78,7 @@ func TestFixMediaExt(t *testing.T) {
 		if err := os.WriteFile(src, jpgMagic, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := fixMediaExt(src); err != nil {
+		if err := fixMediaExt(context.Background(), src); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(filepath.Join(dir, "abc.jpg")); err != nil {
@@ -90,7 +91,7 @@ func TestFixMediaExt(t *testing.T) {
 		if err := os.WriteFile(src, pngMagic, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := fixMediaExt(src); err != nil {
+		if err := fixMediaExt(context.Background(), src); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(src); err != nil {
@@ -103,7 +104,7 @@ func TestFixMediaExt(t *testing.T) {
 		if err := os.WriteFile(src, []byte("plain text"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := fixMediaExt(src); err != nil {
+		if err := fixMediaExt(context.Background(), src); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(src); err != nil {
@@ -120,7 +121,7 @@ func TestFixMediaExt(t *testing.T) {
 		if err := os.WriteFile(tgt, pngMagic, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := fixMediaExt(src); err != nil {
+		if err := fixMediaExt(context.Background(), src); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(src); err != nil {

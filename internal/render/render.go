@@ -51,6 +51,15 @@ func (s *Sink) Emit(_ context.Context, e event.Event) {
 		if hint := diagnose.Hint(e.Err); hint != "" {
 			_, _ = fmt.Fprintf(s.w, "[provenance] hint: %s\n", hint)
 		}
+	case event.KindInfo:
+		msg := e.Detail
+		if msg == "" {
+			msg = e.Reason
+		}
+		if msg == "" {
+			return
+		}
+		_, _ = fmt.Fprintf(s.w, "[provenance] %s\n", msg)
 	case event.KindSummary:
 		if e.Summary == nil {
 			return

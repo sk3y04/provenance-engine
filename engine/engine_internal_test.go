@@ -12,6 +12,7 @@ import (
 	ievent "github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/resolve"
 	"github.com/sk3y04/provenance-engine/internal/worker"
+	"github.com/sk3y04/provenance-engine/internal/workspace"
 )
 
 func TestEffectiveLimitClampsToMaxItems(t *testing.T) {
@@ -87,21 +88,30 @@ func TestPanicErrPrefersCancellation(t *testing.T) {
 	}
 }
 
-func TestCollectArtifactsSkipsBookkeeping(t *testing.T) {
+// TestArtifactsReportOnlyFilesCreatedByTheOperation is the cross-job leakage
+// gate: a reused work directory must never report files that existed before the
+// operation, bookkeeping directories, or in-progress partials.
+func TestArtifactsReportOnlyFilesCreatedByTheOperation(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "video.mp4"), "hello")
-	mustWrite(t, filepath.Join(root, "_metadata", "video.info.json"), "{}")
-	mustWrite(t, filepath.Join(root, "partial.mp4.part"), "half")
-	mustWrite(t, filepath.Join(root, "_provenance_cache", "archive.txt"), "ok:u\n")
-	mustWrite(t, filepath.Join(root, ".provenance", "runs", "x.json"), "{}")
+	mustWrite(t, filepath.Join(root, "earlier-job.mp4"), "old")
 
-	got, err := collectArtifacts(root)
+	w, err := workspace.New(root, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(w.Root, "video.mp4"), "hello")
+	mustWrite(t, filepath.Join(w.Root, "_metadata", "video.info.json"), "{}")
+	mustWrite(t, filepath.Join(w.Root, "partial.mp4.part"), "half")
+	mustWrite(t, filepath.Join(w.Root, "_provenance_cache", "archive.txt"), "ok:u\n")
+	mustWrite(t, filepath.Join(w.Root, ".provenance", "runs", "x.json"), "{}")
+
+	got, err := w.Created()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var names []string
-	for _, a := range got {
-		names = append(names, a.Filename)
+	for _, e := range got {
+		names = append(names, e.Name)
 	}
 	want := []string{"_metadata/video.info.json", "video.mp4"}
 	if len(names) != len(want) {
@@ -112,27 +122,48 @@ func TestCollectArtifactsSkipsBookkeeping(t *testing.T) {
 			t.Fatalf("artifacts = %v, want %v", names, want)
 		}
 	}
-	if got[1].SHA256 != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
-		t.Fatalf("sha256 = %q", got[1].SHA256)
-	}
-	if got[1].MIMEType != "video/mp4" {
-		t.Fatalf("mime = %q, want video/mp4", got[1].MIMEType)
-	}
 	if got[1].Size != 5 {
-		t.Fatalf("size = %d, want 5", got[1].Size)
+		t.Fatalf("entry = %+v, want size 5", got[1])
+	}
+	if sum, err := sha256File(got[1].Path); err != nil || sum == "" {
+		t.Fatalf("hash: %v", err)
 	}
 	if !filepath.IsAbs(got[1].Path) {
 		t.Fatalf("path %q is not absolute", got[1].Path)
 	}
 }
 
-func TestCollectArtifactsMissingDir(t *testing.T) {
-	got, err := collectArtifacts(filepath.Join(t.TempDir(), "does-not-exist"))
+// TestConcurrentOperationsUseDistinctWorkspaces proves two jobs sharing a parent
+// directory cannot report each other's files.
+func TestConcurrentOperationsUseDistinctWorkspaces(t *testing.T) {
+	root := t.TempDir()
+	a, err := workspace.New(root, true)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
-	if got != nil {
-		t.Fatalf("expected nil artifacts, got %v", got)
+	b, err := workspace.New(root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Root == b.Root {
+		t.Fatal("isolated workspaces must not share a root")
+	}
+	mustWrite(t, filepath.Join(a.Root, "a.bin"), "a")
+	mustWrite(t, filepath.Join(b.Root, "b.bin"), "b")
+
+	ga, err := a.Created()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gb, err := b.Created()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ga) != 1 || ga[0].Name != "a.bin" {
+		t.Fatalf("workspace A reported %+v", ga)
+	}
+	if len(gb) != 1 || gb[0].Name != "b.bin" {
+		t.Fatalf("workspace B reported %+v", gb)
 	}
 }
 

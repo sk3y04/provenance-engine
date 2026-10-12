@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Transport-neutral extractor paths (Phase 1)**: every path reachable from
+  `engine.Resolve` and `engine.Download` — Instagram, X/Twitter, hashtag search,
+  Reddit, Album, the browser fallback, and the dispatcher batch/pool paths — now
+  emits structured events instead of writing to a terminal, and writes nothing to
+  stdout/stderr when the operation carries an event sink. Stable machine-readable
+  reason codes are defined in `internal/event/reasons.go`; legacy CLI narration is
+  preserved byte-for-byte when no sink is supplied, so CLI golden output is
+  unchanged.
+- **Event sink on the operation context** (`internal/event.WithSink` /
+  `SinkFrom`): nested helper functions emit through the context instead of
+  threading a sink through every signature. `event.Emit` resolves the context sink
+  when no explicit sink is passed. New `event.KindInfo` carries operation facts
+  (pagination decisions, fallbacks taken) that are neither warnings nor terminal
+  item outcomes; `internal/render` renders it.
+- **Event redaction** (`internal/redact`): `Detail` bounds, normalizes, and removes
+  cookie/authorization/bearer/token/session fragments, and `URL` drops query
+  strings and fragments, so events never carry raw platform response bodies,
+  cookies, auth headers, or secret-bearing URLs. Response-body narration now emits
+  a stable fact (for example a status code) instead of a body preview.
+- **Operation-scoped workspace** (`internal/workspace`): `Download` runs in a
+  workspace that records what already existed and reports only files the operation
+  created, excluding engine bookkeeping directories and in-progress partials.
+  `engine.Config.IsolatedWorkspace` gives each operation its own subdirectory, the
+  only arrangement that separates two concurrent jobs sharing a parent directory.
+- **Typed capability probe** (`internal/capability`, `engine.Capabilities`,
+  `engine.ToolStatus`): reports yt-dlp (required), ffmpeg, ffprobe, and Chrome
+  without installing a tool, downloading anything, or mutating the filesystem, so
+  a health check has no side effects. `engine.Config.AutoInstall` is false by
+  default; the CLI keeps its historical auto-install behavior.
+- **Engine-owned dependencies** (`internal/extractor.Deps`): the X/Twitter query-ID
+  cache and the tool paths are now per-engine instead of process-global. The
+  transport stays a package-level immutable, concurrency-safe shared service.
+- **Cancellable retry/backoff paths**: `sleepCtx` replaces `time.Sleep` in every
+  extractor retry and rate-limit backoff, so a canceled operation stops instead of
+  waiting out a `Retry-After`.
+- **Bounded sink close**: `event.Notifier.Close` waits at most a grace period for
+  an in-flight delivery, so a blocked foreign sink can never stall the caller.
+
+### Changed
+
+- `dispatcher.PrintSummary` is now a presentation adapter taking an `io.Writer`;
+  reusable paths emit `EventSummary` and never write to a terminal themselves.
+- The TUI no longer reassigns `os.Stdout`/`os.Stderr`. It consumes events through
+  an `event.Sink` (`internal/tui.teaSink`), which is safe to run alongside other
+  consumers in a shared process.
+- `Notifier.Close` is bounded by a grace period rather than waiting indefinitely
+  for a slow sink.
+
 ## [0.8.0] - 2026-10-08
 
 ### Changed

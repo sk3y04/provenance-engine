@@ -28,3 +28,9 @@ func Download(ctx context.Context, eng *engine.Engine, rawURL string) (engine.Re
 
 // Kind reports the category of an engine error using only exported helpers.
 func Kind(err error) engine.ErrorKind { return engine.ErrorKindOf(err) }
+
+// Capabilities reads the read-only tool probe through the exported API. A hosted
+// caller uses it for health checks; it has no side effects.
+func Capabilities(ctx context.Context, eng *engine.Engine) []engine.ToolStatus {
+	return eng.Capabilities(ctx)
+}

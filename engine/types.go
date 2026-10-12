@@ -57,6 +57,25 @@ type Config struct {
 	// ChromePath optionally overrides the Chrome/Chromium executable used by
 	// the browser fallback.
 	ChromePath string
+
+	// AutoInstall permits a missing tool to be downloaded into the local cache.
+	// It is false by default so a hosted operation cannot mutate the filesystem;
+	// the CLI keeps its historical auto-install behavior.
+	AutoInstall bool
+
+	// IsolatedWorkspace gives each operation its own subdirectory under WorkDir.
+	// A long-lived agent or worker should set it: two concurrent jobs sharing one
+	// work directory cannot otherwise be separated, and an operation would report
+	// files created by another job.
+	IsolatedWorkspace bool
+}
+
+// ToolStatus is the read-only result of probing one external tool.
+type ToolStatus struct {
+	Name      string
+	Required  bool
+	Available bool
+	Path      string
 }
 
 // FilterOptions narrows which items an operation considers.

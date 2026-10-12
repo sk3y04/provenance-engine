@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +26,7 @@ import (
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 	"github.com/sk3y04/provenance-engine/internal/resolve"
 	"github.com/sk3y04/provenance-engine/internal/worker"
+	"github.com/sk3y04/provenance-engine/internal/workspace"
 )
 
 // sinkBuffer is the bounded queue used to decouple engine emission from a
@@ -39,6 +39,7 @@ const sinkBuffer = 256
 type Engine struct {
 	cfg     Config
 	limiter *ratelimit.Manager
+	deps    *extractor.Deps
 }
 
 // New validates cfg, applies safe defaults, and constructs an Engine. It
@@ -67,7 +68,27 @@ func New(cfg Config) (*Engine, error) {
 	if cfg.Timeout < 0 {
 		return nil, &Error{Kind: ErrorValidation, Op: "new", Err: errors.New("timeout must not be negative")}
 	}
-	return &Engine{cfg: cfg, limiter: ratelimit.New()}, nil
+	deps := extractor.NewDeps()
+	deps.AutoInstall = cfg.AutoInstall
+	deps.Probe(cfg.ChromePath)
+	return &Engine{cfg: cfg, limiter: ratelimit.New(), deps: deps}, nil
+}
+
+// Capabilities reports the external tools reachable for this engine. The probe is
+// read-only: it never installs a tool, never downloads anything, and never
+// mutates the filesystem, so a health check has no side effects.
+func (e *Engine) Capabilities(ctx context.Context) []ToolStatus {
+	set := e.deps.Probe(e.cfg.ChromePath)
+	out := make([]ToolStatus, 0, len(set))
+	for _, t := range set {
+		out = append(out, ToolStatus{
+			Name:      t.Name,
+			Required:  t.Required,
+			Available: t.Available,
+			Path:      t.Path,
+		})
+	}
+	return out
 }
 
 // Config returns a copy of the effective configuration, including defaults.
@@ -149,8 +170,14 @@ func (e *Engine) Download(ctx context.Context, req DownloadRequest, sink EventSi
 	events, closeSink := e.sink(warnings.wrap(sink))
 	defer closeSink()
 
+	ws, werr := workspace.New(e.cfg.WorkDir, e.cfg.IsolatedWorkspace)
+	if werr != nil {
+		return Result{}, &Error{Kind: ErrorValidation, Op: "download", URL: req.URL, Err: werr}
+	}
+
 	counts := &countingReporter{}
 	opts := e.options(req.Filter, limit, req.IncludePosts, req.IncludeComments, req.CommentLimit)
+	opts.OutputDir = ws.Root
 	opts.Reporter = counts
 	opts.Events = events
 
@@ -164,10 +191,26 @@ func (e *Engine) Download(ctx context.Context, req DownloadRequest, sink EventSi
 		Counts:   counts.snapshot(),
 		Warnings: warnings.list(),
 	}
-	if artifacts, aerr := collectArtifacts(e.cfg.WorkDir); aerr != nil {
+	// Only files created by this operation are reported, so a reused work
+	// directory can never leak another job's artifacts.
+	entries, aerr := ws.Created()
+	if aerr != nil {
 		res.Warnings = append(res.Warnings, "artifact scan failed: "+aerr.Error())
 	} else {
-		res.Artifacts = artifacts
+		for _, entry := range entries {
+			sum, herr := sha256File(entry.Path)
+			if herr != nil {
+				res.Warnings = append(res.Warnings, "artifact hash failed: "+herr.Error())
+				continue
+			}
+			res.Artifacts = append(res.Artifacts, Artifact{
+				Path:     entry.Path,
+				Filename: entry.Name,
+				Size:     entry.Size,
+				SHA256:   sum,
+				MIMEType: mimeOf(entry.Name),
+			})
+		}
 	}
 	if downloadErr != nil {
 		return res, e.wrapError("download", req.URL, downloadErr)
@@ -198,6 +241,7 @@ func (e *Engine) options(f FilterOptions, limit int, includePosts, includeCommen
 			OutputLayout:       e.cfg.OutputLayout,
 		},
 		RateLimiter: e.limiter,
+		Deps:        e.deps,
 	}
 }
 
@@ -480,73 +524,6 @@ func (c *warningCollector) list() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.warnings...)
-}
-
-// engineBookkeepingDirs are directories the engine creates for its own use and
-// never reports as artifacts.
-var engineBookkeepingDirs = map[string]bool{
-	"_provenance_cache": true,
-	".provenance":       true,
-}
-
-// collectArtifacts walks a controlled WorkDir and reports every regular file,
-// excluding engine bookkeeping directories and in-progress partial files.
-func collectArtifacts(root string) ([]Artifact, error) {
-	if strings.TrimSpace(root) == "" {
-		return nil, errors.New("empty work dir")
-	}
-	if _, err := os.Stat(root); err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var out []Artifact
-	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if path != root && engineBookkeepingDirs[d.Name()] {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		name := d.Name()
-		if strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".ytdl") {
-			return nil
-		}
-		info, ierr := d.Info()
-		if ierr != nil {
-			return ierr
-		}
-		rel, rerr := filepath.Rel(root, path)
-		if rerr != nil {
-			rel = name
-		}
-		sum, herr := sha256File(path)
-		if herr != nil {
-			return herr
-		}
-		abs, aerr := filepath.Abs(path)
-		if aerr != nil {
-			abs = path
-		}
-		out = append(out, Artifact{
-			Path:     abs,
-			Filename: filepath.ToSlash(rel),
-			Size:     info.Size(),
-			SHA256:   sum,
-			MIMEType: mimeOf(name),
-		})
-		return nil
-	})
-	if walkErr != nil {
-		return nil, walkErr
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Filename < out[j].Filename })
-	return out, nil
 }
 
 func sha256File(path string) (string, error) {

@@ -780,3 +780,101 @@ These are the only remaining direct Resolve/Download bypasses.
 - Smoke: `provenance grab "https://"` exercises the facade path (typed
   validation error, exit 1); `provenance grab` with no args preserves the
   legacy validation message.
+---
+
+## 13. Product Phase 1 (engine hardening) implementation status
+
+This section covers the product-plan Phase 1: making every facade-reachable path
+transport-neutral, deterministic under concurrency, and safe for long-lived
+agent/worker processes.
+
+### Converted to structured events
+
+Every direct terminal write reachable from `engine.Resolve` or `engine.Download`
+was replaced with a structured event emission, with stable reason codes:
+
+- `internal/extractor`: Instagram, X/Twitter, hashtag search, Reddit, Album, and
+  the browser fallback. Legacy CLI narration is preserved byte-for-byte when no
+  sink is supplied.
+- `internal/dispatcher`: `browserFallback`, `downloadVideoLinks`, and
+  `BatchDispatch`.
+- `internal/app`: `Download` (already event-driven; `PrintSummary` is now a
+  presentation adapter taking an `io.Writer`).
+
+Terminal formatting lives only in `internal/render` and the CLI/TUI adapters.
+
+### Mechanism
+
+`internal.event.WithSink`/`SinkFrom` carry the sink on the operation context, so
+deeply nested helpers emit without a sink parameter in every signature, and
+`event.Emit` resolves the context sink when none is passed explicitly. New
+`event.KindInfo` carries operation facts. Reason codes are registered in
+`internal/event/reasons.go`.
+
+`internal/redact` bounds and normalizes event `Detail`, removes cookie,
+authorization, bearer, token, and session fragments, and strips URL query strings
+and fragments. Response-body narration now carries a stable fact (for example a
+status code) instead of a body preview.
+
+### Globals converted to engine-owned state
+
+- `twQueryIDCache` → `extractor.QueryIDCache` instance owned by `Deps`.
+- `ffmpegOnce`/`ffmpegPath`/`ffmpegWarn` → `Deps.FfmpegPath`/`FFprobePath` filled
+  by the read-only capability probe.
+- `albClient`/`rdClient` per-call clients → `Deps.HTTPClient`.
+- `twitterTransport`/`igTransport` merged into one immutable, concurrency-safe
+  shared transport (`extractor.Transport()`), which stays package-level by design.
+
+### Context propagation
+
+`sleepCtx` replaced `time.Sleep` in every extractor retry and rate-limit backoff
+(Twitter, Twitter search, Reddit, Instagram), so cancellation reaches the backoff
+paths. Subprocess and HTTP paths already inherited the operation context.
+
+### Workspace and artifact isolation
+
+`internal/workspace` records the files present when an operation starts and
+reports only files the operation created, excluding bookkeeping directories and
+in-progress partials. `engine.Config.IsolatedWorkspace` gives each operation its
+own subdirectory, which is the only arrangement that separates two concurrent jobs
+sharing a parent directory.
+
+### Capability probe
+
+`internal/capability` plus `engine.Capabilities` report yt-dlp (required), ffmpeg,
+ffprobe, and Chrome without installing a tool or mutating the filesystem.
+`engine.Config.AutoInstall` is false by default; the CLI adapter sets it to
+preserve historical behavior.
+
+### TUI
+
+`internal/tui.redirectStdStreams` is removed. The runner consumes events through
+`teaSink`, so no process-global stream mutation remains.
+
+### Tests added
+
+- `internal/extractor/narrate_test.go`: transport neutrality and canary redaction.
+- `internal/extractor/cancel_test.go`: cancellable retry/backoff.
+- `internal/workspace/workspace_test.go`: operation-scoped artifacts and
+  concurrent-workspace isolation.
+- `internal/capability/capability_test.go`: side-effect-free probe.
+- `internal/redact/redact_test.go`: secret and query-string redaction.
+- `engine/no_terminal_test.go`: no terminal output for a facade call with a sink
+  (and with a nil sink), plus slow/panicking sink regression.
+- `engine/capability_test.go`: capability report shape.
+- `internal/tui/sink_test.go`: no process-global stream mutation.
+
+### Deliberately deferred
+
+- `engine.ArtifactSink` (streaming artifacts without a shared filesystem).
+- Archive/vault/encode/import facades, and the process-global catalog store; those
+  paths are not reachable from `Resolve`/`Download` and stay CLI-local.
+- `internal/importers` context propagation (`ImportGit`/`ImportPDF`/`ImportDocs`/
+  `ImportOpenAPI` still take no context) — out of the facade boundary.
+- Distinct exit codes per `ErrorKind`; every category still maps to `1`.
+
+### Verified
+
+`gofmt -l .`, `go vet ./...`, `go test ./...`, `go test -race ./...`,
+`golangci-lint run ./...`, `go build ./cmd/provenance`, and
+`make engine-example` all pass. No test contacts a live social platform.

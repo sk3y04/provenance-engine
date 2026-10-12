@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,29 +17,16 @@ import (
 	"time"
 
 	"github.com/sk3y04/provenance-engine/internal/downloader"
+	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 	"github.com/sk3y04/provenance-engine/internal/resolve"
 	"github.com/sk3y04/provenance-engine/internal/worker"
 )
 
-var twitterTransport = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
-	DialContext: (&net.Dialer{
-		Timeout:   15 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).DialContext,
-	ForceAttemptHTTP2:     true,
-	MaxIdleConns:          10,
-	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:   15 * time.Second,
-	ResponseHeaderTimeout: 30 * time.Second,
-}
-
-var (
-	twitterRefreshClient = &http.Client{Timeout: 15 * time.Second, Transport: twitterTransport, CheckRedirect: downloader.SafeRedirect}
-	twitterAPIClient     = &http.Client{Timeout: 30 * time.Second, Transport: twitterTransport, CheckRedirect: downloader.SafeRedirect}
-)
+// The transport is the shared, immutable, concurrency-safe service defined in
+// deps.go. Mutable per-engine state (the query-ID cache and tool paths) lives on
+// Deps, never on package globals.
 
 const (
 	twAPIBase           = "https://x.com/i/api/graphql"
@@ -67,14 +53,12 @@ const twSearchOperation = "SearchTimeline"
 
 var twUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-func twBearerToken() string {
+func twBearerToken(c *QueryIDCache) string {
 	if t := os.Getenv("TWITTER_BEARER_TOKEN"); t != "" {
 		return "Bearer " + t
 	}
-	twQueryIDCache.mu.Lock()
-	defer twQueryIDCache.mu.Unlock()
-	if twQueryIDCache.guestBearer != "" {
-		return twQueryIDCache.guestBearer
+	if b := c.bearer(); b != "" {
+		return b
 	}
 	// Public guest token from Twitter's web client JS. Same for all
 	// unauthenticated visitors; not a secret. Refreshed at runtime via
@@ -82,40 +66,23 @@ func twBearerToken() string {
 	return "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 }
 
-var twQueryIDCache struct {
-	mu               sync.RWMutex
-	userByScreenName string
-	userMedia        string
-	userTweets       string
-	searchTimeline   string
-	guestBearer      string
-}
-
-func twUserByScreenNameQueryID() string {
+func twUserByScreenNameQueryID(c *QueryIDCache) string {
 	if v := os.Getenv("TWITTER_QUERY_USER_BY_SCREEN_NAME"); v != "" {
 		return v
 	}
-	twQueryIDCache.mu.RLock()
-	if twQueryIDCache.userByScreenName != "" {
-		v := twQueryIDCache.userByScreenName
-		twQueryIDCache.mu.RUnlock()
+	if v := c.get("UserByScreenName"); v != "" {
 		return v
 	}
-	twQueryIDCache.mu.RUnlock()
 	return "2qvSHpkWTMS9i0zJAwDNiA"
 }
 
-func twUserTweetsQueryID() string {
+func twUserTweetsQueryID(c *QueryIDCache) string {
 	if v := os.Getenv("TWITTER_QUERY_USER_TWEETS"); v != "" {
 		return v
 	}
-	twQueryIDCache.mu.RLock()
-	if twQueryIDCache.userTweets != "" {
-		v := twQueryIDCache.userTweets
-		twQueryIDCache.mu.RUnlock()
+	if v := c.get("UserTweets"); v != "" {
 		return v
 	}
-	twQueryIDCache.mu.RUnlock()
 	return "6r5OLCC_wFH4CpRyXKuAmQ"
 }
 
@@ -124,29 +91,24 @@ func twUserTweetsQueryID() string {
 // operations there is intentionally no hard-coded fallback: search IDs rotate
 // independently and a stale value produces confusing failures, so an empty
 // result raises an actionable error instead (see twSearchQueryIDError).
-func twSearchQueryID() string {
+func twSearchQueryID(c *QueryIDCache) string {
 	if v := os.Getenv("TWITTER_QUERY_SEARCH_TIMELINE"); v != "" {
 		return v
 	}
-	twQueryIDCache.mu.RLock()
-	v := twQueryIDCache.searchTimeline
-	twQueryIDCache.mu.RUnlock()
-	return v
+	return c.get("SearchTimeline")
 }
 
-func twRefreshQueryIDs(ctx context.Context, cookiesFile string) {
-	twRefreshQueryIDsForce(ctx, cookiesFile, false)
+func twRefreshQueryIDs(ctx context.Context, d *Deps, cookiesFile string) {
+	twRefreshQueryIDsForce(ctx, d, cookiesFile, false)
 }
 
-func twRefreshQueryIDsForce(ctx context.Context, cookiesFile string, force bool) {
-	twQueryIDCache.mu.Lock()
-	if !force && twQueryIDCache.userByScreenName != "" && twQueryIDCache.userMedia != "" && twQueryIDCache.userTweets != "" && twQueryIDCache.searchTimeline != "" {
-		twQueryIDCache.mu.Unlock()
+func twRefreshQueryIDsForce(ctx context.Context, d *Deps, cookiesFile string, force bool) {
+	cache := d.QueryIDs
+	if !force && cache.get("UserByScreenName") != "" && cache.get("UserMedia") != "" && cache.get("UserTweets") != "" && cache.get("SearchTimeline") != "" {
 		return
 	}
-	twQueryIDCache.mu.Unlock()
 
-	client := twitterRefreshClient
+	client := d.HTTPClient
 	req, err := http.NewRequestWithContext(ctx, "GET", twSearchRefreshURL, nil)
 	if err != nil {
 		return
@@ -181,38 +143,26 @@ func twRefreshQueryIDsForce(ctx context.Context, cookiesFile string, force bool)
 	defer func() { _ = resp2.Body.Close() }()
 	jsBody, _ := io.ReadAll(io.LimitReader(resp2.Body, 4<<20))
 
-	twQueryIDCache.mu.Lock()
-	defer twQueryIDCache.mu.Unlock()
-	re2 := regexp.MustCompile(`queryId:"([^"]+)",operationName:"UserByScreenName"`)
-	if m := re2.FindStringSubmatch(string(jsBody)); len(m) > 1 {
-		twQueryIDCache.userByScreenName = m[1]
+	if m := regexp.MustCompile(`queryId:"([^"]+)",operationName:"UserByScreenName"`).FindStringSubmatch(string(jsBody)); len(m) > 1 {
+		cache.set("UserByScreenName", m[1])
 	}
-	re3 := regexp.MustCompile(`queryId:"([^"]+)",operationName:"UserMedia"`)
-	if m := re3.FindStringSubmatch(string(jsBody)); len(m) > 1 {
-		twQueryIDCache.userMedia = m[1]
+	if m := regexp.MustCompile(`queryId:"([^"]+)",operationName:"UserMedia"`).FindStringSubmatch(string(jsBody)); len(m) > 1 {
+		cache.set("UserMedia", m[1])
 	}
-	re4 := regexp.MustCompile(`queryId:"([^"]+)",operationName:"UserTweets"`)
-	if m := re4.FindStringSubmatch(string(jsBody)); len(m) > 1 {
-		twQueryIDCache.userTweets = m[1]
+	if m := regexp.MustCompile(`queryId:"([^"]+)",operationName:"UserTweets"`).FindStringSubmatch(string(jsBody)); len(m) > 1 {
+		cache.set("UserTweets", m[1])
 	}
-	re4b := regexp.MustCompile(`queryId:"([^"]+)",operationName:"SearchTimeline"`)
-	if m := re4b.FindStringSubmatch(string(jsBody)); len(m) > 1 {
-		twQueryIDCache.searchTimeline = m[1]
+	if m := regexp.MustCompile(`queryId:"([^"]+)",operationName:"SearchTimeline"`).FindStringSubmatch(string(jsBody)); len(m) > 1 {
+		cache.set("SearchTimeline", m[1])
 	}
 	// Guest bearer token - also public, extracted from the web client JS.
-	re5 := regexp.MustCompile(`"(AAAAA[^"]{50,})"`)
-	if m := re5.FindStringSubmatch(string(jsBody)); len(m) > 1 {
-		twQueryIDCache.guestBearer = "Bearer " + m[1]
+	if m := regexp.MustCompile(`"(AAAAA[^"]{50,})"`).FindStringSubmatch(string(jsBody)); len(m) > 1 {
+		cache.setBearer("Bearer " + m[1])
 	}
 }
 
-func twInvalidateQueryIDs() {
-	twQueryIDCache.mu.Lock()
-	defer twQueryIDCache.mu.Unlock()
-	twQueryIDCache.userByScreenName = ""
-	twQueryIDCache.userMedia = ""
-	twQueryIDCache.userTweets = ""
-	twQueryIDCache.searchTimeline = ""
+func twInvalidateQueryIDs(d *Deps) {
+	d.QueryIDs.Invalidate()
 }
 
 var twFeatures = map[string]interface{}{
@@ -235,13 +185,15 @@ var twFeatures = map[string]interface{}{
 	"responsive_web_enhance_cards_enabled":                              false,
 }
 
-func twClient(cookiesFile string) (*http.Client, string, error) {
+// twClient resolves the CSRF token from the cookies file. The HTTP client comes
+// from the engine-owned Deps, never from a package global.
+func twClient(d *Deps, cookiesFile string) (string, error) {
 	if cookiesFile == "" {
-		return nil, "", fmt.Errorf("cookies file is required for Twitter/X")
+		return "", fmt.Errorf("cookies file is required for Twitter/X")
 	}
 	cookies, err := loadNetscapeCookies(cookiesFile)
 	if err != nil {
-		return nil, "", fmt.Errorf("load cookies: %w", err)
+		return "", fmt.Errorf("load cookies: %w", err)
 	}
 	var csrfToken string
 	for _, ck := range cookies {
@@ -250,7 +202,7 @@ func twClient(cookiesFile string) (*http.Client, string, error) {
 			break
 		}
 	}
-	return twitterAPIClient, csrfToken, nil
+	return csrfToken, nil
 }
 
 type TwOptions struct {
@@ -261,6 +213,10 @@ type TwOptions struct {
 	Limit        int
 	RateLimiter  *ratelimit.Manager
 	IncludePosts bool
+	Deps         *Deps
+	// Events, when set, receives presentation-neutral structured events. When
+	// set, this path does not write to the terminal.
+	Events event.Sink
 }
 
 func ParseTwURL(rawURL string) (username string, err error) {
@@ -277,10 +233,10 @@ func ParseTwURL(rawURL string) (username string, err error) {
 	return sanitizeFilename(parts[0]), nil
 }
 
-func twHeaders(cookiesFile, csrfToken string) (http.Header, error) {
+func twHeaders(d *Deps, cookiesFile, csrfToken string) (http.Header, error) {
 	h := http.Header{}
 	h.Set("User-Agent", twUserAgent)
-	h.Set("Authorization", twBearerToken())
+	h.Set("Authorization", twBearerToken(d.QueryIDs))
 	h.Set("x-csrf-token", csrfToken)
 	h.Set("Content-Type", "application/json")
 	h.Set("Referer", "https://x.com/")
@@ -323,11 +279,12 @@ func isRateLimitError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "status 429")
 }
 
-func resolveTwUserID(ctx context.Context, client *http.Client, cookiesFile, csrfToken, username string, rl *ratelimit.Manager) (string, error) {
-	fmt.Fprintf(os.Stderr, "[twitter] resolving user @%s ...\n", username)
+func resolveTwUserID(ctx context.Context, d *Deps, cookiesFile, csrfToken, username string, rl *ratelimit.Manager) (string, error) {
+	client := d.HTTPClient
+	narratef(ctx, event.KindInfo, event.ReasonStart, "", "@"+username, "[twitter] resolving user @%s ...\n", username)
 	for refresh := 0; refresh < 2; refresh++ {
-		twRefreshQueryIDs(ctx, cookiesFile)
-		queryID := twUserByScreenNameQueryID()
+		twRefreshQueryIDs(ctx, d, cookiesFile)
+		queryID := twUserByScreenNameQueryID(d.QueryIDs)
 		endpoint := fmt.Sprintf("%s/%s/UserByScreenName", twAPIBase, queryID)
 
 		variables, _ := json.Marshal(map[string]interface{}{
@@ -350,7 +307,7 @@ func resolveTwUserID(ctx context.Context, client *http.Client, cookiesFile, csrf
 			if err != nil {
 				return "", fmt.Errorf("new request: %w", err)
 			}
-			headers, err := twHeaders(cookiesFile, csrfToken)
+			headers, err := twHeaders(d, cookiesFile, csrfToken)
 			if err != nil {
 				return "", err
 			}
@@ -369,7 +326,9 @@ func resolveTwUserID(ctx context.Context, client *http.Client, cookiesFile, csrf
 				if attempt == twMaxAttempts {
 					return "", fmt.Errorf("resolve twitter user after %d attempts: %w", attempt, lastErr)
 				}
-				time.Sleep(twRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, twRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return "", err
+				}
 				continue
 			}
 
@@ -379,7 +338,8 @@ func resolveTwUserID(ctx context.Context, client *http.Client, cookiesFile, csrf
 				body := string(preview)
 				if twIsStaleQueryError(resp.StatusCode, body) && refresh == 0 {
 					staleQuery = true
-					fmt.Fprintf(os.Stderr, "[twitter] query ID stale (status %d), refreshing...\n", resp.StatusCode)
+					narratef(ctx, event.KindWarning, event.ReasonQueryIDStale, "", fmt.Sprintf("status %d", resp.StatusCode),
+						"[twitter] query ID stale (status %d), refreshing...\n", resp.StatusCode)
 					break
 				}
 				if resp.StatusCode == http.StatusTooManyRequests {
@@ -389,8 +349,11 @@ func resolveTwUserID(ctx context.Context, client *http.Client, cookiesFile, csrf
 							delay = time.Duration(sec) * time.Second
 						}
 					}
-					fmt.Fprintf(os.Stderr, "[twitter] rate limited (429), attempt %d, waiting %v...\n", attempt, delay)
-					time.Sleep(delay)
+					narratef(ctx, event.KindRetry, event.ReasonRateLimited, "", fmt.Sprintf("attempt %d, waiting %s", attempt, delay),
+						"[twitter] rate limited (429), attempt %d, waiting %v...\n", attempt, delay)
+					if err := sleepCtx(ctx, delay); err != nil {
+						return "", err
+					}
 					continue
 				}
 				return "", fmt.Errorf("twitter user lookup status %d: %s", resp.StatusCode, body)
@@ -414,7 +377,7 @@ func resolveTwUserID(ctx context.Context, client *http.Client, cookiesFile, csrf
 			return result.Data.User.Result.RestID, nil
 		}
 		if staleQuery {
-			twInvalidateQueryIDs()
+			twInvalidateQueryIDs(d)
 			continue
 		}
 		return "", lastErr
@@ -665,10 +628,11 @@ func twCollectEntry(entry twEntry, tweets *[]twTweetResult, nextCursor *string) 
 	}
 }
 
-func fetchTwMediaPage(ctx context.Context, client *http.Client, cookiesFile, csrfToken, userID, cursor string, rl *ratelimit.Manager) ([]twTweetResult, string, error) {
+func fetchTwMediaPage(ctx context.Context, d *Deps, cookiesFile, csrfToken, userID, cursor string, rl *ratelimit.Manager) ([]twTweetResult, string, error) {
+	client := d.HTTPClient
 	for refresh := 0; refresh < 2; refresh++ {
-		twRefreshQueryIDs(ctx, cookiesFile)
-		queryID := twUserTweetsQueryID()
+		twRefreshQueryIDs(ctx, d, cookiesFile)
+		queryID := twUserTweetsQueryID(d.QueryIDs)
 		endpoint := fmt.Sprintf("%s/%s/UserTweets", twAPIBase, queryID)
 
 		vars := map[string]interface{}{
@@ -697,7 +661,7 @@ func fetchTwMediaPage(ctx context.Context, client *http.Client, cookiesFile, csr
 			if err != nil {
 				return nil, "", fmt.Errorf("new request: %w", err)
 			}
-			headers, err := twHeaders(cookiesFile, csrfToken)
+			headers, err := twHeaders(d, cookiesFile, csrfToken)
 			if err != nil {
 				return nil, "", err
 			}
@@ -727,11 +691,11 @@ func fetchTwMediaPage(ctx context.Context, client *http.Client, cookiesFile, csr
 				staleCode := resp.StatusCode
 				if twIsStaleQueryError(staleCode, body) && refresh == 0 {
 					staleQuery = true
-					fmt.Fprintf(os.Stderr, "[twitter] query ID stale (status %d), refreshing...\n", staleCode)
+					narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] query ID stale (status %d), refreshing...\n", staleCode)
 					break
 				}
 				lastErr = fmt.Errorf("twitter status %d", staleCode)
-				fmt.Fprintf(os.Stderr, "[twitter] response: %s\n", sanitizeErrorBody(body))
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] response: %s\n", sanitizeErrorBody(body))
 				if resp.StatusCode == http.StatusTooManyRequests {
 					delay := twMaxRetryBackoff
 					if ra := resp.Header.Get("Retry-After"); ra != "" {
@@ -739,7 +703,7 @@ func fetchTwMediaPage(ctx context.Context, client *http.Client, cookiesFile, csr
 							delay = time.Duration(sec) * time.Second
 						}
 					}
-					fmt.Fprintf(os.Stderr, "[twitter] rate limited (429), waiting %v...\n", delay)
+					narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] rate limited (429), waiting %v...\n", delay)
 					time.Sleep(delay)
 					continue
 				}
@@ -772,7 +736,7 @@ func fetchTwMediaPage(ctx context.Context, client *http.Client, cookiesFile, csr
 			return tweets, nextCursor, nil
 		}
 		if staleQuery {
-			twInvalidateQueryIDs()
+			twInvalidateQueryIDs(d)
 			continue
 		}
 		return nil, "", lastErr
@@ -780,15 +744,15 @@ func fetchTwMediaPage(ctx context.Context, client *http.Client, cookiesFile, csr
 	return nil, "", fmt.Errorf("fetch twitter media: failed after query id refresh")
 }
 
-func FetchAllTwTweets(ctx context.Context, client *http.Client, cookiesFile, csrfToken, userID string, limit int, rl *ratelimit.Manager) ([]twTweetResult, error) {
+func FetchAllTwTweets(ctx context.Context, d *Deps, cookiesFile, csrfToken, userID string, limit int, rl *ratelimit.Manager) ([]twTweetResult, error) {
 	var all []twTweetResult
 	cursor := ""
 	pages := 0
 	for {
-		page, nextCursor, err := fetchTwMediaPage(ctx, client, cookiesFile, csrfToken, userID, cursor, rl)
+		page, nextCursor, err := fetchTwMediaPage(ctx, d, cookiesFile, csrfToken, userID, cursor, rl)
 		if err != nil {
 			if len(all) > 0 && isRateLimitError(err) {
-				fmt.Fprintf(os.Stderr, "[twitter] rate limited mid-scan, returning %d items from %d pages\n", len(all), pages)
+				narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] rate limited mid-scan, returning %d items from %d pages\n", len(all), pages)
 				return all, nil
 			}
 			return nil, err
@@ -798,7 +762,7 @@ func FetchAllTwTweets(ctx context.Context, client *http.Client, cookiesFile, csr
 		}
 		pages++
 		all = append(all, page...)
-		fmt.Fprintf(os.Stderr, "[twitter] page %d: %d tweets (%d with media, %d total)\n", pages, len(page), tweetMediaCount(page), len(all))
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] page %d: %d tweets (%d with media, %d total)\n", pages, len(page), tweetMediaCount(page), len(all))
 		if limit > 0 && len(all) >= limit {
 			all = all[:limit]
 			break
@@ -1053,12 +1017,12 @@ func (c *twCollection) items(outDir string, includePosts bool) []manifest.Item {
 // twCollect resolves a source and fetches its posts, branching between the
 // profile timeline and the hashtag SearchTimeline. Cookies are required either
 // way; hashtag search additionally requires the authenticated session cookies.
-func twCollect(ctx context.Context, rawURL, cookiesFile string, opts TwOptions) (*twCollection, error) {
+func twCollect(ctx context.Context, d *Deps, rawURL, cookiesFile string, opts TwOptions) (*twCollection, error) {
 	src, err := ParseTwSource(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	client, csrfToken, err := twClient(cookiesFile)
+	csrfToken, err := twClient(d, cookiesFile)
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
 	}
@@ -1067,18 +1031,18 @@ func twCollect(ctx context.Context, rawURL, cookiesFile string, opts TwOptions) 
 		if err := twRequireAuthCookies(cookiesFile); err != nil {
 			return nil, err
 		}
-		tweets, err := FetchAllTwSearchPosts(ctx, client, cookiesFile, csrfToken, src.Query, opts.Limit, opts.RateLimiter)
+		tweets, err := FetchAllTwSearchPosts(ctx, d, cookiesFile, csrfToken, src.Query, opts.Limit, opts.RateLimiter)
 		if err != nil {
 			return nil, err
 		}
 		return &twCollection{Source: src, Posts: twPostsFromResults(tweets, "")}, nil
 	}
 
-	userID, err := resolveTwUserID(ctx, client, cookiesFile, csrfToken, src.Username, opts.RateLimiter)
+	userID, err := resolveTwUserID(ctx, d, cookiesFile, csrfToken, src.Username, opts.RateLimiter)
 	if err != nil {
 		return nil, fmt.Errorf("resolve user id: %w", err)
 	}
-	tweets, err := FetchAllTwTweets(ctx, client, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
+	tweets, err := FetchAllTwTweets(ctx, d, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
 	if err != nil {
 		return nil, err
 	}
@@ -1086,7 +1050,9 @@ func twCollect(ctx context.Context, rawURL, cookiesFile string, opts TwOptions) 
 }
 
 func ScanTwitter(ctx context.Context, rawURL, outDir string, cookiesFile string, opts TwOptions) (manifest.Manifest, error) {
-	coll, err := twCollect(ctx, rawURL, cookiesFile, opts)
+	d := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
+	coll, err := twCollect(ctx, d, rawURL, cookiesFile, opts)
 	if err != nil {
 		return manifest.Manifest{}, err
 	}
@@ -1095,7 +1061,8 @@ func ScanTwitter(ctx context.Context, rawURL, outDir string, cookiesFile string,
 }
 
 func DownloadTwitter(ctx context.Context, rawURL, outDir string, cookiesFile string, opts TwOptions, dryRun bool) error {
-	coll, err := twCollect(ctx, rawURL, cookiesFile, opts)
+	d := depsFor(opts.Deps)
+	coll, err := twCollect(ctx, d, rawURL, cookiesFile, opts)
 	if err != nil {
 		return err
 	}
@@ -1122,7 +1089,7 @@ func DownloadTwitter(ctx context.Context, rawURL, outDir string, cookiesFile str
 		failMu.Lock()
 		failed[url] = err.Error()
 		failMu.Unlock()
-		fmt.Fprintf(os.Stderr, "[provenance] twitter download failed: %s: %v\n", url, err)
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] twitter download failed: %s: %v\n", url, err)
 	}
 
 	for _, p := range coll.Posts {
@@ -1133,12 +1100,12 @@ func DownloadTwitter(ctx context.Context, rawURL, outDir string, cookiesFile str
 			postDest := postItem.Destination
 			postContent := twPostMarkdown(p)
 			if dryRun {
-				fmt.Printf("[dry-run] twitter post: %s -> %s\n", t.RestID, postDest)
+				narrateOut(ctx, kindInfo, reasonInfo, "", "", "[dry-run] twitter post: %s -> %s\n", t.RestID, postDest)
 			} else {
 				pool.SubmitWithHooks(func() error {
 					return writeFile(postDest, postContent)
 				}, func() {
-					fmt.Fprintf(os.Stderr, "[provenance] twitter post saved: %s\n", postDest)
+					narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] twitter post saved: %s\n", postDest)
 				}, func(err error) {
 					recordFailure("post:"+t.RestID, err)
 				})
@@ -1171,14 +1138,14 @@ func DownloadTwitter(ctx context.Context, rawURL, outDir string, cookiesFile str
 					dest = filepath.Join(base, subdir, sanitizeFilename(name))
 				}
 				if dryRun {
-					fmt.Printf("[dry-run] twitter: %s -> %s\n", mediaURL, dest)
+					narrateOut(ctx, kindInfo, reasonInfo, "", "", "[dry-run] twitter: %s -> %s\n", mediaURL, dest)
 					continue
 				}
 				furl := mediaURL
 				pool.SubmitWithHooks(func() error {
 					dl := downloader.New()
 					dl.SpeedLimit = opts.SpeedLimit
-					dl.Progress = opts.Progress
+					dl.Progress = progressFor(ctx, opts.Progress)
 					return dl.Download(ctx, furl, dest, "")
 				}, nil, func(err error) {
 					recordFailure(furl, err)
@@ -1233,7 +1200,9 @@ func TwTweetToItem(t twTweetResult, username string) resolve.Item {
 }
 
 func ScanTwitterResolved(ctx context.Context, rawURL, outDir, cookiesFile string, opts TwOptions) (resolve.Source, error) {
-	coll, err := twCollect(ctx, rawURL, cookiesFile, opts)
+	d := depsFor(opts.Deps)
+	ctx = event.WithSink(ctx, opts.Events)
+	coll, err := twCollect(ctx, d, rawURL, cookiesFile, opts)
 	if err != nil {
 		return resolve.Source{}, err
 	}

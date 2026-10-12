@@ -28,6 +28,7 @@ func Download(ctx context.Context, urls []string, batchPath string, opts dispatc
 		return engineerr.Newf(engineerr.Validation, "download", "", "provide at least one URL or use --batch <file>")
 	}
 	var firstErr error
+	ctx = event.WithSink(ctx, opts.Events)
 	cr := dispatcher.NewCountsReporter(opts.Reporter)
 	opts.Reporter = cr
 	if batchPath != "" {
@@ -63,7 +64,7 @@ func Download(ctx context.Context, urls []string, batchPath string, opts dispatc
 			},
 		})
 	} else {
-		dispatcher.PrintSummary(&cr.Counts, opts.OutputDir, "")
+		dispatcher.PrintSummary(os.Stderr, &cr.Counts, opts.OutputDir, "")
 	}
 	return firstErr
 }

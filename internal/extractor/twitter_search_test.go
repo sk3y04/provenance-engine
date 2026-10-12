@@ -178,6 +178,7 @@ type twSearchTestRequest struct {
 
 type twSearchTestServer struct {
 	srv      *httptest.Server
+	deps     *Deps
 	mu       sync.Mutex
 	requests []twSearchTestRequest
 }
@@ -190,11 +191,9 @@ func (ts *twSearchTestServer) Requests() []twSearchTestRequest {
 	return out
 }
 
-func resetTwQueryIDs() {
-	twInvalidateQueryIDs()
-	twQueryIDCache.mu.Lock()
-	twQueryIDCache.guestBearer = ""
-	twQueryIDCache.mu.Unlock()
+func resetTwQueryIDs(d *Deps) {
+	twInvalidateQueryIDs(d)
+	d.QueryIDs.setBearer("")
 }
 
 // newTwSearchServer starts an httptest server and points the SearchTimeline
@@ -237,15 +236,12 @@ func newTwSearchServer(t *testing.T, respond func(cursor, rawQuery string) []byt
 	t.Cleanup(ts.srv.Close)
 
 	oldBase, oldRefresh := twSearchAPIBase, twSearchRefreshURL
-	oldClient := twitterRefreshClient
 	twSearchAPIBase = ts.srv.URL
 	twSearchRefreshURL = ts.srv.URL + "/home"
-	twitterRefreshClient = ts.srv.Client()
-	resetTwQueryIDs()
+	ts.deps = &Deps{HTTPClient: ts.srv.Client(), QueryIDs: &QueryIDCache{}}
+	resetTwQueryIDs(ts.deps)
 	t.Cleanup(func() {
 		twSearchAPIBase, twSearchRefreshURL = oldBase, oldRefresh
-		twitterRefreshClient = oldClient
-		resetTwQueryIDs()
 	})
 	return ts
 }
@@ -277,7 +273,7 @@ func TestFetchTwSearchPagePostsPhotoAndCursor(t *testing.T) {
 		return twTestSearchResponse(nil, "")
 	})
 
-	tweets, cursor, err := fetchTwSearchPage(context.Background(), srv.srv.Client(), "", "csrf", "#golang filter:media", "", nil)
+	tweets, cursor, err := fetchTwSearchPage(context.Background(), testDeps(srv.srv.Client()), "", "csrf", "#golang filter:media", "", nil)
 	if err != nil {
 		t.Fatalf("fetchTwSearchPage: %v", err)
 	}
@@ -375,7 +371,7 @@ func TestFetchAllTwSearchPostsPaginationDedupAndLimit(t *testing.T) {
 		}
 	})
 
-	posts, err := FetchAllTwSearchPosts(context.Background(), http.DefaultClient, "", "csrf", "#tag filter:media", 0, nil)
+	posts, err := FetchAllTwSearchPosts(context.Background(), testDeps(http.DefaultClient), "", "csrf", "#tag filter:media", 0, nil)
 	if err != nil {
 		t.Fatalf("FetchAllTwSearchPosts: %v", err)
 	}
@@ -407,7 +403,7 @@ func TestFetchAllTwSearchPostsRepeatedCursorStops(t *testing.T) {
 		}, "LOOP")
 	})
 
-	posts, err := FetchAllTwSearchPosts(context.Background(), http.DefaultClient, "", "csrf", "#tag filter:media", 0, nil)
+	posts, err := FetchAllTwSearchPosts(context.Background(), testDeps(http.DefaultClient), "", "csrf", "#tag filter:media", 0, nil)
 	if err != nil {
 		t.Fatalf("FetchAllTwSearchPosts: %v", err)
 	}
@@ -427,7 +423,7 @@ func TestFetchAllTwSearchPostsNoProgressStops(t *testing.T) {
 		}, fmt.Sprintf("C%d", page))
 	})
 
-	posts, err := FetchAllTwSearchPosts(context.Background(), http.DefaultClient, "", "csrf", "#tag filter:media", 0, nil)
+	posts, err := FetchAllTwSearchPosts(context.Background(), testDeps(http.DefaultClient), "", "csrf", "#tag filter:media", 0, nil)
 	if err != nil {
 		t.Fatalf("FetchAllTwSearchPosts: %v", err)
 	}
@@ -450,7 +446,7 @@ func TestFetchAllTwSearchPostsPartialFailureIsNotSilent(t *testing.T) {
 		return []byte(`{"data":{"something_changed":true}}`)
 	})
 
-	posts, err := FetchAllTwSearchPosts(context.Background(), http.DefaultClient, "", "csrf", "#tag filter:media", 0, nil)
+	posts, err := FetchAllTwSearchPosts(context.Background(), testDeps(http.DefaultClient), "", "csrf", "#tag filter:media", 0, nil)
 	if err == nil {
 		t.Fatal("expected an error so a partial pagination failure is not reported as complete")
 	}
@@ -477,7 +473,7 @@ func TestFetchAllTwSearchPostsLimitAcrossPages(t *testing.T) {
 		}, "C2")
 	})
 
-	posts, err := FetchAllTwSearchPosts(context.Background(), http.DefaultClient, "", "csrf", "#tag filter:media", 3, nil)
+	posts, err := FetchAllTwSearchPosts(context.Background(), testDeps(http.DefaultClient), "", "csrf", "#tag filter:media", 3, nil)
 	if err != nil {
 		t.Fatalf("FetchAllTwSearchPosts: %v", err)
 	}
@@ -501,7 +497,7 @@ func TestFetchAllTwSearchPostsIgnoresPromotedAndNoMedia(t *testing.T) {
 		}, "")
 	})
 
-	posts, err := FetchAllTwSearchPosts(context.Background(), http.DefaultClient, "", "csrf", "#tag filter:media", 0, nil)
+	posts, err := FetchAllTwSearchPosts(context.Background(), testDeps(http.DefaultClient), "", "csrf", "#tag filter:media", 0, nil)
 	if err != nil {
 		t.Fatalf("FetchAllTwSearchPosts: %v", err)
 	}
@@ -521,7 +517,7 @@ func TestFetchAllTwSearchPostsVisibilityAndModule(t *testing.T) {
 		}, "")
 	})
 
-	tweets, _, err := fetchTwSearchPage(context.Background(), http.DefaultClient, "", "csrf", "#tag filter:media", "", nil)
+	tweets, _, err := fetchTwSearchPage(context.Background(), testDeps(http.DefaultClient), "", "csrf", "#tag filter:media", "", nil)
 	if err != nil {
 		t.Fatalf("fetchTwSearchPage: %v", err)
 	}
@@ -716,7 +712,7 @@ func TestFetchTwSearchPageMalformedSchema(t *testing.T) {
 	newTwSearchServer(t, func(cursor, rawQuery string) []byte {
 		return []byte(`{"data":{"something_else":{}}}`)
 	})
-	_, _, err := fetchTwSearchPage(context.Background(), http.DefaultClient, "", "csrf", "#tag filter:media", "", nil)
+	_, _, err := fetchTwSearchPage(context.Background(), testDeps(http.DefaultClient), "", "csrf", "#tag filter:media", "", nil)
 	if err == nil {
 		t.Fatal("expected malformed-schema error")
 	}
@@ -741,7 +737,7 @@ func TestFetchTwSearchPageAuthError(t *testing.T) {
 	twSearchAPIBase, twSearchRefreshURL = srv.URL, srv.URL+"/home"
 	defer func() { twSearchAPIBase, twSearchRefreshURL = oldBase, oldRefresh }()
 
-	_, _, err := fetchTwSearchPage(context.Background(), srv.Client(), "", "csrf", "#tag filter:media", "", nil)
+	_, _, err := fetchTwSearchPage(context.Background(), testDeps(srv.Client()), "", "csrf", "#tag filter:media", "", nil)
 	if err == nil || !strings.Contains(err.Error(), "authentication failed") {
 		t.Fatalf("error = %v, want authentication failure", err)
 	}
@@ -769,7 +765,7 @@ func TestTwRequireAuthCookies(t *testing.T) {
 
 func TestTwSearchQueryIDDiscovery(t *testing.T) {
 	t.Setenv("TWITTER_QUERY_SEARCH_TIMELINE", "")
-	resetTwQueryIDs()
+	resetTwQueryIDs(testDeps(http.DefaultClient))
 
 	respond := func(cursor, rawQuery string) []byte {
 		return twTestSearchResponse(nil, "")
@@ -793,20 +789,17 @@ func TestTwSearchQueryIDDiscovery(t *testing.T) {
 	srvURL = srv.URL
 
 	oldBase, oldRefresh := twSearchAPIBase, twSearchRefreshURL
-	oldClient := twitterRefreshClient
 	twSearchAPIBase, twSearchRefreshURL = srvURL, srvURL+"/home"
-	twitterRefreshClient = srv.Client()
+	deps := &Deps{HTTPClient: srv.Client(), QueryIDs: &QueryIDCache{}}
 	defer func() {
 		twSearchAPIBase, twSearchRefreshURL = oldBase, oldRefresh
-		twitterRefreshClient = oldClient
-		resetTwQueryIDs()
 	}()
 
-	_, _, err := fetchTwSearchPage(context.Background(), srv.Client(), "", "csrf", "#tag filter:media", "", nil)
+	_, _, err := fetchTwSearchPage(context.Background(), deps, "", "csrf", "#tag filter:media", "", nil)
 	if err != nil {
 		t.Fatalf("fetchTwSearchPage: %v", err)
 	}
-	if got := twSearchQueryID(); got != "discoveredqid" {
+	if got := twSearchQueryID(deps.QueryIDs); got != "discoveredqid" {
 		t.Errorf("discovered query ID = %q, want discoveredqid", got)
 	}
 }

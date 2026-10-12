@@ -39,7 +39,7 @@ func TestClassifyYtdlpError(t *testing.T) {
 
 func TestEventProgressEmitsStructuredEvents(t *testing.T) {
 	var got []event.Event
-	ep := newEventProgress(event.Func(func(_ context.Context, e event.Event) {
+	ep := newEventProgress(context.Background(), event.Func(func(_ context.Context, e event.Event) {
 		got = append(got, e)
 	}))
 

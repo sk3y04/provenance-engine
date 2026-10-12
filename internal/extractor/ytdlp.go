@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/lrstanley/go-ytdlp"
-
+	"github.com/sk3y04/provenance-engine/internal/capability"
 	"github.com/sk3y04/provenance-engine/internal/downloader"
 	"github.com/sk3y04/provenance-engine/internal/engineerr"
 	"github.com/sk3y04/provenance-engine/internal/event"
@@ -25,24 +25,17 @@ import (
 	"github.com/sk3y04/provenance-engine/internal/resolve"
 )
 
-// ffmpeg detection (cached). go-ytdlp does NOT auto-install ffmpeg, so we
-// degrade gracefully when it's missing.
-var (
-	ffmpegOnce sync.Once
-	ffmpegPath string
-	ffmpegWarn sync.Once
-)
+// Tool discovery is engine-owned (see Deps). The reusable path never caches a
+// tool path in package-level state, and never installs a tool unless the caller
+// explicitly enabled auto-install.
 
-func resolveFfmpeg() string {
-	ffmpegOnce.Do(func() {
-		if p, err := exec.LookPath("ffmpeg"); err == nil {
-			ffmpegPath = p
-		}
-	})
-	return ffmpegPath
+// EnsureInstalled installs yt-dlp + ffmpeg into the local cache if missing. It
+// mutates the filesystem, so it is a CLI-only convenience: the engine facade
+// does not call it unless Config.AutoInstall is set.
+func EnsureInstalled(ctx context.Context) error {
+	ytdlp.MustInstall(ctx, nil)
+	return nil
 }
-
-func hasFfmpeg() bool { return resolveFfmpeg() != "" }
 
 // YtdlpOptions controls how the yt-dlp wrapper is invoked.
 type YtdlpOptions struct {
@@ -60,6 +53,9 @@ type YtdlpOptions struct {
 	// Events, when set, receives structured progress/warning/item events. The
 	// reusable path never writes to the terminal when Events is set.
 	Events event.Sink
+	// AutoInstall permits downloading the tool into the local cache. The engine
+	// leaves it false; the CLI keeps its historical behavior.
+	AutoInstall bool
 	// MetadataDir is the subdirectory (relative to OutputDir) where yt-dlp
 	// sidecar files like *.info.json, *.description, *.jpg thumbnails, and
 	// subtitles will be placed. Empty means "_metadata"; set to "." to keep
@@ -68,13 +64,6 @@ type YtdlpOptions struct {
 }
 
 const ytdlpProgressMarker = "PROVENANCE_YTDLP_PROGRESS:"
-
-// EnsureInstalled installs yt-dlp + ffmpeg into the local cache if missing.
-// Safe to call multiple times.
-func EnsureInstalled(ctx context.Context) error {
-	ytdlp.MustInstall(ctx, nil)
-	return nil
-}
 
 // formatSelector translates a quality string into a yt-dlp format selector.
 // When ffmpeg is missing we must pick a single pre-muxed file because yt-dlp
@@ -108,49 +97,40 @@ func formatSelector(quality string, ffmpeg bool) string {
 // terminal in real time. Errors include any text yt-dlp wrote to stderr that
 // matches typical "site not supported" patterns, so the dispatcher can decide
 // whether to fall back to the browser scraper.
-func RunYtdlp(ctx context.Context, rawURL string, opts YtdlpOptions) error {
-	_, err := runYtdlpInternal(ctx, rawURL, opts)
+func RunYtdlp(ctx context.Context, d *Deps, rawURL string, opts YtdlpOptions) error {
+	_, err := runYtdlpInternal(ctx, d, rawURL, opts)
 	return err
 }
 
 // runYtdlpInternal does the actual work. It tees stderr to both the user's
 // terminal and an in-memory buffer; on failure the captured stderr is folded
 // into the returned error so callers can pattern-match it.
-func runYtdlpInternal(ctx context.Context, rawURL string, opts YtdlpOptions) (string, error) {
-	if err := EnsureInstalled(ctx); err != nil {
-		return "", classifyYtdlpError(rawURL, err, "")
+func runYtdlpInternal(ctx context.Context, d *Deps, rawURL string, opts YtdlpOptions) (string, error) {
+	if opts.AutoInstall {
+		if err := EnsureInstalled(ctx); err != nil {
+			return "", classifyYtdlpError(rawURL, err, "")
+		}
+	} else if !d.Tools.Available(capability.ToolYtdlp) {
+		return "", engineerr.Newf(engineerr.ExternalTool, "yt-dlp", rawURL, "yt-dlp is not available")
 	}
 
 	event.Emit(ctx, opts.Events, event.Event{
 		Kind: event.KindStageChanged, Stage: event.StageDownloading, URL: rawURL,
 	})
 	if opts.Progress == nil && opts.Events != nil {
-		opts.Progress = newEventProgress(opts.Events)
+		opts.Progress = newEventProgress(ctx, opts.Events)
 	}
 
-	ffmpeg := hasFfmpeg()
+	ffmpeg := d.FfmpegPath != ""
 	if !ffmpeg {
-		if opts.Events != nil {
-			event.Emit(ctx, opts.Events, event.Event{
-				Kind: event.KindWarning, Stage: event.StageDownloading, URL: rawURL,
-				Reason: "ffmpeg_missing",
-				Detail: "ffmpeg not found on PATH; falling back to single-file downloads",
-			})
-		} else {
-			ffmpegWarn.Do(func() {
-				fmt.Fprintln(os.Stderr,
-					"[provenance] WARNING: ffmpeg not found on PATH. Falling back to single-file "+
-						"downloads (no merge, no thumbnail embed, no audio-only conversion).")
-				fmt.Fprintln(os.Stderr,
-					"[provenance]   Install ffmpeg for full quality:")
-				fmt.Fprintln(os.Stderr,
-					"[provenance]     Windows: winget install Gyan.FFmpeg   (or)   choco install ffmpeg")
-				fmt.Fprintln(os.Stderr,
-					"[provenance]     macOS:   brew install ffmpeg")
-				fmt.Fprintln(os.Stderr,
-					"[provenance]     Linux:   sudo apt install ffmpeg")
-			})
-		}
+		narratef(ctx, kindWarn, event.ReasonFfmpegMissing, rawURL,
+			"ffmpeg not found on PATH; falling back to single-file downloads",
+			"[provenance] WARNING: ffmpeg not found on PATH. Falling back to single-file "+
+				"downloads (no merge, no thumbnail embed, no audio-only conversion).\n"+
+				"[provenance]   Install ffmpeg for full quality:\n"+
+				"[provenance]     Windows: winget install Gyan.FFmpeg   (or)   choco install ffmpeg\n"+
+				"[provenance]     macOS:   brew install ffmpeg\n"+
+				"[provenance]     Linux:   sudo apt install ffmpeg\n")
 	}
 
 	cmd := ytdlp.New()
@@ -186,7 +166,7 @@ func runYtdlpInternal(ctx context.Context, rawURL string, opts YtdlpOptions) (st
 	}
 
 	if ffmpeg {
-		cmd = cmd.FFmpegLocation(resolveFfmpeg())
+		cmd = cmd.FFmpegLocation(d.FfmpegPath)
 	}
 
 	if opts.CookiesFile != "" {
@@ -208,7 +188,7 @@ func runYtdlpInternal(ctx context.Context, rawURL string, opts YtdlpOptions) (st
 	}
 	var stderrBuf bytes.Buffer
 	var stdoutFallback, stderrFallback io.Writer = os.Stdout, os.Stderr
-	if opts.Events != nil {
+	if opts.Events != nil || event.SinkFrom(ctx) != nil {
 		stdoutFallback, stderrFallback = nil, nil
 	}
 	stdoutWriter := newYtdlpProgressWriter(rawURL, opts.Progress, stdoutFallback, nil)
@@ -445,8 +425,8 @@ func stripCR(s string) string {
 // RunYtdlpCaptured behaves like RunYtdlp but also returns whatever yt-dlp
 // wrote to stderr. Useful for the dispatcher's "is this site unsupported?"
 // heuristic.
-func RunYtdlpCaptured(ctx context.Context, rawURL string, opts YtdlpOptions) (stderr string, err error) {
-	return runYtdlpInternal(ctx, rawURL, opts)
+func RunYtdlpCaptured(ctx context.Context, d *Deps, rawURL string, opts YtdlpOptions) (stderr string, err error) {
+	return runYtdlpInternal(ctx, d, rawURL, opts)
 }
 
 type ytdlpInfo struct {
@@ -464,7 +444,9 @@ type ytdlpInfo struct {
 	Duration    float64 `json:"duration"`
 }
 
-func ScanYtdlp(ctx context.Context, rawURL string, opts YtdlpOptions) (manifest.Manifest, error) {
+func ScanYtdlp(ctx context.Context, d *Deps, rawURL string, opts YtdlpOptions) (manifest.Manifest, error) {
+	ctx = event.WithSink(ctx, opts.Events)
+	ctx = event.WithSink(ctx, opts.Events)
 	if err := EnsureInstalled(ctx); err != nil {
 		return manifest.Manifest{}, classifyYtdlpError(rawURL, err, "")
 	}
@@ -623,7 +605,9 @@ func YtdlpInfoToSource(info ytdlpInfo, rawURL string) (resolve.Source, []resolve
 	return src, []resolve.Item{item}
 }
 
-func ScanYtdlpResolved(ctx context.Context, rawURL string, opts YtdlpOptions) (resolve.Source, error) {
+func ScanYtdlpResolved(ctx context.Context, d *Deps, rawURL string, opts YtdlpOptions) (resolve.Source, error) {
+	ctx = event.WithSink(ctx, opts.Events)
+	ctx = event.WithSink(ctx, opts.Events)
 	if err := EnsureInstalled(ctx); err != nil {
 		return resolve.Source{}, classifyYtdlpError(rawURL, err, "")
 	}
