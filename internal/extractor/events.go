@@ -9,6 +9,7 @@ import (
 	"github.com/sk3y04/provenance-engine/internal/downloader"
 	"github.com/sk3y04/provenance-engine/internal/engineerr"
 	"github.com/sk3y04/provenance-engine/internal/event"
+	"github.com/sk3y04/provenance-engine/internal/redact"
 )
 
 // eventProgress adapts an event.Sink to downloader.ProgressReporter so the
@@ -32,21 +33,21 @@ func newEventProgress(ctx context.Context, sink event.Sink) downloader.ProgressR
 func (p *eventProgress) OnStart(url, dest string, total int64) {
 	event.Emit(p.ctx, p.sink, event.Event{
 		Kind: event.KindProgress, Stage: event.StageDownloading,
-		URL: url, ItemRef: dest, Total: total, Reason: "start",
+		URL: redact.URL(url), ItemRef: dest, Total: total, Reason: "start",
 	})
 }
 
 func (p *eventProgress) OnProgress(url string, written, total int64) {
 	event.Emit(p.ctx, p.sink, event.Event{
 		Kind: event.KindProgress, Stage: event.StageDownloading,
-		URL: url, Written: written, Total: total,
+		URL: redact.URL(url), Written: written, Total: total,
 	})
 }
 
 func (p *eventProgress) OnDone(url string, err error) {
 	event.Emit(p.ctx, p.sink, event.Event{
 		Kind: event.KindItemDone, Stage: event.StageDownloading,
-		URL: url, Err: err,
+		URL: redact.URL(url), Err: redact.Error(err),
 	})
 }
 

@@ -205,7 +205,7 @@ func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
 		return engineerr.New(engineerr.Validation, "classify", rawURL, err)
 	}
 
-	event.Emit(ctx, opts.Events, event.Event{
+	emitEvent(ctx, opts.Events, event.Event{
 		Kind: event.KindStageChanged, Stage: event.StageResolving, URL: rawURL,
 	})
 
@@ -221,6 +221,7 @@ func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
 		SpeedLimit:         opts.SpeedLimit,
 		Progress:           opts.FileProgress,
 		Events:             opts.Events,
+		AutoInstall:        d.AutoInstall,
 	}
 
 	switch site {
@@ -268,7 +269,7 @@ func Dispatch(ctx context.Context, rawURL string, opts Options) (err error) {
 		}, opts.DryRun)
 
 	case SiteGeneric:
-		event.Emit(ctx, opts.Events, event.Event{
+		emitEvent(ctx, opts.Events, event.Event{
 			Kind: event.KindStageChanged, Stage: event.StageDownloading, URL: rawURL,
 		})
 		stderr, err := extractor.RunYtdlpCaptured(ctx, d, rawURL, ytOpts)
@@ -293,7 +294,7 @@ func browserFallback(ctx context.Context, d *extractor.Deps, rawURL string, opts
 	}
 
 	if opts.Events != nil {
-		event.Emit(ctx, opts.Events, event.Event{
+		emitEvent(ctx, opts.Events, event.Event{
 			Kind: event.KindStageChanged, Stage: event.StageProcessing, URL: rawURL,
 			Reason: "browser_crawl",
 			Detail: "crawling the page (and any pagination) for video links",
@@ -305,7 +306,7 @@ func browserFallback(ctx context.Context, d *extractor.Deps, rawURL string, opts
 	if scrapeErr == nil && len(links) > 0 {
 		if cachePath, cerr := writeLinkCache(opts.OutputDir, rawURL, links); cerr == nil {
 			if opts.Events != nil {
-				event.Emit(ctx, opts.Events, event.Event{
+				emitEvent(ctx, opts.Events, event.Event{
 					Kind: event.KindWarning, URL: rawURL, Reason: "link_cache_saved",
 					Detail: fmt.Sprintf("saved %d link(s) to %s", len(links), cachePath),
 				})
@@ -320,7 +321,7 @@ func browserFallback(ctx context.Context, d *extractor.Deps, rawURL string, opts
 	}
 	if scrapeErr != nil {
 		if opts.Events != nil {
-			event.Emit(ctx, opts.Events, event.Event{
+			emitEvent(ctx, opts.Events, event.Event{
 				Kind: event.KindWarning, URL: rawURL, Reason: "link_scrape_failed",
 				Detail: scrapeErr.Error(),
 			})
@@ -337,7 +338,7 @@ func browserFallback(ctx context.Context, d *extractor.Deps, rawURL string, opts
 			fmt.Errorf("browser fallback: %w (original error: %v)", berr, originalErr))
 	}
 	if opts.Events != nil {
-		event.Emit(ctx, opts.Events, event.Event{
+		emitEvent(ctx, opts.Events, event.Event{
 			Kind: event.KindWarning, URL: rawURL, Reason: "sniffed_media_url",
 			Detail: resolved.MediaURL,
 		})
@@ -357,7 +358,7 @@ func Scan(ctx context.Context, rawURL string, opts Options) (manifest.Manifest, 
 	if err != nil {
 		return manifest.Manifest{}, engineerr.New(engineerr.Validation, "classify", rawURL, err)
 	}
-	event.Emit(ctx, opts.Events, event.Event{
+	emitEvent(ctx, opts.Events, event.Event{
 		Kind: event.KindStageChanged, Stage: event.StageResolving, URL: rawURL,
 	})
 	var m manifest.Manifest
@@ -402,6 +403,7 @@ func Scan(ctx context.Context, rawURL string, opts Options) (manifest.Manifest, 
 			OutputTemplate:     opts.OutputTemplate,
 			SpeedLimit:         opts.SpeedLimit,
 			Events:             opts.Events,
+			AutoInstall:        d.AutoInstall,
 		})
 	}
 	if err != nil {
@@ -417,7 +419,7 @@ func ScanResolved(ctx context.Context, rawURL string, opts Options) (resolve.Sou
 	if err != nil {
 		return resolve.Source{}, engineerr.New(engineerr.Validation, "classify", rawURL, err)
 	}
-	event.Emit(ctx, opts.Events, event.Event{
+	emitEvent(ctx, opts.Events, event.Event{
 		Kind: event.KindStageChanged, Stage: event.StageResolving, URL: rawURL,
 	})
 	switch site {
@@ -461,6 +463,7 @@ func ScanResolved(ctx context.Context, rawURL string, opts Options) (resolve.Sou
 			OutputTemplate:     opts.OutputTemplate,
 			SpeedLimit:         opts.SpeedLimit,
 			Events:             opts.Events,
+			AutoInstall:        d.AutoInstall,
 		})
 	}
 }

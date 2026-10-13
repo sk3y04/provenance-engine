@@ -55,6 +55,16 @@ func narrateOut(ctx context.Context, kind event.Kind, reason, url, fact, legacyF
 	narrate(ctx, os.Stdout, kind, reason, url, fact, legacyFormat, args...)
 }
 
+// emitEvent delivers a structured event with its URL, Detail, and Err redacted,
+// so direct emissions from the reusable paths cannot carry secret-bearing URLs or
+// raw response bodies. It is the sanctioned way to emit outside narrate.
+func emitEvent(ctx context.Context, sink event.Sink, e event.Event) {
+	e.URL = redact.URL(e.URL)
+	e.Detail = redact.Detail(e.Detail)
+	e.Err = redact.Error(e.Err)
+	event.Emit(ctx, sink, e)
+}
+
 // depsFor returns the engine-owned Deps, falling back to the shared default.
 func depsFor(d *extractor.Deps) *extractor.Deps {
 	if d == nil {

@@ -3,6 +3,7 @@ package extractor
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/sk3y04/provenance-engine/internal/engineerr"
@@ -43,9 +44,9 @@ func TestEventProgressEmitsStructuredEvents(t *testing.T) {
 		got = append(got, e)
 	}))
 
-	ep.OnStart("u", "file.mp4", 100)
-	ep.OnProgress("u", 40, 100)
-	ep.OnDone("u", nil)
+	ep.OnStart("https://cdn.example.com/f?token=CANARYSTART", "file.mp4", 100)
+	ep.OnProgress("https://cdn.example.com/f?token=CANARYPROGRESS", 40, 100)
+	ep.OnDone("https://cdn.example.com/f?token=CANARYDONE", errors.New("auth_token=CANARYERR"))
 
 	if len(got) != 3 {
 		t.Fatalf("got %d events, want 3", len(got))
@@ -56,10 +57,16 @@ func TestEventProgressEmitsStructuredEvents(t *testing.T) {
 	if got[1].Kind != event.KindProgress || got[1].Written != 40 || got[1].Total != 100 {
 		t.Fatalf("progress event = %+v", got[1])
 	}
-	if got[2].Kind != event.KindItemDone || got[2].Err != nil {
+	if got[2].Kind != event.KindItemDone || got[2].Err == nil {
 		t.Fatalf("done event = %+v", got[2])
 	}
 	if got[0].Stage != event.StageDownloading {
 		t.Fatalf("stage = %q, want downloading", got[0].Stage)
+	}
+	for _, secret := range []string{"CANARYSTART", "CANARYPROGRESS", "CANARYDONE", "CANARYERR"} {
+		if strings.Contains(got[0].URL, secret) || strings.Contains(got[1].URL, secret) ||
+			strings.Contains(got[2].URL, secret) || strings.Contains(got[2].Err.Error(), secret) {
+			t.Fatalf("canary %q leaked into progress event: %+v", secret, got)
+		}
 	}
 }

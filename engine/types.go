@@ -64,9 +64,11 @@ type Config struct {
 	AutoInstall bool
 
 	// IsolatedWorkspace gives each operation its own subdirectory under WorkDir.
-	// A long-lived agent or worker should set it: two concurrent jobs sharing one
-	// work directory cannot otherwise be separated, and an operation would report
-	// files created by another job.
+	// A long-lived agent or worker running concurrent jobs on one Engine must set
+	// it (or use one Engine per job): two concurrent jobs sharing one work
+	// directory cannot otherwise be separated, and an operation would report
+	// files created by another job. It is left false for single-job CLI use,
+	// where outputs land directly in WorkDir.
 	IsolatedWorkspace bool
 }
 
@@ -153,7 +155,9 @@ type Source struct {
 }
 
 // Artifact is a file produced by Download. Path is absolute and refers to a
-// file inside Config.WorkDir.
+// file inside Config.WorkDir. A hosted caller should treat Path as engine-local
+// and not expose it as a public identifier. ItemRef is best-effort: it is set
+// only when the engine can associate the file with a resolved item.
 type Artifact struct {
 	Path     string
 	Filename string

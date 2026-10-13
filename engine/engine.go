@@ -24,6 +24,7 @@ import (
 	"github.com/sk3y04/provenance-engine/internal/extractor"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
+	"github.com/sk3y04/provenance-engine/internal/redact"
 	"github.com/sk3y04/provenance-engine/internal/resolve"
 	"github.com/sk3y04/provenance-engine/internal/worker"
 	"github.com/sk3y04/provenance-engine/internal/workspace"
@@ -35,7 +36,10 @@ import (
 const sinkBuffer = 256
 
 // Engine executes Resolve and Download operations. Construct it with New and
-// reuse it; it is safe for concurrent use.
+// reuse it; its internal state is safe for concurrent use. For artifact
+// isolation, concurrent jobs must either use one Engine per job or set
+// Config.IsolatedWorkspace, which gives each operation its own subdirectory so
+// two jobs sharing a work directory can never report each other's files.
 type Engine struct {
 	cfg     Config
 	limiter *ratelimit.Manager
@@ -170,9 +174,9 @@ func (e *Engine) Download(ctx context.Context, req DownloadRequest, sink EventSi
 	events, closeSink := e.sink(warnings.wrap(sink))
 	defer closeSink()
 
-	ws, werr := workspace.New(e.cfg.WorkDir, e.cfg.IsolatedWorkspace)
+	ws, werr := e.newWorkspace()
 	if werr != nil {
-		return Result{}, &Error{Kind: ErrorValidation, Op: "download", URL: req.URL, Err: werr}
+		return Result{}, &Error{Kind: ErrorValidation, Op: "download", URL: redact.URL(req.URL), Err: redact.Error(werr)}
 	}
 
 	counts := &countingReporter{}
@@ -245,6 +249,14 @@ func (e *Engine) options(f FilterOptions, limit int, includePosts, includeCommen
 	}
 }
 
+// newWorkspace creates the operation-scoped output root. When
+// Config.IsolatedWorkspace is set each operation gets its own subdirectory,
+// which is the only arrangement that separates two concurrent jobs sharing one
+// work directory.
+func (e *Engine) newWorkspace() (*workspace.Workspace, error) {
+	return workspace.New(e.cfg.WorkDir, e.cfg.IsolatedWorkspace)
+}
+
 // effectiveLimit clamps a request limit into the configured bound. A
 // non-positive or oversized request limit becomes Config.MaxItems.
 func (e *Engine) effectiveLimit(limit int) int {
@@ -284,14 +296,14 @@ func checkContext(op, rawURL string, ctx context.Context) error {
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
-		return &Error{Kind: ErrorCanceled, Op: op, URL: rawURL, Err: err}
+		return &Error{Kind: ErrorCanceled, Op: op, URL: redact.URL(rawURL), Err: redact.Error(err)}
 	}
 	return nil
 }
 
 func (e *Engine) validateURL(op, raw string) error {
 	if strings.TrimSpace(raw) == "" {
-		return &Error{Kind: ErrorValidation, Op: op, URL: raw, Err: errors.New("url is required")}
+		return &Error{Kind: ErrorValidation, Op: op, URL: redact.URL(raw), Err: errors.New("url is required")}
 	}
 	// Bare hashtags are a supported Twitter/X source and are not URLs.
 	if extractor.IsTwitterHashtagSource(raw) {
@@ -299,13 +311,13 @@ func (e *Engine) validateURL(op, raw string) error {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return &Error{Kind: ErrorValidation, Op: op, URL: raw, Err: fmt.Errorf("invalid url: %w", err)}
+		return &Error{Kind: ErrorValidation, Op: op, URL: redact.URL(raw), Err: fmt.Errorf("invalid url: %w", err)}
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return &Error{Kind: ErrorValidation, Op: op, URL: raw, Err: fmt.Errorf("unsupported url scheme %q", u.Scheme)}
+		return &Error{Kind: ErrorValidation, Op: op, URL: redact.URL(raw), Err: fmt.Errorf("unsupported url scheme %q", u.Scheme)}
 	}
 	if u.Host == "" {
-		return &Error{Kind: ErrorValidation, Op: op, URL: raw, Err: errors.New("url has no host")}
+		return &Error{Kind: ErrorValidation, Op: op, URL: redact.URL(raw), Err: errors.New("url has no host")}
 	}
 	return nil
 }
@@ -313,19 +325,19 @@ func (e *Engine) validateURL(op, raw string) error {
 func (e *Engine) validateFilter(op, rawURL string, f FilterOptions) error {
 	if f.TitleMatch != "" {
 		if _, err := regexp.Compile(f.TitleMatch); err != nil {
-			return &Error{Kind: ErrorValidation, Op: op, URL: rawURL, Err: fmt.Errorf("title-match regex: %w", err)}
+			return &Error{Kind: ErrorValidation, Op: op, URL: redact.URL(rawURL), Err: fmt.Errorf("title-match regex: %w", err)}
 		}
 	}
 	if f.TitleReject != "" {
 		if _, err := regexp.Compile(f.TitleReject); err != nil {
-			return &Error{Kind: ErrorValidation, Op: op, URL: rawURL, Err: fmt.Errorf("title-exclude regex: %w", err)}
+			return &Error{Kind: ErrorValidation, Op: op, URL: redact.URL(rawURL), Err: fmt.Errorf("title-exclude regex: %w", err)}
 		}
 	}
 	if f.MinSize < 0 || f.MaxSize < 0 {
-		return &Error{Kind: ErrorValidation, Op: op, URL: rawURL, Err: errors.New("size filters must not be negative")}
+		return &Error{Kind: ErrorValidation, Op: op, URL: redact.URL(rawURL), Err: errors.New("size filters must not be negative")}
 	}
 	if f.MinSize > 0 && f.MaxSize > 0 && f.MinSize > f.MaxSize {
-		return &Error{Kind: ErrorValidation, Op: op, URL: rawURL, Err: errors.New("min-size exceeds max-size")}
+		return &Error{Kind: ErrorValidation, Op: op, URL: redact.URL(rawURL), Err: errors.New("min-size exceeds max-size")}
 	}
 	return nil
 }
@@ -338,15 +350,15 @@ func (e *Engine) wrapError(op, rawURL string, err error) error {
 		return nil
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return &Error{Kind: ErrorCanceled, Op: op, URL: rawURL, Err: err}
+		return &Error{Kind: ErrorCanceled, Op: op, URL: redact.URL(rawURL), Err: redact.Error(err)}
 	}
 	if worker.IsPermanent(err) {
-		return &Error{Kind: ErrorPermanent, Op: op, URL: rawURL, Err: err}
+		return &Error{Kind: ErrorPermanent, Op: op, URL: redact.URL(rawURL), Err: redact.Error(err)}
 	}
 	if kind := engineerr.KindOf(err); kind != "" {
-		return &Error{Kind: mapKind(kind), Op: op, URL: rawURL, Err: err}
+		return &Error{Kind: mapKind(kind), Op: op, URL: redact.URL(rawURL), Err: redact.Error(err)}
 	}
-	return &Error{Kind: ErrorTemporary, Op: op, URL: rawURL, Err: err}
+	return &Error{Kind: ErrorTemporary, Op: op, URL: redact.URL(rawURL), Err: redact.Error(err)}
 }
 
 func mapKind(kind engineerr.Kind) ErrorKind {
@@ -378,10 +390,10 @@ func mapKind(kind engineerr.Kind) ErrorKind {
 func (e *Engine) panicErr(op, rawURL string, ctx context.Context, r any) error {
 	if ctx != nil {
 		if cerr := ctx.Err(); cerr != nil {
-			return &Error{Kind: ErrorCanceled, Op: op, URL: rawURL, Err: cerr}
+			return &Error{Kind: ErrorCanceled, Op: op, URL: redact.URL(rawURL), Err: redact.Error(cerr)}
 		}
 	}
-	return &Error{Kind: ErrorPermanent, Op: op, URL: rawURL, Err: fmt.Errorf("engine panic: %v", r)}
+	return &Error{Kind: ErrorPermanent, Op: op, URL: redact.URL(rawURL), Err: redact.Error(fmt.Errorf("engine panic: %v", r))}
 }
 
 func toManifestFilter(f FilterOptions) manifest.FilterOptions {
@@ -447,14 +459,14 @@ func fromEvent(ev ievent.Event) Event {
 	out := Event{
 		Kind:    EventKind(ev.Kind),
 		Stage:   Stage(ev.Stage),
-		URL:     ev.URL,
+		URL:     redact.URL(ev.URL),
 		ItemRef: ev.ItemRef,
 		Written: ev.Written,
 		Total:   ev.Total,
 		Attempt: ev.Attempt,
 		Reason:  ev.Reason,
-		Detail:  ev.Detail,
-		Err:     ev.Err,
+		Detail:  redact.Detail(ev.Detail),
+		Err:     redact.Error(ev.Err),
 		At:      ev.At,
 	}
 	if ev.Summary != nil {

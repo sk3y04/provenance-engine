@@ -53,6 +53,24 @@ func URL(raw string) string {
 	return u.String()
 }
 
+// Error returns an error safe to carry in an event or a log line: the message is
+// redacted and bounded, but the original cause stays reachable through Unwrap so
+// errors.Is/errors.As keep working.
+func Error(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &redactedError{msg: Detail(err.Error()), cause: err}
+}
+
+type redactedError struct {
+	msg   string
+	cause error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.cause }
+
 func redactSecrets(s string) string {
 	return secretPattern.ReplaceAllString(s, "$1=<redacted>")
 }

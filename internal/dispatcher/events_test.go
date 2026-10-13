@@ -3,9 +3,11 @@ package dispatcher
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -114,5 +116,33 @@ func TestClassifyErrorIsTyped(t *testing.T) {
 		// dispatcher boundary (Dispatch/Scan). This asserts the boundary is the
 		// one that types it, documented here to prevent drift.
 		t.Fatalf("Classify unexpectedly typed: %v", err)
+	}
+}
+
+// TestEmitEventRedacts proves the sanctioned direct-emission path cannot carry a
+// canary cookie, token, or query string in URL, Detail, or Err.
+func TestEmitEventRedacts(t *testing.T) {
+	var got []event.Event
+	sink := event.Func(func(_ context.Context, e event.Event) { got = append(got, e) })
+
+	emitEvent(context.Background(), sink, event.Event{
+		Kind:   event.KindWarning,
+		URL:    "https://x.com/a?token=CANARYQUERY",
+		Reason: event.ReasonResponseError,
+		Detail: "auth_token=CANARYTOKEN; sessionid=CANARYCOOKIE",
+		Err:    errors.New("failed https://cdn.example/f?token=CANARYERR"),
+	})
+
+	if len(got) != 1 {
+		t.Fatalf("events = %d, want 1", len(got))
+	}
+	e := got[0]
+	for _, secret := range []string{"CANARYQUERY", "CANARYTOKEN", "CANARYCOOKIE", "CANARYERR"} {
+		if strings.Contains(e.URL, secret) || strings.Contains(e.Detail, secret) || strings.Contains(e.Err.Error(), secret) {
+			t.Fatalf("canary %q leaked into event: %+v", secret, e)
+		}
+	}
+	if !strings.Contains(e.URL, "https://x.com/a") {
+		t.Fatalf("url = %q", e.URL)
 	}
 }

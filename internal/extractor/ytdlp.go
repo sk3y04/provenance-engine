@@ -444,11 +444,26 @@ type ytdlpInfo struct {
 	Duration    float64 `json:"duration"`
 }
 
+// ensureYtdlpForScan resolves yt-dlp for a scan. It only mutates the filesystem
+// when the caller explicitly enabled AutoInstall; otherwise a missing tool is a
+// typed ExternalTool error, so a hosted Resolve has no side effects.
+func ensureYtdlpForScan(ctx context.Context, d *Deps, rawURL string) error {
+	if d.AutoInstall {
+		if err := EnsureInstalled(ctx); err != nil {
+			return classifyYtdlpError(rawURL, err, "")
+		}
+		return nil
+	}
+	if !d.Tools.Available(capability.ToolYtdlp) {
+		return engineerr.Newf(engineerr.ExternalTool, "yt-dlp", rawURL, "yt-dlp is not available")
+	}
+	return nil
+}
+
 func ScanYtdlp(ctx context.Context, d *Deps, rawURL string, opts YtdlpOptions) (manifest.Manifest, error) {
 	ctx = event.WithSink(ctx, opts.Events)
-	ctx = event.WithSink(ctx, opts.Events)
-	if err := EnsureInstalled(ctx); err != nil {
-		return manifest.Manifest{}, classifyYtdlpError(rawURL, err, "")
+	if err := ensureYtdlpForScan(ctx, d, rawURL); err != nil {
+		return manifest.Manifest{}, err
 	}
 	event.Emit(ctx, opts.Events, event.Event{
 		Kind: event.KindStageChanged, Stage: event.StageResolving, URL: rawURL,
@@ -607,9 +622,8 @@ func YtdlpInfoToSource(info ytdlpInfo, rawURL string) (resolve.Source, []resolve
 
 func ScanYtdlpResolved(ctx context.Context, d *Deps, rawURL string, opts YtdlpOptions) (resolve.Source, error) {
 	ctx = event.WithSink(ctx, opts.Events)
-	ctx = event.WithSink(ctx, opts.Events)
-	if err := EnsureInstalled(ctx); err != nil {
-		return resolve.Source{}, classifyYtdlpError(rawURL, err, "")
+	if err := ensureYtdlpForScan(ctx, d, rawURL); err != nil {
+		return resolve.Source{}, err
 	}
 	event.Emit(ctx, opts.Events, event.Event{
 		Kind: event.KindStageChanged, Stage: event.StageResolving, URL: rawURL,

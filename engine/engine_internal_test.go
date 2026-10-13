@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -254,6 +255,77 @@ func TestSinkNilBecomesNop(t *testing.T) {
 	s, closeFn := e.sink(nil)
 	s.Emit(context.Background(), ievent.Event{Kind: ievent.KindProgress})
 	closeFn()
+}
+
+// TestPublicErrorAndEventRedactCanaries proves the facade boundary never leaks a
+// canary token, cookie, or query string through Error.URL or Event fields.
+func TestPublicErrorAndEventRedactCanaries(t *testing.T) {
+	e := &Engine{}
+
+	err := e.validateURL("resolve", "ftp://x.com/a?token=CANARYQUERY")
+	var typed *Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("expected *Error, got %v", err)
+	}
+	if strings.Contains(typed.URL, "CANARYQUERY") {
+		t.Fatalf("canary leaked in Error.URL: %q", typed.URL)
+	}
+
+	wrapped := e.wrapError("resolve", "https://x.com/a?token=CANARYQUERY", errors.New("auth_token=CANARYSECRET"))
+	var wrappedErr *Error
+	if !errors.As(wrapped, &wrappedErr) {
+		t.Fatalf("expected *Error, got %v", wrapped)
+	}
+	if strings.Contains(wrappedErr.URL, "CANARYQUERY") || strings.Contains(wrapped.Error(), "CANARYSECRET") {
+		t.Fatalf("canary leaked in wrapped error: %+v", wrappedErr)
+	}
+
+	ev := fromEvent(ievent.Event{
+		Kind:   ievent.KindWarning,
+		URL:    "https://x.com/a?token=CANARYEVENT",
+		Detail: "sessionid=CANARYCOOKIE",
+		Err:    errors.New("failed https://cdn.example/f?token=CANARYERR"),
+	})
+	for _, secret := range []string{"CANARYEVENT", "CANARYCOOKIE", "CANARYERR"} {
+		if strings.Contains(ev.URL, secret) || strings.Contains(ev.Detail, secret) || strings.Contains(ev.Err.Error(), secret) {
+			t.Fatalf("canary %q leaked in public event: %+v", secret, ev)
+		}
+	}
+}
+
+// TestEngineConcurrentWorkspacesAreDistinct proves the engine gate at the facade
+// level: with Config.IsolatedWorkspace set (the documented requirement for
+// concurrent jobs), two operations on one Engine get distinct roots and cannot
+// report each other's files.
+func TestEngineConcurrentWorkspacesAreDistinct(t *testing.T) {
+	e := &Engine{cfg: Config{WorkDir: t.TempDir(), IsolatedWorkspace: true}}
+	a, err := e.newWorkspace()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := e.newWorkspace()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Root == b.Root {
+		t.Fatal("isolated engine workspaces must not share a root")
+	}
+	mustWrite(t, filepath.Join(a.Root, "a.bin"), "a")
+	mustWrite(t, filepath.Join(b.Root, "b.bin"), "b")
+	ga, err := a.Created()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gb, err := b.Created()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ga) != 1 || ga[0].Name != "a.bin" {
+		t.Fatalf("workspace A reported %+v", ga)
+	}
+	if len(gb) != 1 || gb[0].Name != "b.bin" {
+		t.Fatalf("workspace B reported %+v", gb)
+	}
 }
 
 func mustWrite(t *testing.T, path, content string) {
