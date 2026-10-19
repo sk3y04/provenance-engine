@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waiting out a `Retry-After`.
 - **Bounded sink close**: `event.Notifier.Close` waits at most a grace period for
   an in-flight delivery, so a blocked foreign sink can never stall the caller.
+- **Single X post resolution**: `https://x.com/<user>/status/<id>` is now a
+  distinct source kind (`TwSourceStatus`) resolved through the
+  `TweetResultByRestId` operation, so a status URL fetches exactly the post it
+  names instead of paginating the author's whole timeline. Trailing media-index
+  segments (`/video/1`, `/photo/1`) are ignored, the post id must be numeric, and
+  `ScanTwitterResolved` reports `resolve.KindSingle` for these sources. The query
+  id has no hard-coded fallback (discovered from the web-client JS or
+  `TWITTER_QUERY_TWEET_RESULT_BY_REST_ID`).
 
 ### Changed
 

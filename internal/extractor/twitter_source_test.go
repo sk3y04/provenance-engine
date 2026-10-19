@@ -90,7 +90,6 @@ func TestParseTwSourceProfileUnchanged(t *testing.T) {
 	}{
 		{"https://x.com/artist", "artist", "https://x.com/artist"},
 		{"https://twitter.com/artist", "artist", "https://x.com/artist"},
-		{"https://x.com/artist/status/123", "artist", "https://x.com/artist"},
 		{"https://x.com/artist/", "artist", "https://x.com/artist"},
 	}
 	for _, tt := range tests {
@@ -107,6 +106,54 @@ func TestParseTwSourceProfileUnchanged(t *testing.T) {
 		}
 		if src.Canonical != tt.canon {
 			t.Errorf("ParseTwSource(%q).Canonical = %q, want %q", tt.in, src.Canonical, tt.canon)
+		}
+	}
+}
+
+func TestParseTwSourceStatusForms(t *testing.T) {
+	tests := []struct {
+		in       string
+		username string
+		restID   string
+		canon    string
+	}{
+		{"https://x.com/artist/status/1234567890123456789", "artist", "1234567890123456789", "https://x.com/artist/status/1234567890123456789"},
+		{"https://x.com/artist/status/1234567890123456789/video/1", "artist", "1234567890123456789", "https://x.com/artist/status/1234567890123456789"},
+		{"https://twitter.com/artist/status/123/photo/1", "artist", "123", "https://x.com/artist/status/123"},
+		{"https://x.com/i/status/123", "", "123", "https://x.com/i/status/123"},
+		{"https://x.com/status/123", "", "123", "https://x.com/i/status/123"},
+	}
+	for _, tt := range tests {
+		src, err := ParseTwSource(tt.in)
+		if err != nil {
+			t.Errorf("ParseTwSource(%q) unexpected error: %v", tt.in, err)
+			continue
+		}
+		if src.Kind != TwSourceStatus {
+			t.Errorf("ParseTwSource(%q).Kind = %v, want status", tt.in, src.Kind)
+		}
+		if src.Username != tt.username {
+			t.Errorf("ParseTwSource(%q).Username = %q, want %q", tt.in, src.Username, tt.username)
+		}
+		if src.RestID != tt.restID {
+			t.Errorf("ParseTwSource(%q).RestID = %q, want %q", tt.in, src.RestID, tt.restID)
+		}
+		if src.Canonical != tt.canon {
+			t.Errorf("ParseTwSource(%q).Canonical = %q, want %q", tt.in, src.Canonical, tt.canon)
+		}
+	}
+}
+
+func TestParseTwSourceStatusErrors(t *testing.T) {
+	for _, in := range []string{
+		"https://x.com/artist/status",
+		"https://x.com/artist/status/",
+		"https://x.com/artist/status/abc",
+		"https://x.com/artist/status/123;rm",
+		"https://x.com/artist/status/..",
+	} {
+		if src, err := ParseTwSource(in); err == nil {
+			t.Errorf("ParseTwSource(%q) expected error, got %+v", in, src)
 		}
 	}
 }
@@ -150,5 +197,19 @@ func TestTwSourceBaseDir(t *testing.T) {
 	}
 	if got := profile.BaseDir("/out"); !strings.HasSuffix(got, "twitter/artist") {
 		t.Errorf("profile BaseDir = %q, want .../twitter/artist", got)
+	}
+	status, err := ParseTwSource("https://x.com/artist/status/123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := status.BaseDir("/out"); !strings.HasSuffix(got, "twitter/artist") {
+		t.Errorf("status BaseDir = %q, want .../twitter/artist", got)
+	}
+	anonymous, err := ParseTwSource("https://x.com/i/status/123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := anonymous.BaseDir("/out"); !strings.HasSuffix(got, "twitter/123") {
+		t.Errorf("anonymous status BaseDir = %q, want .../twitter/123", got)
 	}
 }

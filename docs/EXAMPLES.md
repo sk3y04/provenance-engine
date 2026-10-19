@@ -32,6 +32,17 @@ provenance grab --cookies cookies.txt --include-posts https://x.com/artist
 
 Creates `twitter/artist/posts/{tweet_id}.md` for each tweet with text, links, and metadata.
 
+### Download media from one post
+
+```bash
+# A status URL resolves exactly that post; it never walks the author timeline.
+provenance grab --cookies cookies.txt https://x.com/artist/status/1234567890123456789
+provenance grab --cookies cookies.txt https://x.com/artist/status/1234567890123456789/video/1
+```
+
+Trailing `/video/1` and `/photo/1` segments are ignored, and `x.com/i/status/<id>`
+works when the URL carries no username.
+
 ### Download media from a hashtag search (authenticated)
 
 ```bash

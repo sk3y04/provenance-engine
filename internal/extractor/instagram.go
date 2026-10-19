@@ -62,6 +62,16 @@ func igNoteLoginState(ctx context.Context, base, body string) {
 	}
 }
 
+// igLooksLikeHTML reports whether a response body that should be JSON is
+// actually an HTML page (bot challenge, error page, or login wall).
+func igLooksLikeHTML(contentType string, body string) bool {
+	if strings.Contains(contentType, "application/json") {
+		return false
+	}
+	trimmed := strings.TrimSpace(body)
+	return len(trimmed) > 0 && trimmed[0] == '<'
+}
+
 // igAPIHostFromBase extracts the rate-limit key (host) from an API base URL.
 func igAPIHostFromBase(base string) string {
 	if u, err := url.Parse(base); err == nil && u.Host != "" {
@@ -737,12 +747,24 @@ func fetchIgMediaPageHost(ctx context.Context, d *Deps, cookiesFile, csrfToken, 
 			return nil, "", lastErr
 		}
 
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, "", fmt.Errorf("read body: %w", err)
+		}
+		if igLooksLikeHTML(resp.Header.Get("Content-Type"), string(body)) {
+			lastErr = fmt.Errorf("instagram %s served an HTML challenge page instead of JSON: %s", base, sanitizeErrorBody(string(body[:min(len(body), 256)])))
+			narratef(ctx, kindWarn, reasonInfo, "", "", "[instagram] %s returned HTML challenge (bot block), not JSON\n", base)
+			if attempt == igMaxAttempts {
+				return nil, "", lastErr
+			}
+			time.Sleep(igRetryBackoff << min(attempt-1, 3))
+			continue
+		}
 		var result igFeedResponse
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			_ = resp.Body.Close()
+		if err := json.Unmarshal(body, &result); err != nil {
 			return nil, "", fmt.Errorf("decode: %w", err)
 		}
-		_ = resp.Body.Close()
 		return result.Items, result.NextMaxID, nil
 	}
 	return nil, "", lastErr

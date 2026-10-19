@@ -259,6 +259,7 @@ Applied at two levels:
 | `TWITTER_QUERY_USER_MEDIA` | Override `UserMedia` query ID |
 | `TWITTER_QUERY_USER_TWEETS` | Override `UserTweets` query ID |
 | `TWITTER_QUERY_SEARCH_TIMELINE` | Override the `SearchTimeline` (hashtag search) query ID. Useful when web-client JS discovery is unavailable; there is no hard-coded fallback for this operation. |
+| `TWITTER_QUERY_TWEET_RESULT_BY_REST_ID` | Override the `TweetResultByRestId` (single post) query ID. Useful when web-client JS discovery is unavailable; there is no hard-coded fallback for this operation. |
 
 Query IDs are normally auto-refreshed from X.com's web client JS. These env vars skip the refresh. The `TWITTER_BEARER_TOKEN` env var accepts the full `Bearer <token>` string or just the token itself.
 

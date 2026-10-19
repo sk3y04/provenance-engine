@@ -29,7 +29,6 @@ import (
 // Deps, never on package globals.
 
 const (
-	twAPIBase           = "https://x.com/i/api/graphql"
 	twPageSize          = 20
 	twSearchPageSize    = 20
 	twMaxAttempts       = 4
@@ -38,10 +37,11 @@ const (
 	twMaxRetryBackoff   = 15 * time.Second
 )
 
-// twSearchAPIBase and twSearchRefreshURL are overridable so tests can point the
-// SearchTimeline operation and query-ID discovery at an httptest server without
-// weakening production TLS or redirect safety.
+// twAPIBase and twSearchAPIBase are overridable so tests can point the GraphQL
+// operations at an httptest server without weakening production TLS or redirect
+// safety.
 var (
+	twAPIBase          = "https://x.com/i/api/graphql"
 	twSearchAPIBase    = twAPIBase
 	twSearchRefreshURL = "https://x.com/home"
 )
@@ -50,6 +50,10 @@ var (
 // web builds serve it via POST with a JSON body; the method/body detail is
 // isolated here so it can be updated if X changes shape.
 const twSearchOperation = "SearchTimeline"
+
+// twSingleTweetOperation is the GraphQL operation name for one post by id. It
+// resolves exactly that post, so a status URL never walks a timeline.
+const twSingleTweetOperation = "TweetResultByRestId"
 
 var twUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -98,13 +102,29 @@ func twSearchQueryID(c *QueryIDCache) string {
 	return c.get("SearchTimeline")
 }
 
+// twSingleTweetQueryID returns the TweetResultByRestId query ID from the env
+// override or the runtime cache. Like SearchTimeline there is intentionally no
+// hard-coded fallback: single-post IDs rotate independently and a stale value
+// produces confusing failures, so an empty result raises an actionable error
+// instead (see twSingleTweetQueryIDError).
+func twSingleTweetQueryID(c *QueryIDCache) string {
+	if v := os.Getenv("TWITTER_QUERY_TWEET_RESULT_BY_REST_ID"); v != "" {
+		return v
+	}
+	return c.get("TweetResultByRestId")
+}
+
+func twSingleTweetQueryIDError() error {
+	return fmt.Errorf("twitter single-post query id unavailable: set TWITTER_QUERY_TWEET_RESULT_BY_REST_ID or allow query-id discovery to reach x.com (TweetResultByRestId rotates independently and has no hard-coded fallback)")
+}
+
 func twRefreshQueryIDs(ctx context.Context, d *Deps, cookiesFile string) {
 	twRefreshQueryIDsForce(ctx, d, cookiesFile, false)
 }
 
 func twRefreshQueryIDsForce(ctx context.Context, d *Deps, cookiesFile string, force bool) {
 	cache := d.QueryIDs
-	if !force && cache.get("UserByScreenName") != "" && cache.get("UserMedia") != "" && cache.get("UserTweets") != "" && cache.get("SearchTimeline") != "" {
+	if !force && cache.get("UserByScreenName") != "" && cache.get("UserMedia") != "" && cache.get("UserTweets") != "" && cache.get("SearchTimeline") != "" && cache.get("TweetResultByRestId") != "" {
 		return
 	}
 
@@ -154,6 +174,9 @@ func twRefreshQueryIDsForce(ctx context.Context, d *Deps, cookiesFile string, fo
 	}
 	if m := regexp.MustCompile(`queryId:"([^"]+)",operationName:"SearchTimeline"`).FindStringSubmatch(string(jsBody)); len(m) > 1 {
 		cache.set("SearchTimeline", m[1])
+	}
+	if m := regexp.MustCompile(`queryId:"([^"]+)",operationName:"TweetResultByRestId"`).FindStringSubmatch(string(jsBody)); len(m) > 1 {
+		cache.set("TweetResultByRestId", m[1])
 	}
 	// Guest bearer token - also public, extracted from the web client JS.
 	if m := regexp.MustCompile(`"(AAAAA[^"]{50,})"`).FindStringSubmatch(string(jsBody)); len(m) > 1 {
@@ -775,6 +798,139 @@ func FetchAllTwTweets(ctx context.Context, d *Deps, cookiesFile, csrfToken, user
 	return all, nil
 }
 
+// twSingleTweetResponse is one decoded TweetResultByRestId response. The pointer
+// distinguishes an absent (changed or malformed) wrapper from a legitimately
+// empty result, which is what X returns for a post that does not exist or is not
+// visible to this account.
+type twSingleTweetResponse struct {
+	Data struct {
+		TweetResults struct {
+			Result *twTweetResultWrapper `json:"result"`
+		} `json:"tweet_results"`
+	} `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
+// fetchTwTweetByRestID resolves exactly one post by id. It never paginates a
+// timeline, so a status URL costs a single request. Stale query IDs trigger a
+// single invalidate/refresh/retry, matching the other operations.
+func fetchTwTweetByRestID(ctx context.Context, d *Deps, cookiesFile, csrfToken, restID string, rl *ratelimit.Manager) (twTweetResult, error) {
+	client := d.HTTPClient
+	for refresh := 0; refresh < 2; refresh++ {
+		// Discover at most once per process, not once per call.
+		if twSingleTweetQueryID(d.QueryIDs) == "" {
+			twRefreshQueryIDs(ctx, d, cookiesFile)
+		}
+		queryID := twSingleTweetQueryID(d.QueryIDs)
+		if queryID == "" {
+			return twTweetResult{}, twSingleTweetQueryIDError()
+		}
+		endpoint := fmt.Sprintf("%s/%s/%s", twAPIBase, queryID, twSingleTweetOperation)
+
+		vars := map[string]interface{}{
+			"tweetId":                restID,
+			"withCommunity":          false,
+			"includePromotedContent": false,
+			"withVoice":              false,
+			"withV2Timeline":         false,
+		}
+		variables, _ := json.Marshal(vars)
+		features, _ := json.Marshal(twFeatures)
+
+		params := url.Values{}
+		params.Set("variables", string(variables))
+		params.Set("features", string(features))
+		fullURL := endpoint + "?" + params.Encode()
+
+		var lastErr error
+		staleQuery := false
+		for attempt := 1; attempt <= twMaxAttempts; attempt++ {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+			if err != nil {
+				return twTweetResult{}, fmt.Errorf("new request: %w", err)
+			}
+			headers, err := twHeaders(d, cookiesFile, csrfToken)
+			if err != nil {
+				return twTweetResult{}, err
+			}
+			req.Header = headers
+
+			if u, _ := url.Parse(fullURL); u != nil && rl != nil {
+				_ = rl.GetLimiter(u.Host).Wait(ctx)
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				if ctx.Err() != nil {
+					return twTweetResult{}, fmt.Errorf("http: %w", err)
+				}
+				lastErr = fmt.Errorf("http: %w", err)
+				if attempt == twMaxAttempts {
+					return twTweetResult{}, fmt.Errorf("twitter request failed after %d attempts: %w", attempt, lastErr)
+				}
+				if err := sleepCtx(ctx, twRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return twTweetResult{}, err
+				}
+				continue
+			}
+
+			if resp.StatusCode >= 400 {
+				preview, _ := io.ReadAll(io.LimitReader(resp.Body, twErrorPreviewLimit))
+				_ = resp.Body.Close()
+				body := string(preview)
+				if twIsStaleQueryError(resp.StatusCode, body) && refresh == 0 {
+					staleQuery = true
+					narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] query ID stale (status %d), refreshing...\n", resp.StatusCode)
+					break
+				}
+				lastErr = fmt.Errorf("twitter status %d", resp.StatusCode)
+				if resp.StatusCode == http.StatusTooManyRequests {
+					delay := twMaxRetryBackoff
+					if ra := resp.Header.Get("Retry-After"); ra != "" {
+						if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
+							delay = time.Duration(sec) * time.Second
+						}
+					}
+					narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] rate limited (429), waiting %v...\n", delay)
+					if err := sleepCtx(ctx, delay); err != nil {
+						return twTweetResult{}, err
+					}
+					continue
+				}
+				return twTweetResult{}, lastErr
+			}
+
+			var result twSingleTweetResponse
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				_ = resp.Body.Close()
+				if refresh == 0 {
+					staleQuery = true
+					break
+				}
+				return twTweetResult{}, fmt.Errorf("decode: %w", err)
+			}
+			_ = resp.Body.Close()
+
+			tweet := result.Data.TweetResults.Result
+			if tweet == nil || tweet.Tweet.RestID == "" {
+				if len(result.Errors) > 0 && result.Errors[0].Message != "" {
+					return twTweetResult{}, fmt.Errorf("twitter: post %s not available: %s", restID, result.Errors[0].Message)
+				}
+				return twTweetResult{}, fmt.Errorf("twitter: post not found: %s", restID)
+			}
+			return tweet.Tweet, nil
+		}
+		if staleQuery {
+			twInvalidateQueryIDs(d)
+			continue
+		}
+		return twTweetResult{}, lastErr
+	}
+	return twTweetResult{}, fmt.Errorf("fetch twitter post: failed after query id refresh")
+}
+
 func tweetMediaCount(tweets []twTweetResult) int {
 	n := 0
 	for _, t := range tweets {
@@ -1014,9 +1170,11 @@ func (c *twCollection) items(outDir string, includePosts bool) []manifest.Item {
 	return twPostItems(c.Source.BaseDir(outDir), c.Posts, includePosts)
 }
 
-// twCollect resolves a source and fetches its posts, branching between the
-// profile timeline and the hashtag SearchTimeline. Cookies are required either
-// way; hashtag search additionally requires the authenticated session cookies.
+// twCollect resolves a source and fetches its posts, branching between a single
+// post, the profile timeline, and the hashtag SearchTimeline. Cookies are
+// required either way; hashtag search additionally requires the authenticated
+// session cookies. A status source resolves exactly the post it names and never
+// walks the surrounding timeline.
 func twCollect(ctx context.Context, d *Deps, rawURL, cookiesFile string, opts TwOptions) (*twCollection, error) {
 	src, err := ParseTwSource(rawURL)
 	if err != nil {
@@ -1025,6 +1183,14 @@ func twCollect(ctx context.Context, d *Deps, rawURL, cookiesFile string, opts Tw
 	csrfToken, err := twClient(d, cookiesFile)
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
+	}
+
+	if src.Kind == TwSourceStatus {
+		tweet, err := fetchTwTweetByRestID(ctx, d, cookiesFile, csrfToken, src.RestID, opts.RateLimiter)
+		if err != nil {
+			return nil, err
+		}
+		return &twCollection{Source: src, Posts: twPostsFromResults([]twTweetResult{tweet}, src.Username)}, nil
 	}
 
 	if src.Kind == TwSourceHashtag {
@@ -1206,9 +1372,17 @@ func ScanTwitterResolved(ctx context.Context, rawURL, outDir, cookiesFile string
 	if err != nil {
 		return resolve.Source{}, err
 	}
-	src := resolve.NewSource(rawURL, coll.Source.Canonical, resolve.KindFeed, "twitter")
-	if coll.Source.Kind == TwSourceProfile {
+	kind := resolve.KindFeed
+	if coll.Source.Kind == TwSourceStatus {
+		kind = resolve.KindSingle
+	}
+	src := resolve.NewSource(rawURL, coll.Source.Canonical, kind, "twitter")
+	if coll.Source.Kind == TwSourceProfile || coll.Source.Kind == TwSourceStatus {
 		src.Author = coll.Source.Username
+		if src.Author == "" && len(coll.Posts) > 0 {
+			// /i/status/<id> carries no author in the URL; the post data does.
+			src.Author = coll.Posts[0].Author
+		}
 	}
 	for _, p := range coll.Posts {
 		src.Items = append(src.Items, TwTweetToItem(p.Tweet, p.Author))

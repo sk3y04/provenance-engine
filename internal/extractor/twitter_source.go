@@ -8,7 +8,7 @@ import (
 	"unicode"
 )
 
-// TwSourceKind identifies the two supported native X/Twitter source families.
+// TwSourceKind identifies the three supported native X/Twitter source families.
 type TwSourceKind int
 
 const (
@@ -16,28 +16,36 @@ const (
 	TwSourceProfile TwSourceKind = iota
 	// TwSourceHashtag is a hashtag search: #tag, x:#tag, or /hashtag/tag.
 	TwSourceHashtag
+	// TwSourceStatus is one post: https://x.com/<user>/status/<id>. It resolves
+	// exactly that post, never the surrounding timeline.
+	TwSourceStatus
 )
 
 // TwSource is a normalized X/Twitter source. Profile sources carry a username;
 // hashtag sources carry the original tag, the GraphQL search query, a
 // filesystem-safe slug, and a stable canonical identity (x:#tag) so equivalent
-// spellings map to one source.
+// spellings map to one source; status sources carry the post id.
 type TwSource struct {
 	Kind      TwSourceKind
 	Username  string
 	Hashtag   string // original tag as supplied, without the leading '#'
 	Query     string // GraphQL rawQuery, e.g. "#golang filter:media"
 	Slug      string // filesystem-safe, lowercased tag
-	Canonical string // profile: https://x.com/<user>; hashtag: x:#<tag>
+	RestID    string // status sources: validated post id
+	Canonical string // profile: https://x.com/<user>; hashtag: x:#<tag>; status: https://x.com/<user>/status/<id>
 }
 
 // BaseDir returns the native output directory for this source:
 //
-//	<outDir>/twitter/<username>            (profile)
+//	<outDir>/twitter/<username>            (profile, and status with a username)
 //	<outDir>/twitter/hashtags/<slug>       (hashtag)
+//	<outDir>/twitter/<restId>              (status without a username, e.g. x.com/i/status/<id>)
 func (s TwSource) BaseDir(outDir string) string {
 	if s.Kind == TwSourceHashtag {
 		return filepath.Join(outDir, "twitter", "hashtags", s.Slug)
+	}
+	if s.Kind == TwSourceStatus && s.Username == "" {
+		return filepath.Join(outDir, "twitter", s.RestID)
 	}
 	return filepath.Join(outDir, "twitter", s.Username)
 }
@@ -80,6 +88,7 @@ func twSlug(tag string) string {
 // TwSource. It handles:
 //
 //	https://x.com/<user>              (profile, also twitter.com)
+//	https://x.com/<user>/status/<id>  (single post, also /i/status/<id>)
 //	#tag                              (hashtag, must be quoted in a shell)
 //	x:#tag                            (canonical hashtag shorthand)
 //	https://x.com/hashtag/<tag>       (hashtag URL)
@@ -122,6 +131,18 @@ func ParseTwSource(raw string) (TwSource, error) {
 		}
 		return newTwHashtagSource(decoded)
 	}
+	// Single post. Trailing media-index segments (/video/1, /photo/1) are not
+	// part of the identity and are ignored.
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "status") {
+		restID := ""
+		if len(parts) >= 3 {
+			restID = parts[2]
+		}
+		return newTwStatusSource(parts[0], restID)
+	}
+	if len(parts) >= 2 && strings.EqualFold(parts[0], "status") {
+		return newTwStatusSource("", parts[1])
+	}
 	if len(parts) == 0 || parts[0] == "" {
 		return TwSource{}, fmt.Errorf("not a twitter profile url: %s", raw)
 	}
@@ -151,6 +172,42 @@ func newTwHashtagSource(rawTag string) (TwSource, error) {
 		Query:     "#" + tag + twHashtagQuerySuffix,
 		Slug:      slug,
 		Canonical: "x:#" + strings.ToLower(tag),
+	}, nil
+}
+
+// twValidRestID accepts only a numeric snowflake post id, so a status id can
+// never carry path or query fragments into the output directory.
+func twValidRestID(id string) bool {
+	if id == "" || len(id) > 25 {
+		return false
+	}
+	for _, r := range id {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func newTwStatusSource(rawUsername, rawID string) (TwSource, error) {
+	restID := strings.TrimSpace(rawID)
+	if !twValidRestID(restID) {
+		return TwSource{}, fmt.Errorf("invalid post id %q: expected a numeric status id such as https://x.com/<user>/status/123", rawID)
+	}
+	username := sanitizeFilename(rawUsername)
+	if username == "i" {
+		// /i/status/<id> carries no author; the author comes from the post data.
+		username = ""
+	}
+	canonical := "https://x.com/i/status/" + restID
+	if username != "" {
+		canonical = fmt.Sprintf("https://x.com/%s/status/%s", username, restID)
+	}
+	return TwSource{
+		Kind:      TwSourceStatus,
+		Username:  username,
+		RestID:    restID,
+		Canonical: canonical,
 	}, nil
 }
 

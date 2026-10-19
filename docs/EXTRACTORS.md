@@ -122,7 +122,7 @@ func FetchAllTwTweets(ctx, rawURL, cookiesFile string, opts TwOptions) ([]twTwee
 
 ### API architecture
 
-Three GraphQL operations:
+Five GraphQL operations:
 
 | Operation | Query ID env var | Hardcoded default | Purpose |
 |-----------|-----------------|-------------------|---------|
@@ -130,11 +130,12 @@ Three GraphQL operations:
 | `UserTweets` | `TWITTER_QUERY_USER_TWEETS` | `6r5OLCC_wFH4CpRyXKuAmQ` | Fetch tweet timeline with media |
 | `UserMedia` | `TWITTER_QUERY_USER_MEDIA` | `IS3w9vvPg1SJysLErvnFGg` | Reserved for media-only endpoint |
 | `SearchTimeline` | `TWITTER_QUERY_SEARCH_TIMELINE` | *(none — discovered)* | Latest hashtag search, `filter:media` |
+| `TweetResultByRestId` | `TWITTER_QUERY_TWEET_RESULT_BY_REST_ID` | *(none — discovered)* | Resolve exactly one post by id |
 
-`SearchTimeline` has **no hard-coded fallback**: its query ID rotates
-independently, so the extractor discovers it from X's web-client JS (or uses the
-env override) and raises an actionable error if neither is available. It is
-served via **POST** with a JSON body (`variables` + `features` + `queryId`);
+`SearchTimeline` and `TweetResultByRestId` have **no hard-coded fallback**: their query IDs rotate
+independently, so the extractor discovers them from X's web-client JS (or uses the
+env override) and raises an actionable error if neither is available. `SearchTimeline`
+is served via **POST** with a JSON body (`variables` + `features` + `queryId`);
 that method/body detail is isolated in `fetchTwSearchPage` so it can be updated
 if X changes shape.
 
@@ -153,12 +154,15 @@ if X changes shape.
 3. `twInvalidateQueryIDs()` clears the cache
 4. `twRefreshQueryIDsForce()`:
    - Fetches `https://x.com/home` and extracts the web client JS URL from the HTML
-   - Fetches the JS file and regex-extracts query IDs for `UserByScreenName`, `UserMedia`, `UserTweets`, `SearchTimeline`
+   - Fetches the JS file and regex-extracts query IDs for `UserByScreenName`, `UserMedia`, `UserTweets`, `SearchTimeline`, `TweetResultByRestId`
    - Uses `operationName:"<Name>"` and `queryId:"<ID>"` patterns
 5. Retries with fresh IDs (up to 2 refresh cycles)
 6. Query-ID discovery runs at most once per process for a known operation (the bundle is not re-downloaded per page)
 
 ### Data flow (download)
+
+Profile sources. A status URL branches to `fetchTwTweetByRestID` (see Single
+post), and a hashtag source branches to `SearchTimeline`.
 
 ```
 ParseTwURL(rawURL) → extract username
@@ -216,6 +220,33 @@ Animated GIFs and videos share the same highest-bitrate non-HLS MP4 selection.
 Quoted/reposted media is attributed to the media-owning post's ID and author;
 a hashtag is never recorded as a creator. Promoted entries, cursor entries, and
 posts without media are ignored as media posts.
+
+### Single post
+
+`https://x.com/<user>/status/<id>` resolves exactly the post it names. It never
+walks the surrounding timeline, so a status URL costs one request:
+
+```
+ParseTwSource(raw) → TwSource{Kind: status, Username, RestID}
+   │  trailing /video/1 and /photo/1 segments are ignored;
+   │  the post id must be numeric
+   ▼
+fetchTwTweetByRestID() → TweetResultByRestId GET (single request)
+   │  stale query id → invalidate + refresh + retry once
+   ▼
+twPostsFromResults() → the post itself, plus embedded quoted/reposted
+   │  media when the post surfaced someone else's media
+   ▼
+twPostItems() → manifest items
+   ▼
+Worker pool → download each media file
+```
+
+`ScanTwitterResolved` reports `resolve.KindSingle` for these sources (profile and
+hashtag sources remain `feed`), so the API and UI show one resolved item rather
+than a feed. Output stays under `twitter/<username>` when the URL carries a
+username, and under `twitter/<postId>` for the authorless `x.com/i/status/<id>`
+form.
 
 ### Media URL extraction
 
