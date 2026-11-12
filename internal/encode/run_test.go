@@ -171,12 +171,9 @@ func TestRunSkipExisting(t *testing.T) {
 	mkfile(t, dir, "a.mp4")
 	mkfile(t, dir, "b.mp4")
 
-	// Pre-create one output so it is skipped (overwrite is false by default).
-	outDir := filepath.Join(dir, "av1_q30")
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(outDir, "a.av1-q30.mkv"), []byte("x"), 0o644); err != nil {
+	// Pre-create one in-place output so it is skipped (overwrite is false by
+	// default), and so the scan itself skips it as our own output.
+	if err := os.WriteFile(filepath.Join(dir, "a.av1-q30.mkv"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -197,11 +194,7 @@ func TestRunOverwriteReencodes(t *testing.T) {
 	stubBinaries(t)
 	dir := t.TempDir()
 	mkfile(t, dir, "a.mp4")
-	outDir := filepath.Join(dir, "av1_q30")
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(outDir, "a.av1-q30.mkv"), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "a.av1-q30.mkv"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -227,6 +220,60 @@ func TestRunReportsFailureAndNonZero(t *testing.T) {
 	}
 	if res.Failed != 1 || res.Succeeded != 0 {
 		t.Fatalf("unexpected result on failure: %#v", res)
+	}
+}
+
+func TestRunRemoveOriginalOnSuccess(t *testing.T) {
+	stubBinaries(t)
+	dir := t.TempDir()
+	in := filepath.Join(dir, "a.mp4")
+	mkfile(t, dir, "a.mp4")
+
+	fake := &fakeRunner{probeOut: qsvAvailable(), ffprobeOut: "24"}
+	res, err := Run(context.Background(), Options{Dir: dir, Encoder: "qsv", Quality: 30, RemoveOriginal: true}, fake)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Succeeded != 1 {
+		t.Fatalf("expected 1 succeeded, got %#v", res)
+	}
+	if _, statErr := os.Stat(in); !os.IsNotExist(statErr) {
+		t.Fatalf("original %s should have been removed after a successful encode", in)
+	}
+}
+
+func TestRunRemoveOriginalNotOnFailure(t *testing.T) {
+	stubBinaries(t)
+	dir := t.TempDir()
+	in := filepath.Join(dir, "a.mp4")
+	mkfile(t, dir, "a.mp4")
+
+	fake := &fakeRunner{probeOut: qsvAvailable(), ffprobeOut: "24", encodeErr: errors.New("device busy")}
+	_, err := Run(context.Background(), Options{Dir: dir, Encoder: "qsv", Quality: 30, RemoveOriginal: true}, fake)
+	if err == nil {
+		t.Fatal("expected a non-nil error when an encode fails")
+	}
+	if _, statErr := os.Stat(in); statErr != nil {
+		t.Fatalf("original %s must survive a failed encode: %v", in, statErr)
+	}
+}
+
+func TestRunDryRunNeverRemovesOriginal(t *testing.T) {
+	stubBinaries(t)
+	dir := t.TempDir()
+	in := filepath.Join(dir, "a.mp4")
+	mkfile(t, dir, "a.mp4")
+
+	fake := &fakeRunner{probeOut: qsvAvailable(), ffprobeOut: "24"}
+	res, err := Run(context.Background(), Options{Dir: dir, Encoder: "qsv", Quality: 30, DryRun: true, RemoveOriginal: true}, fake)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Succeeded != 1 {
+		t.Fatalf("dry-run should report success, got %#v", res)
+	}
+	if _, statErr := os.Stat(in); statErr != nil {
+		t.Fatalf("dry-run must not remove the original: %v", statErr)
 	}
 }
 
@@ -274,7 +321,7 @@ func TestRunNoFilesErrors(t *testing.T) {
 	}
 }
 
-func TestRunDefaultExtsAndOutDir(t *testing.T) {
+func TestRunDefaultExtsAndInPlaceOutput(t *testing.T) {
 	stubBinaries(t)
 	dir := t.TempDir()
 	mkfile(t, dir, "keep.mp4")
@@ -289,8 +336,21 @@ func TestRunDefaultExtsAndOutDir(t *testing.T) {
 	if res.Total != 2 {
 		t.Fatalf("default ext set should match mp4+webm only, got total=%d", res.Total)
 	}
-	if filepath.Base(res.OutDir) != "av1_q30" {
-		t.Fatalf("default out dir should be av1_q30, got %q", res.OutDir)
+	if res.OutDir != dir {
+		t.Fatalf("default out dir should be the source dir (in place), got %q", res.OutDir)
+	}
+	// No subdirectory or log file may be created.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			t.Fatalf("unexpected subdirectory %q created by encode", e.Name())
+		}
+		if strings.HasSuffix(e.Name(), ".log") {
+			t.Fatalf("unexpected log file %q created by encode", e.Name())
+		}
 	}
 }
 
@@ -310,7 +370,7 @@ func TestCollectFilesRecursiveFiltersAndSkipsOutput(t *testing.T) {
 	exts := parseExts("mp4,mkv,mov")
 
 	// Non-recursive: sub/ is not descended.
-	nonRec, err := collectFiles(root, false, exts, outDir)
+	nonRec, err := collectFiles(root, false, exts, outDir, "av1-q30")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,13 +380,45 @@ func TestCollectFilesRecursiveFiltersAndSkipsOutput(t *testing.T) {
 	}
 
 	// Recursive: sub/ descended, av1_q30 skipped.
-	rec, err := collectFiles(root, true, exts, outDir)
+	rec, err := collectFiles(root, true, exts, outDir, "av1-q30")
 	if err != nil {
 		t.Fatal(err)
 	}
 	sort.Strings(rec)
 	if got := strings.Join(baenames(rec), ","); got != "a.mp4,b.mkv,d.mov" {
 		t.Fatalf("recursive = %v", got)
+	}
+}
+
+// TestCollectFilesSkipsInPlaceOutput verifies that outputs written into the
+// source directory itself (<base>.<suffix>.mkv) are not re-collected on a
+// re-run, while other .mkv files in that directory still are.
+func TestCollectFilesSkipsInPlaceOutput(t *testing.T) {
+	root := t.TempDir()
+	mkfile(t, root, "a.mp4")
+	mkfile(t, root, "b.mkv")         // a user file, not our output
+	mkfile(t, root, "a.av1-q30.mkv") // our previous in-place output
+
+	exts := parseExts("mp4,mkv")
+
+	got, err := collectFiles(root, false, exts, root, "av1-q30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(got)
+	if s := strings.Join(baenames(got), ","); s != "a.mp4,b.mkv" {
+		t.Fatalf("in-place outputs must be skipped, got %v", s)
+	}
+
+	// With no suffix there is no recognizable output pattern, so the .mkv
+	// file is collected as a normal input.
+	got, err = collectFiles(root, false, exts, root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(got)
+	if s := strings.Join(baenames(got), ","); s != "a.av1-q30.mkv,a.mp4,b.mkv" {
+		t.Fatalf("empty suffix must not skip any file, got %v", s)
 	}
 }
 

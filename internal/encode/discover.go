@@ -31,8 +31,10 @@ func parseExts(s string) map[string]bool {
 
 // collectFiles walks dir and returns absolute paths of files whose extension is
 // in exts. It never descends into the encoder's own output directories
-// (named av1_qN or equal to outDir) so re-runs do not re-encode their output.
-func collectFiles(dir string, recursive bool, exts map[string]bool, outDir string) ([]string, error) {
+// (named av1_qN or equal to outDir) so re-runs do not re-encode their output,
+// and it skips its own in-place output files (<base>.<suffix>.mkv inside
+// outDir) for the same reason.
+func collectFiles(dir string, recursive bool, exts map[string]bool, outDir, suffix string) ([]string, error) {
 	var results []string
 	var walkErr error
 
@@ -46,12 +48,19 @@ func collectFiles(dir string, recursive bool, exts map[string]bool, outDir strin
 			if strings.HasPrefix(base, "av1_q") && path != dir {
 				return filepath.SkipDir
 			}
-			if outDir != "" && pathIsInside(path, outDir) {
+			if outDir != "" && path != dir && pathIsInside(path, outDir) {
 				return filepath.SkipDir
 			}
 			if !recursive && path != dir {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		// Skip in-place outputs we produced: <base>.<suffix>.mkv in the
+		// output dir (only when a suffix is set, otherwise the pattern
+		// would match every .mkv file).
+		if suffix != "" && outDir != "" && pathIsInside(path, outDir) &&
+			strings.HasSuffix(strings.ToLower(path), "."+strings.ToLower(suffix)+".mkv") {
 			return nil
 		}
 		if exts[strings.ToLower(filepath.Ext(path))] {

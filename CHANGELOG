@@ -54,9 +54,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ScanTwitterResolved` reports `resolve.KindSingle` for these sources. The query
   id has no hard-coded fallback (discovered from the web-client JS or
   `TWITTER_QUERY_TWEET_RESULT_BY_REST_ID`).
+- **`encode --remove-original`**: deletes each source file only after its encode
+  succeeds. A failed encode leaves its source in place, and `--dry-run` never
+  removes anything.
 
 ### Changed
 
+- **`encode`: output now lands in the source directory by default** (in place)
+  instead of a `<dir>/av1_qN` subdirectory, and no per-file log files are
+  written; ffmpeg stderr is discarded. `--out` still redirects. The scan skips
+  its own in-place `<base>.<suffix>.mkv` outputs so re-runs do not re-encode
+  them, while a user's own `.mkv` files are still collected.
+- **`encode`: `--devices` is auto-detected when unset** — QSV pins the Intel render
+  nodes (PCI vendor `8086`) and AMF the AMD nodes (`1002`/`1022`) found in
+  `/dev/dri` via `/sys/class/drm`, sorted by node number; NVENC uses GPU index
+  0. The previous hard-coded `/dev/dri/renderD128` default is gone — a box
+  whose lowest-numbered node is a non-Intel GPU (for example an RTX 3090
+  without AV1 hardware encode) no longer defaults to a node that cannot
+  encode. If no node matches the vendor, every node is pinned so the failure
+  is loud; with no render nodes at all nothing is pinned and the encoder
+  library chooses.
 - `dispatcher.PrintSummary` is now a presentation adapter taking an `io.Writer`;
   reusable paths emit `EventSummary` and never write to a terminal themselves.
 - The TUI no longer reassigns `os.Stdout`/`os.Stderr`. It consumes events through

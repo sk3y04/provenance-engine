@@ -77,21 +77,22 @@ var (
 	flagKeep               int
 	flagChromePath         string
 
-	flagEncodeDir       string
-	flagEncodeFile      string
-	flagEncodeRecursive bool
-	flagEncodeExt       string
-	flagEncodeOut       string
-	flagEncodeSuffix    string
-	flagEncodeOverwrite bool
-	flagEncodeEncoder   string
-	flagEncodeDevices   string
-	flagEncodeQuality   int
-	flagEncodePreset    string
-	flagEncodeGOP       float64
-	flagEncodeLookahead int
-	flagEncodeBFrames   int
-	flagEncodeDryRun    bool
+	flagEncodeDir            string
+	flagEncodeFile           string
+	flagEncodeRecursive      bool
+	flagEncodeExt            string
+	flagEncodeOut            string
+	flagEncodeSuffix         string
+	flagEncodeOverwrite      bool
+	flagEncodeEncoder        string
+	flagEncodeDevices        string
+	flagEncodeQuality        int
+	flagEncodePreset         string
+	flagEncodeGOP            float64
+	flagEncodeLookahead      int
+	flagEncodeBFrames        int
+	flagEncodeDryRun         bool
+	flagEncodeRemoveOriginal bool
 )
 
 func main() {
@@ -254,29 +255,32 @@ func encodeCmd() *cobra.Command {
 		Long: `encode batch-converts local video files to AV1 using hardware
 acceleration (Intel QuickSync, AMD AMF, or NVIDIA NVENC), fanning work across
 one or more GPUs. Audio and subtitle streams are copied, container metadata is
-preserved, and outputs are always written to an .mkv container. Source files are
-never modified.
+preserved, and outputs are always written to an .mkv container, in the same
+directory as the source files unless --out is set. No log files are written.
+Source files are never modified; --remove-original deletes an input only after
+its encode succeeds.
 
 Encoder auto-detection probes your ffmpeg build; pass --encoder to choose a
 specific backend. Use --dry-run to preview the exact ffmpeg commands.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			opts := encode.Options{
-				Dir:        flagEncodeDir,
-				File:       flagEncodeFile,
-				Recursive:  flagEncodeRecursive,
-				Ext:        manifest.ParseCSV(flagEncodeExt),
-				OutDir:     flagEncodeOut,
-				Suffix:     flagEncodeSuffix,
-				Overwrite:  flagEncodeOverwrite,
-				Encoder:    flagEncodeEncoder,
-				Devices:    splitDevices(flagEncodeDevices),
-				Quality:    flagEncodeQuality,
-				Preset:     flagEncodePreset,
-				GOPSeconds: flagEncodeGOP,
-				Lookahead:  flagEncodeLookahead,
-				BFrames:    flagEncodeBFrames,
-				DryRun:     flagEncodeDryRun,
+				Dir:            flagEncodeDir,
+				File:           flagEncodeFile,
+				Recursive:      flagEncodeRecursive,
+				Ext:            manifest.ParseCSV(flagEncodeExt),
+				OutDir:         flagEncodeOut,
+				Suffix:         flagEncodeSuffix,
+				Overwrite:      flagEncodeOverwrite,
+				RemoveOriginal: flagEncodeRemoveOriginal,
+				Encoder:        flagEncodeEncoder,
+				Devices:        splitDevices(flagEncodeDevices),
+				Quality:        flagEncodeQuality,
+				Preset:         flagEncodePreset,
+				GOPSeconds:     flagEncodeGOP,
+				Lookahead:      flagEncodeLookahead,
+				BFrames:        flagEncodeBFrames,
+				DryRun:         flagEncodeDryRun,
 			}
 			res, err := encode.Run(cmd.Context(), opts, nil)
 			if err != nil {
@@ -295,11 +299,12 @@ func addEncodeFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&flagEncodeFile, "file", "", "Single input video file (alternative to --dir)")
 	cmd.Flags().BoolVar(&flagEncodeRecursive, "recursive", false, "Recurse into subdirectories")
 	cmd.Flags().StringVar(&flagEncodeExt, "ext", "mp4,mkv,mov,avi,ts,webm", "Comma-separated input extensions to match")
-	cmd.Flags().StringVar(&flagEncodeOut, "out", "", "Output directory (default: <dir>/av1_qN)")
+	cmd.Flags().StringVar(&flagEncodeOut, "out", "", "Output directory (default: the source directory itself)")
 	cmd.Flags().StringVar(&flagEncodeSuffix, "suffix", "", "Suffix inserted before .mkv in output names (default: av1-qN)")
 	cmd.Flags().BoolVar(&flagEncodeOverwrite, "overwrite", false, "Re-encode even if the output already exists")
+	cmd.Flags().BoolVar(&flagEncodeRemoveOriginal, "remove-original", false, "Delete each source file after its encode succeeds (never with --dry-run)")
 	cmd.Flags().StringVar(&flagEncodeEncoder, "encoder", "auto", "AV1 backend: qsv (Intel), amf (AMD), nvenc (NVIDIA), or auto")
-	cmd.Flags().StringVar(&flagEncodeDevices, "devices", "/dev/dri/renderD128", "Comma-separated render nodes (QSV/AMF) or GPU indices (NVENC)")
+	cmd.Flags().StringVar(&flagEncodeDevices, "devices", "", "Comma-separated render nodes (QSV/AMF) or GPU indices (NVENC). Default: auto-detected (Intel nodes for QSV, AMD nodes for AMF, GPU 0 for NVENC)")
 	cmd.Flags().IntVar(&flagEncodeQuality, "quality", 30, "QSV global_quality 1..51 (20-22 near-transparent, 24-26 very good, 28-30 aggressive, 32+ archival/animation only)")
 	cmd.Flags().StringVar(&flagEncodePreset, "preset", "medium", "Encoder preset for speed vs efficiency, mapped per backend")
 	cmd.Flags().Float64Var(&flagEncodeGOP, "gop-seconds", 10, "Keyframe interval in seconds (converted to frames per file using its fps)")

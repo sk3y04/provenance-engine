@@ -451,7 +451,7 @@ provenance completion powershell | Out-String | Invoke-Expression
 
 ## `provenance encode [flags]`
 
-Batch-convert local video files to hardware-accelerated AV1 in an `.mkv` container. Inputs are scanned from a directory (or a single `--file`), transcoded through a GPU backend (Intel QuickSync, AMD AMF, or NVIDIA NVENC), and written as AV1 — audio/subtitle streams and container metadata are copied; source files are never modified. Work is fanned out across one worker pool per requested device, so multiple GPUs can encode in parallel.
+Batch-convert local video files to hardware-accelerated AV1 in an `.mkv` container. Inputs are scanned from a directory (or a single `--file`), transcoded through a GPU backend (Intel QuickSync, AMD AMF, or NVIDIA NVENC), and written as AV1 — audio/subtitle streams and container metadata are copied. Outputs are written in the same directory as the source files unless `--out` is set, and no log files are written. Work is fanned out across one worker pool per requested device, so multiple GPUs can encode in parallel.
 
 Encoder selection probes your installed `ffmpeg`: `auto` picks the first available hardware AV1 codec (QSV preferred); pass `--encoder qsv|amf|nvenc` to pin one. An explicit encoder not present in the build is rejected with a `not supported by this ffmpeg build` error. Requires `ffmpeg` and `ffprobe` on `PATH` (the latter for per-file frame-rate detection).
 
@@ -463,11 +463,12 @@ Encoder selection probes your installed `ffmpeg`: `auto` picks the first availab
 | `--file` | string | - | Single input video file (alternative to `--dir`) |
 | `--recursive` | bool | `false` | Recurse into subdirectories |
 | `--ext` | string | `mp4,mkv,mov,avi,ts,webm` | Comma-separated input extensions to match (no leading dot) |
-| `--out` | string | `<dir>/av1_qN` | Output directory (default: `<dir>/av1_qN`) |
+| `--out` | string | source directory | Output directory (default: the source directory itself) |
 | `--suffix` | string | `av1-qN` | Suffix inserted before `.mkv` in output names |
 | `--overwrite` | bool | `false` | Re-encode even if the output already exists |
+| `--remove-original` | bool | `false` | Delete each source file after its encode succeeds (never with `--dry-run`) |
 | `--encoder` | string | `auto` | AV1 backend: `qsv` (Intel), `amf` (AMD), `nvenc` (NVIDIA), or `auto` |
-| `--devices` | string | `/dev/dri/renderD128` | Comma-separated render nodes (QSV/AMF) or GPU indices (NVENC) |
+| `--devices` | string | auto-detected | Comma-separated render nodes (QSV/AMF) or GPU indices (NVENC). When unset, QSV pins the Intel render nodes found in `/dev/dri` (by PCI vendor), AMF pins the AMD nodes, and NVENC uses GPU index 0 |
 | `--quality` | int | `30` | Quality on the canonical QSV `global_quality` scale 1..51 (20–22 near-transparent, 24–26 very good, 28–30 aggressive, 32+ archival/animation only); mapped to AMF `cq_quality` / NVENC `crf` |
 | `--preset` | string | `medium` | Speed-vs-efficiency hint, mapped per backend (QSV `fast`/`slow`, NVENC `hp`/`hq`/`slow_hq`, AMF `ultrafast`/`balanced`/`maximum`) |
 | `--gop-seconds` | float | `10` | Keyframe interval in seconds; converted to a frame count per file using its ffprobe-detected fps |
@@ -478,9 +479,11 @@ Encoder selection probes your installed `ffmpeg`: `auto` picks the first availab
 ### Behavior notes
 
 - **Quality scale** — `--quality` is expressed once on the QSV `global_quality` scale (1–51, lower = better) and translated per backend: AMF receives `-cq_quality` on the same range, NVENC receives `-crf` mapped onto 1–33.
-- **Output naming** — each output is `<base>.<suffix>.mkv` (e.g. `clip.av1-q30.mkv`), written next to the source unless `--out` is set. The scan skips any directory named `av1_q*` or equal to the output dir, so re-runs do not re-encode their own output.
+- **Output naming** — each output is `<base>.<suffix>.mkv` (e.g. `clip.av1-q30.mkv`), written in the same directory as the source file unless `--out` is set. No log files are written. The scan skips any directory named `av1_q*` or equal to the output dir, and skips its own in-place output files (`<base>.<suffix>.mkv` inside the output dir), so re-runs do not re-encode their own output.
+- **`--remove-original`** — deletes each source file only after its encode succeeds. A failed encode leaves its source in place, and `--dry-run` never removes anything.
+- **Device auto-detection** — with no `--devices`, QSV pins the Intel render nodes (PCI vendor `8086`) and AMF the AMD nodes (`1002`/`1022`), read from `/sys/class/drm` and sorted by node number, so a box with multiple GPU vendors does not default to a node that cannot encode. If no node matches the vendor, every node is pinned so the failure is loud; if no render nodes exist at all, nothing is pinned and the encoder library chooses.
 - **Concurrency** — one `worker.Pool` is created per device; each job is submitted with permanent-error semantics so a failed encode never overwrites another's in-progress output.
-- **`--dry-run`** — prints each device's full `ffmpeg` command (shell-escaped, no shell invoked) and touches no files or logs.
+- **`--dry-run`** — prints each device's full `ffmpeg` command (shell-escaped, no shell invoked) and touches no files.
 
 ---
 

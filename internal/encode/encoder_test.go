@@ -11,7 +11,6 @@ func sampleJob() EncodeJob {
 	return EncodeJob{
 		Input:     "/in/movie.mp4",
 		Output:    "/out/movie.av1-q30.mkv",
-		LogPath:   "/out/movie.av1-q30.log",
 		FPS:       24,
 		GOPInt:    120,
 		Device:    "/dev/dri/renderD128",

@@ -25,21 +25,24 @@ import (
 // persistent flags separately from the generic download Config — the encoder
 // has no download/session semantics to preserve, so it gets its own option bag.
 type Options struct {
-	Dir        string   // source directory (ignored when File is set)
-	File       string   // single input file
-	Recursive  bool     // recurse into subdirectories
-	Ext        []string // input extensions to match (no leading dot)
-	OutDir     string   // empty -> <sourceDir>/av1_qN
-	Suffix     string   // inserted before .mkv (empty -> av1-qN)
-	Overwrite  bool     // re-encode even if the output already exists
-	Encoder    string   // qsv|amf|nvenc|auto
-	Devices    []string // render-node paths (QSV/AMF) or GPU indices (NVENC)
-	Quality    int      // canonical QSV global_quality scale 1..51
-	Preset     string   // speed/efficiency hint, mapped per backend
-	GOPSeconds float64  // keyframe interval in seconds
-	Lookahead  int      // look-ahead frames; QSV max 100
-	BFrames    int      // B-frames per GOP
-	DryRun     bool     // print commands without encoding
+	Dir       string   // source directory (ignored when File is set)
+	File      string   // single input file
+	Recursive bool     // recurse into subdirectories
+	Ext       []string // input extensions to match (no leading dot)
+	OutDir    string   // empty -> the source directory itself (in place)
+	Suffix    string   // inserted before .mkv (empty -> av1-qN)
+	Overwrite bool     // re-encode even if the output already exists
+	// RemoveOriginal deletes each input file after its encode succeeds.
+	// Removal never happens in dry-run mode or when the encode fails.
+	RemoveOriginal bool
+	Encoder        string   // qsv|amf|nvenc|auto
+	Devices        []string // render-node paths (QSV/AMF) or GPU indices (NVENC)
+	Quality        int      // canonical QSV global_quality scale 1..51
+	Preset         string   // speed/efficiency hint, mapped per backend
+	GOPSeconds     float64  // keyframe interval in seconds
+	Lookahead      int      // look-ahead frames; QSV max 100
+	BFrames        int      // B-frames per GOP
+	DryRun         bool     // print commands without encoding
 }
 
 // Result summarizes a completed (or dry-run) batch.
@@ -56,11 +59,6 @@ type Result struct {
 // OK reports whether the batch produced no failures and touched at least one
 // file. A run with zero discovered files is not OK.
 func (r Result) OK() bool { return r.Failed == 0 && r.Total > 0 }
-
-// defaultDevice is the default render node when the user does not pass
-// --devices. QSV is the primary target, so the first Intel render node is the
-// sensible default.
-const defaultDevice = "/dev/dri/renderD128"
 
 // Run discovers inputs, resolves the encoder, and fans the batch out over the
 // requested devices using the worker pool. It returns a non-nil error (so the
@@ -89,18 +87,13 @@ func Run(ctx context.Context, opts Options, runner CommandRunner) (Result, error
 
 	outDir := opts.OutDir
 	if strings.TrimSpace(outDir) == "" {
-		outDir = filepath.Join(sourceDir, fmt.Sprintf("av1_q%d", quality))
+		outDir = sourceDir
 	}
 	suffix := opts.Suffix
 	if strings.TrimSpace(suffix) == "" {
 		suffix = fmt.Sprintf("av1-q%d", quality)
 	}
 	suffix = strings.TrimSpace(suffix)
-
-	devices := opts.Devices
-	if len(devices) == 0 {
-		devices = []string{defaultDevice}
-	}
 
 	// Look-ahead defaults to 100 (QSV's max) when unset, matching the CLI flag
 	// default; <=0 disables the flag inside av1Args.
@@ -121,6 +114,17 @@ func Run(ctx context.Context, opts Options, runner CommandRunner) (Result, error
 		return Result{}, err
 	}
 
+	// Devices default to the vendor-matched render nodes detected on this
+	// machine (Intel for QSV, AMD for AMF, GPU index 0 for NVENC). An empty
+	// detection result pins nothing and lets the encoder library choose.
+	devices := opts.Devices
+	if len(devices) == 0 {
+		devices = probeDevices(enc.Name())
+	}
+	if len(devices) == 0 {
+		devices = []string{""}
+	}
+
 	// Discover inputs.
 	var inputs []string
 	if opts.File != "" {
@@ -134,7 +138,11 @@ func Run(ctx context.Context, opts Options, runner CommandRunner) (Result, error
 		if err != nil {
 			return Result{}, fmt.Errorf("resolve --dir: %w", err)
 		}
-		inputs, err = collectFiles(abs, opts.Recursive, exts, outDir)
+		outDirAbs, err := filepath.Abs(outDir)
+		if err != nil {
+			return Result{}, fmt.Errorf("resolve --out: %w", err)
+		}
+		inputs, err = collectFiles(abs, opts.Recursive, exts, outDirAbs, suffix)
 		if err != nil {
 			return Result{}, fmt.Errorf("scan %s: %w", abs, err)
 		}
@@ -156,7 +164,6 @@ func Run(ctx context.Context, opts Options, runner CommandRunner) (Result, error
 	for i, in := range inputs {
 		base := strings.TrimSuffix(filepath.Base(in), filepath.Ext(in))
 		outPath := filepath.Join(outDir, fmt.Sprintf("%s.%s.mkv", base, suffix))
-		logPath := filepath.Join(outDir, fmt.Sprintf("%s.%s.log", base, suffix))
 
 		if !opts.Overwrite {
 			if _, statErr := os.Stat(outPath); statErr == nil {
@@ -169,7 +176,6 @@ func Run(ctx context.Context, opts Options, runner CommandRunner) (Result, error
 		job := EncodeJob{
 			Input:     in,
 			Output:    outPath,
-			LogPath:   logPath,
 			FPS:       fps,
 			GOPInt:    GOPFrames(fps, gopSeconds),
 			Device:    devices[i%len(devices)],
@@ -203,6 +209,11 @@ func Run(ctx context.Context, opts Options, runner CommandRunner) (Result, error
 				return nil
 			},
 			func() {
+				if opts.RemoveOriginal && !opts.DryRun {
+					if rmErr := os.Remove(job.Input); rmErr != nil {
+						reporter.linef("[provenance] warning: could not remove original %s: %v", job.Input, rmErr)
+					}
+				}
 				reporter.incSucceeded()
 				reporter.printDone(devices[i%len(devices)], job, reporter.completed())
 			},
@@ -227,25 +238,20 @@ func Run(ctx context.Context, opts Options, runner CommandRunner) (Result, error
 	reporter.printSummary(res, time.Since(reporter.start))
 
 	if res.Failed > 0 {
-		return res, fmt.Errorf("%d encode(s) failed (see %s)", res.Failed, outDir)
+		return res, fmt.Errorf("%d encode(s) failed", res.Failed)
 	}
 	return res, nil
 }
 
-// runOne encodes a single job, streaming ffmpeg stderr to the per-file log.
+// runOne encodes a single job. ffmpeg stderr is discarded: no per-file log
+// files are written.
 func runOne(ctx context.Context, ffmpeg string, runner CommandRunner, enc Encoder, job EncodeJob, dryRun bool) error {
 	if dryRun {
 		// Dry-run prints the constructed command and never touches the
 		// filesystem, so there is no log to open.
 		return enc.Run(ctx, ffmpeg, runner, io.Discard, job, true)
 	}
-	log, err := os.Create(job.LogPath)
-	if err != nil {
-		return fmt.Errorf("create log %s: %w", job.LogPath, err)
-	}
-	defer func() { _ = log.Close() }()
-
-	if err := enc.Run(ctx, ffmpeg, runner, log, job, false); err != nil {
+	if err := enc.Run(ctx, ffmpeg, runner, io.Discard, job, false); err != nil {
 		return fmt.Errorf("ffmpeg: %w", err)
 	}
 	return nil
@@ -301,8 +307,8 @@ func (r *reporter) fail(job EncodeJob, runErr error) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	fmt.Fprintf(os.Stderr, "[provenance] %s: FAILED %s -> %v (see %s)\n",
-		job.Device, filepath.Base(job.Input), runErr, job.LogPath)
+	fmt.Fprintf(os.Stderr, "[provenance] %s: FAILED %s -> %v\n",
+		job.Device, filepath.Base(job.Input), runErr)
 }
 
 func (r *reporter) linef(format string, args ...any) {

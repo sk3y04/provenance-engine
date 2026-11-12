@@ -33,7 +33,6 @@ var encoderShortcuts = map[string]string{
 type EncodeJob struct {
 	Input     string
 	Output    string
-	LogPath   string
 	FPS       float64
 	GOPInt    int // keyframe interval in frames
 	Device    string
