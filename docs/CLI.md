@@ -575,6 +575,7 @@ Encoder selection probes your installed `ffmpeg`: `auto` picks the first availab
 - **Device auto-detection** — with no `--devices`, QSV pins the Intel render nodes (PCI vendor `8086`) and AMF the AMD nodes (`1002`/`1022`), read from `/sys/class/drm` and sorted by node number, so a box with multiple GPU vendors does not default to a node that cannot encode. If no node matches the vendor, every node is pinned so the failure is loud; if no render nodes exist at all, nothing is pinned and the encoder library chooses.
 - **Concurrency** — one `worker.Pool` is created per device; each job is submitted with permanent-error semantics so a failed encode never overwrites another's in-progress output.
 - **`--dry-run`** — prints each device's full `ffmpeg` command (shell-escaped, no shell invoked) and touches no files.
+- **Event sink** — when the operation carries an `event.Sink` (`encode.Options.Events`), narration (start, per-file outcomes, summary, dry-run echo) is emitted as structured events and nothing is written to the terminal. The CLI passes no sink, so terminal output is the legacy `[provenance]` lines.
 
 ---
 

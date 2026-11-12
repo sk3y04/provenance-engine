@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/worker"
 )
 
@@ -43,6 +44,10 @@ type Options struct {
 	Lookahead      int      // look-ahead frames; QSV max 100
 	BFrames        int      // B-frames per GOP
 	DryRun         bool     // print commands without encoding
+	// Events, when set, receives structured progress/summary events and the
+	// operation narrates to no terminal. The CLI leaves it nil today (legacy
+	// narration); a TUI or worker transport supplies one.
+	Events event.Sink
 }
 
 // Result summarizes a completed (or dry-run) batch.
@@ -66,6 +71,12 @@ func (r Result) OK() bool { return r.Failed == 0 && r.Total > 0 }
 func Run(ctx context.Context, opts Options, runner CommandRunner) (Result, error) {
 	if runner == nil {
 		runner = NewRunner()
+	}
+	// Carry the sink on the context so every narration helper in the batch
+	// (including per-job hooks and the encoder dry-run echo) resolves it
+	// without threading a parameter through every signature.
+	if opts.Events != nil {
+		ctx = event.WithSink(ctx, opts.Events)
 	}
 
 	exts := extSet(opts.Ext)
@@ -158,7 +169,7 @@ func Run(ctx context.Context, opts Options, runner CommandRunner) (Result, error
 	}
 
 	// Build jobs, skipping outputs that already exist unless --overwrite.
-	reporter := newReporter()
+	reporter := newReporter(ctx)
 	reporter.total = len(inputs)
 
 	for i, in := range inputs {
@@ -211,7 +222,8 @@ func Run(ctx context.Context, opts Options, runner CommandRunner) (Result, error
 			func() {
 				if opts.RemoveOriginal && !opts.DryRun {
 					if rmErr := os.Remove(job.Input); rmErr != nil {
-						reporter.linef("[provenance] warning: could not remove original %s: %v", job.Input, rmErr)
+						narrate(reporter.ctx, os.Stderr, kindEncodeWarn, event.ReasonInfo, filepath.Base(job.Input), "", rmErr,
+							"[provenance] warning: could not remove original %s: %v", job.Input, rmErr)
 					}
 				}
 				reporter.incSucceeded()
@@ -269,10 +281,14 @@ func defaultExts() []string {
 	return []string{"mp4", "mkv", "mov", "avi", "ts", "webm"}
 }
 
-// reporter serializes [provenance] stderr lines and counts outcomes. It is
-// safe for concurrent use because pool hooks run in worker goroutines.
+// reporter counts encode outcomes and narrates the [provenance] lines. It is
+// safe for concurrent use because pool hooks run in worker goroutines;
+// terminal writes are serialized by narrateMu in emit.go. ctx carries the
+// operation's event sink (set in Run), which decides whether each line becomes
+// a structured event or legacy terminal text.
 type reporter struct {
 	mu        sync.Mutex
+	ctx       context.Context
 	start     time.Time
 	total     int
 	jobs      []EncodeJob
@@ -282,8 +298,8 @@ type reporter struct {
 	firstErr  error
 }
 
-func newReporter() *reporter {
-	return &reporter{start: time.Now()}
+func newReporter(ctx context.Context) *reporter {
+	return &reporter{ctx: ctx, start: time.Now()}
 }
 
 func (r *reporter) incSucceeded() { atomic.AddInt64(&r.succeeded, 1) }
@@ -296,7 +312,7 @@ func (r *reporter) completed() int {
 	return int(atomic.LoadInt64(&r.succeeded) + atomic.LoadInt64(&r.failed))
 }
 
-// fail records the first failure (guarded) and prints a per-file error line.
+// fail records the first failure (guarded) and narrates a per-file error line.
 func (r *reporter) fail(job EncodeJob, runErr error) {
 	r.incFailed()
 	r.mu.Lock()
@@ -305,31 +321,25 @@ func (r *reporter) fail(job EncodeJob, runErr error) {
 	}
 	r.mu.Unlock()
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	fmt.Fprintf(os.Stderr, "[provenance] %s: FAILED %s -> %v\n",
-		job.Device, filepath.Base(job.Input), runErr)
-}
-
-func (r *reporter) linef(format string, args ...any) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	narrate(r.ctx, os.Stderr, kindEncodeItem, event.ReasonItemFailed, filepath.Base(job.Input), "", runErr,
+		"[provenance] %s: FAILED %s -> %v", job.Device, filepath.Base(job.Input), runErr)
 }
 
 func (r *reporter) printHeader(count int, codec string, quality int, preset string, gopSeconds float64, suffix string, devices []string, dryRun bool) {
-	r.linef("[provenance] encode: %d input(s), %d device worker(s): %s",
+	narrate(r.ctx, os.Stderr, kindEncodeStart, event.ReasonStart, "", "", nil,
+		"[provenance] encode: %d input(s), %d device worker(s): %s",
 		count, len(devices), strings.Join(devices, ", "))
-	r.linef("[provenance] encoder: %s | quality=%d | preset=%q | suffix=%q | gop=%gs | dry-run=%v",
+	narrate(r.ctx, os.Stderr, kindEncodeInfo, event.ReasonInfo, "", "", nil,
+		"[provenance] encoder: %s | quality=%d | preset=%q | suffix=%q | gop=%gs | dry-run=%v",
 		codec, quality, preset, suffix, gopSeconds, dryRun)
 }
 
 func (r *reporter) printDone(device string, job EncodeJob, done int) {
-	r.linef("[provenance] %s: done %d/%d  %s (fps=%.2f gop=%d)",
+	narrate(r.ctx, os.Stderr, kindEncodeItem, event.ReasonItemOK, filepath.Base(job.Input), "", nil,
+		"[provenance] %s: done %d/%d  %s (fps=%.2f gop=%d)",
 		device, done, r.total, filepath.Base(job.Output), job.FPS, job.GOPInt)
 }
 
 func (r *reporter) printSummary(res Result, dur time.Duration) {
-	r.linef("[provenance] done in %s — success: %d, skipped: %d, failed: %d, output: %s",
-		dur.Round(time.Second), res.Succeeded, res.Skipped, res.Failed, res.OutDir)
+	narrateSummary(r.ctx, res.Total, res.Succeeded, res.Skipped, res.Failed, res.OutDir, dur.Round(time.Second).String())
 }

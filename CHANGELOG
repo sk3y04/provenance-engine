@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Encode is transport-neutral (`encode.Options.Events`)**: the encode batch
+  now narrates through the shared event system — a start stage, one config
+  info line, one `item_done` per file (failures carry the error), a terminal
+  `summary` carrying the ok/failed/skipped tallies, and the dry-run command
+  echo — emitted as structured `event.Event`s on an `event.Sink` with nothing
+  written to the terminal when one is supplied. The CLI passes no sink, so
+  `provenance encode` output is byte-for-byte unchanged; a TUI or worker
+  transport can now consume encode progress like every other operation.
 - **Run history on the CLI (`provenance history`)**: every run that goes
   through `app.Download` — CLI `grab`, `watch run` (including `--every`
   repeats) and `collect sync` — now records one history entry (URLs,

@@ -3,11 +3,13 @@ package encode
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/sk3y04/provenance-engine/internal/event"
 )
 
 // Encoder names (ffmpeg codec names).
@@ -141,7 +143,8 @@ func (av1QSV) BuildArgs(job EncodeJob) []string {
 // Run implements Encoder.
 func (e av1QSV) Run(ctx context.Context, ffmpeg string, runner CommandRunner, log io.Writer, job EncodeJob, dryRun bool) error {
 	if dryRun {
-		fmt.Fprintf(os.Stderr, "[provenance] dry-run (%s): ffmpeg %s\n", e.Name(), formatCmdline(e.BuildArgs(job)))
+		narrate(ctx, os.Stderr, kindEncodeInfo, event.ReasonDryRun, filepath.Base(job.Input), "", nil,
+			"[provenance] dry-run (%s): ffmpeg %s", e.Name(), formatCmdline(e.BuildArgs(job)))
 		return nil
 	}
 	return runner.Run(ctx, ffmpeg, nil, io.Discard, log, e.BuildArgs(job)...)
@@ -186,7 +189,8 @@ func (av1AMF) BuildArgs(job EncodeJob) []string {
 // Run implements Encoder.
 func (e av1AMF) Run(ctx context.Context, ffmpeg string, runner CommandRunner, log io.Writer, job EncodeJob, dryRun bool) error {
 	if dryRun {
-		fmt.Fprintf(os.Stderr, "[provenance] dry-run (%s): ffmpeg %s\n", e.Name(), formatCmdline(e.BuildArgs(job)))
+		narrate(ctx, os.Stderr, kindEncodeInfo, event.ReasonDryRun, filepath.Base(job.Input), "", nil,
+			"[provenance] dry-run (%s): ffmpeg %s", e.Name(), formatCmdline(e.BuildArgs(job)))
 		return nil
 	}
 	return runner.Run(ctx, ffmpeg, nil, io.Discard, log, e.BuildArgs(job)...)
@@ -230,9 +234,10 @@ func (av1NVENC) BuildArgs(job EncodeJob) []string {
 }
 
 // Run implements Encoder.
-func (av1NVENC) Run(ctx context.Context, ffmpeg string, runner CommandRunner, log io.Writer, job EncodeJob, dryRun bool) error {
+func (e av1NVENC) Run(ctx context.Context, ffmpeg string, runner CommandRunner, log io.Writer, job EncodeJob, dryRun bool) error {
 	if dryRun {
-		fmt.Fprintf(os.Stderr, "[provenance] dry-run (%s): ffmpeg %s\n", av1NVENC{}.Name(), formatCmdline(av1NVENC{}.BuildArgs(job)))
+		narrate(ctx, os.Stderr, kindEncodeInfo, event.ReasonDryRun, filepath.Base(job.Input), "", nil,
+			"[provenance] dry-run (%s): ffmpeg %s", av1NVENC{}.Name(), formatCmdline(av1NVENC{}.BuildArgs(job)))
 		return nil
 	}
 	return runner.Run(ctx, ffmpeg, nil, io.Discard, log, av1NVENC{}.BuildArgs(job)...)
