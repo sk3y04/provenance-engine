@@ -161,8 +161,15 @@ func ReadRevision(vaultRoot, id string) (*Revision, error) {
 	return &rev, nil
 }
 
+// computeRevisionID derives a content-addressed revision ID: the same
+// captured content always yields the same ID, so re-ingesting a manifest
+// (retry, resume) is idempotent instead of creating a duplicate revision.
+// The wall-clock capture time is metadata, not content, so it is excluded.
 func computeRevisionID(rev *Revision) (string, error) {
-	data, err := json.Marshal(rev)
+	stable := *rev
+	stable.ID = ""
+	stable.CapturedAt = time.Time{}
+	data, err := json.Marshal(&stable)
 	if err != nil {
 		return "", err
 	}
