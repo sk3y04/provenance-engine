@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`provenance doctor`**: read-only prerequisite check for yt-dlp, ffmpeg,
+  ffprobe, Chrome, an optional cookies file, the cache directory, and the
+  archive database (`PROVENANCE_DATABASE_URL`, pinged with a short timeout and
+  reported by host only). Exit code is non-zero when a required check fails;
+  the command never triggers tool auto-install.
 - **Transport-neutral extractor paths (Phase 1)**: every path reachable from
   `engine.Resolve` and `engine.Download` — Instagram, X/Twitter, hashtag search,
   Reddit, Album, the browser fallback, and the dispatcher batch/pool paths — now

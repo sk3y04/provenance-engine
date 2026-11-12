@@ -14,6 +14,7 @@ provenance
 │   ├── sync [NAME]                  Sync one or all collections
 │   └── remove <NAME>                Remove a collection
 ├── scan <URL...> [flags]            Preview items without downloading
+├── doctor [flags]                   Check prerequisites (tools, cookies, cache, DB)
 ├── status <SESSION>                 Show session progress
 ├── resume <SESSION>                 Resume pending + failed URLs
 ├── retry-failed <SESSION>           Retry only failed URLs
@@ -168,6 +169,49 @@ All `grab` flags apply, plus:
 |------|------|---------|-------------|
 | `--json` | bool | `false` | Print resolved source data as formatted JSON to stdout (see `resolve.Source` format) |
 | `--save` | string | - | Save scan manifest JSON to a file |
+
+---
+
+## `provenance doctor [flags]`
+
+Check that provenance's prerequisites are installed and configured. The probe
+is read-only (apart from creating its own cache directory and a short database
+ping), so it is safe to run at any time.
+
+| Check | Required | Meaning |
+|-------|----------|---------|
+| `yt-dlp` | yes | resolved from PATH or the go-ytdlp cache |
+| `ffmpeg` | yes | resolved from PATH |
+| `ffprobe` | yes | resolved from PATH |
+| `chrome` | no | browser fallback and `import-web` |
+| `cookies` | no | the `--cookies` file, if given, exists and is a regular file |
+| `cache` | yes | the provenance cache directory exists and is writable |
+| `database` | no | pings `PROVENANCE_DATABASE_URL` when set (host shown, never the password) |
+
+The exit code is non-zero when a required check fails, so it can gate a
+deployment or CI step. It does not trigger tool auto-install (the point is to
+report state, not fix it).
+
+```bash
+$ provenance doctor
+provenance doctor
+  yt-dlp    ok              /home/anima/.local/bin/yt-dlp
+  ffmpeg    ok              /usr/bin/ffmpeg
+  ffprobe   ok              /usr/bin/ffprobe
+  chrome    ok              /usr/bin/google-chrome
+  cookies   not_configured  not set
+  cache     ok              /home/anima/.cache/provenance
+  database  not_configured  not configured (set PROVENANCE_DATABASE_URL for vault/search)
+result: ok
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `-c`, `--cookies` | string | - | Path to Netscape `cookies.txt` to verify exists |
+
+`--chrome-path` (global) also applies.
 
 ---
 

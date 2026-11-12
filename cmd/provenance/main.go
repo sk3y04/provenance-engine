@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -24,6 +25,7 @@ import (
 	"github.com/sk3y04/provenance-engine/internal/config"
 	"github.com/sk3y04/provenance-engine/internal/diagnose"
 	"github.com/sk3y04/provenance-engine/internal/dispatcher"
+	"github.com/sk3y04/provenance-engine/internal/doctor"
 	"github.com/sk3y04/provenance-engine/internal/encode"
 	"github.com/sk3y04/provenance-engine/internal/extractor"
 	"github.com/sk3y04/provenance-engine/internal/importers"
@@ -152,6 +154,7 @@ search. No runtime dependencies beyond yt-dlp + ffmpeg.`,
 	root.AddCommand(downloadCmd())
 	root.AddCommand(scanCmd())
 	root.AddCommand(installCmd())
+	root.AddCommand(doctorCmd())
 	root.AddCommand(statusCmd())
 	root.AddCommand(resumeCmd())
 	root.AddCommand(retryFailedCmd())
@@ -196,7 +199,7 @@ search. No runtime dependencies beyond yt-dlp + ffmpeg.`,
 
 func shouldSkipAutoInstall(cmd *cobra.Command) bool {
 	switch cmd.Name() {
-	case "help", "install", "status", "sessions", "tui", "completion", "manifest", "search":
+	case "help", "install", "doctor", "status", "sessions", "tui", "completion", "manifest", "search":
 		return true
 	}
 	path := cmd.CommandPath()
@@ -423,6 +426,32 @@ func installCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func doctorCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Check that provenance's prerequisites are installed and configured",
+		Long: `doctor reports the state of everything provenance needs: external tools
+(yt-dlp, ffmpeg, ffprobe, Chrome), an optional cookies file, a writable cache
+directory, and the archive database when PROVENANCE_DATABASE_URL is set. The
+check is read-only and safe to run at any time; the exit code is non-zero when
+a required check fails.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			rep := doctor.Run(cmd.Context(), doctor.Options{
+				CookiesFile: flagCookies,
+				ChromePath:  flagChromePath,
+			})
+			doctor.Render(os.Stdout, rep)
+			if !rep.OK {
+				return errors.New("doctor: required check(s) failed")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&flagCookies, "cookies", "c", "", "Path to Netscape cookies.txt (checks the file exists)")
+	return cmd
 }
 
 func statusCmd() *cobra.Command {
