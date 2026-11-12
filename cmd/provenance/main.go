@@ -28,6 +28,7 @@ import (
 	"github.com/sk3y04/provenance-engine/internal/doctor"
 	"github.com/sk3y04/provenance-engine/internal/encode"
 	"github.com/sk3y04/provenance-engine/internal/extractor"
+	"github.com/sk3y04/provenance-engine/internal/history"
 	"github.com/sk3y04/provenance-engine/internal/importers"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
@@ -76,6 +77,8 @@ var (
 	flagMaxPages           int
 	flagScreenshot         bool
 	flagEvery              string
+	flagWatchEvery         string
+	flagHistoryClearYes    bool
 	flagKeep               int
 	flagChromePath         string
 
@@ -155,6 +158,7 @@ search. No runtime dependencies beyond yt-dlp + ffmpeg.`,
 	root.AddCommand(scanCmd())
 	root.AddCommand(installCmd())
 	root.AddCommand(doctorCmd())
+	root.AddCommand(historyCmd())
 	root.AddCommand(statusCmd())
 	root.AddCommand(resumeCmd())
 	root.AddCommand(retryFailedCmd())
@@ -199,7 +203,7 @@ search. No runtime dependencies beyond yt-dlp + ffmpeg.`,
 
 func shouldSkipAutoInstall(cmd *cobra.Command) bool {
 	switch cmd.Name() {
-	case "help", "install", "doctor", "status", "sessions", "tui", "completion", "manifest", "search":
+	case "help", "install", "doctor", "history", "status", "sessions", "tui", "completion", "manifest", "search":
 		return true
 	}
 	path := cmd.CommandPath()
@@ -454,6 +458,188 @@ a required check fails.`,
 	return cmd
 }
 
+// historyCmd lists, inspects, and deletes past runs. Every transport that
+// goes through app.Download (CLI grab, watch runs, collection sync) records
+// one entry, so this shows what actually happened on this machine.
+func historyCmd() *cobra.Command {
+	listE := func(cmd *cobra.Command, args []string) error {
+		runs, err := history.List()
+		if err != nil {
+			return err
+		}
+		if len(runs) == 0 {
+			fmt.Println("No runs recorded yet.")
+			return nil
+		}
+		fmt.Fprintf(os.Stdout, "%-10s %-19s %-8s %-8s %-8s %s\n", "ID", "Finished", "OK", "FAIL", "SKIP", "Title")
+		for _, run := range runs {
+			fmt.Fprintf(os.Stdout, "%s %-19s %-8d %-8d %-8d %s\n",
+				run.ID, run.CompletedAt.Format("2006-01-02 15:04"),
+				run.Succeeded, run.Failed, run.Skipped, historyTitle(run))
+		}
+		return nil
+	}
+	cmd := &cobra.Command{
+		Use:   "history",
+		Short: "List and inspect past runs",
+		Args:  cobra.NoArgs,
+		RunE:  listE,
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List recent runs (newest first)",
+		Args:  cobra.NoArgs,
+		RunE:  listE,
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "show ID",
+		Short: "Show one run's details (ID or unique prefix)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			run, err := resolveHistoryID(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stdout, "ID:       %s\n", run.ID)
+			fmt.Fprintf(os.Stdout, "Title:    %s\n", historyTitle(run))
+			fmt.Fprintf(os.Stdout, "Started:  %s\n", run.StartedAt.Format("2006-01-02 15:04:05"))
+			fmt.Fprintf(os.Stdout, "Duration: %s\n", run.Duration.Round(time.Millisecond))
+			summary := fmt.Sprintf("%d succeeded, %d failed, %d skipped", run.Succeeded, run.Failed, run.Skipped)
+			if run.TotalBytes > 0 {
+				summary += fmt.Sprintf(", %s", cliHumanBytes(run.TotalBytes))
+			}
+			fmt.Fprintf(os.Stdout, "Result:   %s\n", summary)
+			if dest := strings.TrimSpace(run.Options.OutputDir); dest != "" {
+				fmt.Fprintf(os.Stdout, "Output:   %s\n", dest)
+			}
+			if run.Error != "" {
+				fmt.Fprintf(os.Stdout, "Error:    %s\n", run.Error)
+			}
+			if len(run.URLs) > 0 {
+				fmt.Fprintln(os.Stdout, "URLs:")
+				for i, u := range run.URLs {
+					if i == 20 {
+						fmt.Fprintf(os.Stdout, "  ... and %d more\n", len(run.URLs)-i)
+						break
+					}
+					fmt.Fprintf(os.Stdout, "  - %s\n", u)
+				}
+			}
+			if len(run.Files) > 0 {
+				fmt.Fprintln(os.Stdout, "Files:")
+				for i, f := range run.Files {
+					if i == 10 {
+						fmt.Fprintf(os.Stdout, "  ... and %d more\n", len(run.Files)-i)
+						break
+					}
+					mark := "ok  "
+					if !f.Success {
+						mark = "FAIL"
+					}
+					if f.Success {
+						fmt.Fprintf(os.Stdout, "  [%s] %s (%s)\n", mark, f.Path, cliHumanBytes(f.Size))
+					} else {
+						fmt.Fprintf(os.Stdout, "  [%s] %s: %s\n", mark, f.Path, f.Error)
+					}
+				}
+			}
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "delete ID",
+		Short: "Delete one run (ID or unique prefix)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			run, err := resolveHistoryID(args[0])
+			if err != nil {
+				return err
+			}
+			if err := history.Delete(run.ID); err != nil {
+				return err
+			}
+			fmt.Printf("Deleted run %s\n", run.ID)
+			return nil
+		},
+	})
+	clearCmd := &cobra.Command{
+		Use:   "clear",
+		Short: "Delete all recorded runs",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !flagHistoryClearYes {
+				runs, err := history.List()
+				if err != nil {
+					return err
+				}
+				return fmt.Errorf("refusing to clear %d recorded run(s) without --yes", len(runs))
+			}
+			if err := history.Clear(); err != nil {
+				return err
+			}
+			fmt.Println("History cleared.")
+			return nil
+		},
+	}
+	cmd.AddCommand(clearCmd)
+	clearCmd.Flags().BoolVar(&flagHistoryClearYes, "yes", false, "Really delete all runs")
+	return cmd
+}
+
+// resolveHistoryID resolves a full or unique-prefix run ID.
+func resolveHistoryID(idOrPrefix string) (history.Run, error) {
+	idOrPrefix = strings.TrimSpace(idOrPrefix)
+	if idOrPrefix == "" {
+		return history.Run{}, errors.New("empty history ID")
+	}
+	runs, err := history.List()
+	if err != nil {
+		return history.Run{}, err
+	}
+	var match *history.Run
+	for i := range runs {
+		switch {
+		case runs[i].ID == idOrPrefix:
+			return runs[i], nil
+		case strings.HasPrefix(runs[i].ID, idOrPrefix):
+			if match != nil {
+				return history.Run{}, fmt.Errorf("history ID prefix %q is ambiguous", idOrPrefix)
+			}
+			match = &runs[i]
+		}
+	}
+	if match == nil {
+		return history.Run{}, fmt.Errorf("no run found for ID %q", idOrPrefix)
+	}
+	return *match, nil
+}
+
+// historyTitle picks the best one-line label for a run.
+func historyTitle(run history.Run) string {
+	title := strings.TrimSpace(run.Title)
+	if title == "" && len(run.URLs) > 0 {
+		title = run.URLs[0]
+	}
+	if len(title) > 60 {
+		title = title[:57] + "..."
+	}
+	return title
+}
+
+// cliHumanBytes renders a byte count for terminal output.
+func cliHumanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
 func statusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status SESSION",
@@ -655,54 +841,81 @@ func watchCmd() *cobra.Command {
 			return watch.Remove(args[0])
 		},
 	})
-	cmd.AddCommand(&cobra.Command{
+	runCmd := &cobra.Command{
 		Use:   "run [NAME]",
 		Short: "Run one watch subscription or all subscriptions",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var subs []watch.Subscription
-			if len(args) == 1 {
-				sub, err := watch.Get(args[0])
-				if err != nil {
-					return err
-				}
-				subs = []watch.Subscription{sub}
-			} else {
-				var err error
-				subs, err = watch.List()
-				if err != nil {
-					return err
-				}
-			}
-			var firstErr error
-			for _, sub := range subs {
-				fmt.Fprintf(os.Stderr, "[provenance] watch %q: %s\n", sub.Name, sub.URL)
-				sess, err := session.OpenOrCreate("watch-"+sub.Name, sub.Options)
-				if err != nil {
-					return err
-				}
-				opts := dispatcher.Options{Config: sub.Options, Reporter: sess}
-				// Mark "running" up front so an interrupted run is visible as
-				// stuck rather than showing a stale last status.
-				if err := watch.MarkRunWithStatus(sub.Name, 0, "running"); err != nil && firstErr == nil {
-					firstErr = err
-				}
-				started := time.Now()
-				dlErr := app.Download(cmd.Context(), []string{sub.URL}, "", opts)
-				status := "success"
-				if dlErr != nil {
-					status = "failed"
-					if firstErr == nil {
-						firstErr = dlErr
+			doRun := func() error {
+				var subs []watch.Subscription
+				if len(args) == 1 {
+					sub, err := watch.Get(args[0])
+					if err != nil {
+						return err
+					}
+					subs = []watch.Subscription{sub}
+				} else {
+					var err error
+					subs, err = watch.List()
+					if err != nil {
+						return err
 					}
 				}
-				if err := watch.MarkRunWithStatus(sub.Name, time.Since(started), status); err != nil && firstErr == nil {
-					firstErr = err
+				var firstErr error
+				for _, sub := range subs {
+					fmt.Fprintf(os.Stderr, "[provenance] watch %q: %s\n", sub.Name, sub.URL)
+					sess, err := session.OpenOrCreate("watch-"+sub.Name, sub.Options)
+					if err != nil {
+						return err
+					}
+					opts := dispatcher.Options{Config: sub.Options, Reporter: sess}
+					// Mark "running" up front so an interrupted run is visible as
+					// stuck rather than showing a stale last status.
+					if err := watch.MarkRunWithStatus(sub.Name, 0, "running"); err != nil && firstErr == nil {
+						firstErr = err
+					}
+					started := time.Now()
+					dlErr := app.Download(cmd.Context(), []string{sub.URL}, "", opts)
+					status := "success"
+					if dlErr != nil {
+						status = "failed"
+						if firstErr == nil {
+							firstErr = dlErr
+						}
+					}
+					if err := watch.MarkRunWithStatus(sub.Name, time.Since(started), status); err != nil && firstErr == nil {
+						firstErr = err
+					}
+				}
+				return firstErr
+			}
+			if flagWatchEvery != "" {
+				dur, err := time.ParseDuration(flagWatchEvery)
+				if err != nil {
+					return fmt.Errorf("invalid --every duration: %w", err)
+				}
+				fmt.Fprintf(os.Stderr, "[provenance] scheduling watch run every %s\n", dur)
+				if err := doRun(); err != nil {
+					fmt.Fprintf(os.Stderr, "[provenance] watch run error: %v\n", err)
+				}
+				t := time.NewTicker(dur)
+				defer t.Stop()
+				for {
+					select {
+					case <-cmd.Context().Done():
+						return nil
+					case <-t.C:
+						if err := doRun(); err != nil {
+							fmt.Fprintf(os.Stderr, "[provenance] watch run error: %v\n", err)
+						}
+					}
 				}
 			}
-			return firstErr
+			return doRun()
 		},
-	})
+	}
+	runCmd.Flags().StringVar(&flagWatchEvery, "every", "", "Repeat watch runs at interval (e.g., 24h, 7d, 30m)")
+	cmd.AddCommand(runCmd)
 	return cmd
 }
 

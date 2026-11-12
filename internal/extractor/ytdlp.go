@@ -29,12 +29,26 @@ import (
 // tool path in package-level state, and never installs a tool unless the caller
 // explicitly enabled auto-install.
 
+// installTools runs the actual yt-dlp install. Split out from EnsureInstalled
+// so tests can point the downloader at a dead URL and exercise the failure
+// path without real network access.
+func installTools(ctx context.Context, opts *ytdlp.InstallOptions) error {
+	_, err := ytdlp.Install(ctx, opts)
+	if err != nil {
+		return fmt.Errorf("install yt-dlp: %w", err)
+	}
+	return nil
+}
+
 // EnsureInstalled installs yt-dlp + ffmpeg into the local cache if missing. It
 // mutates the filesystem, so it is a CLI-only convenience: the engine facade
 // does not call it unless Config.AutoInstall is set.
+//
+// A failed download is a plain error, never a panic: go-ytdlp's MustInstall
+// panics when the network is down, which used to dump a stack trace instead of
+// a clean "yt-dlp is not available" failure.
 func EnsureInstalled(ctx context.Context) error {
-	ytdlp.MustInstall(ctx, nil)
-	return nil
+	return installTools(ctx, nil)
 }
 
 // YtdlpOptions controls how the yt-dlp wrapper is invoked.

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Run history on the CLI (`provenance history`)**: every run that goes
+  through `app.Download` — CLI `grab`, `watch run` (including `--every`
+  repeats) and `collect sync` — now records one history entry (URLs,
+  ok/fail/skip counts, duration, total bytes, error text; dry runs are not
+  recorded). New command: `provenance history` (bare = list), with `list`,
+  `show <ID>` (full or unique prefix; prints title, duration, counts,
+  output dir, error, URLs, per-file results when recorded), `delete <ID>`,
+  and `clear --yes`. Stored under the user cache dir, like the TUI's history.
+- **`provenance watch run --every <interval>`**: run a watch (or all watches)
+  on a repeating interval (Go duration: `30m`, `24h`, `7d`…). The first run
+  starts immediately; per-run errors are reported without stopping the loop;
+  Ctrl-C cancels the in-flight run and exits cleanly. Each completed tick
+  records a history entry and updates the watch's last-run time.
 - **`provenance doctor`**: read-only prerequisite check for yt-dlp, ffmpeg,
   ffprobe, Chrome, an optional cookies file, the cache directory, and the
   archive database (`PROVENANCE_DATABASE_URL`, pinged with a short timeout and
@@ -96,6 +109,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumers in a shared process.
 - `Notifier.Close` is bounded by a grace period rather than waiting indefinitely
   for a slow sink.
+
+### Fixed
+
+- **Auto-install no longer panics**: `extractor.EnsureInstalled` used
+  go-ytdlp's `MustInstall`, which panics when the download fails (network
+  down, empty cache) and dumped a full stack trace instead of a clean
+  failure. Failed installs are now plain errors; the pre-run auto-install
+  stays best-effort, and a missing tool still fails with the normal
+  "yt-dlp is not available" message.
+- **Capability/doctor now find go-ytdlp's versioned cache binaries**: the
+  tool probe only looked for a bare `yt-dlp` on `PATH`, but go-ytdlp caches
+  and resolves `yt-dlp-<version>` (e.g. `yt-dlp-2026.08.19`) inside the
+  user cache dir. Resolution now falls back to that cache — bare name first,
+  then the newest versioned file — so `doctor` and `status` report the same
+  tools the engine actually uses.
 
 ## [0.8.0] - 2026-10-08
 

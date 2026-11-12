@@ -26,8 +26,13 @@ provenance
 ├── watch                            Manage subscriptions
 │   ├── add <NAME> <URL> [flags]     Add or update a watch
 │   ├── list                         List watches
-│   ├── run [NAME]                   Run one or all watches
+│   ├── run [NAME] [flags]           Run once, or repeat with --every
 │   └── remove <NAME>                Remove a watch
+├── history                          List and inspect past runs
+│   ├── list                         List recent runs (newest first)
+│   ├── show <ID>                    Show one run (ID or unique prefix)
+│   ├── delete <ID>                  Delete one run
+│   └── clear --yes                  Delete all runs
 ├── manifest                          Show and verify capture manifests
 │   ├── show <PATH>                   Display a capture manifest
 │   └── verify <DIR>                  Verify files against SHA-256 hashes
@@ -459,10 +464,52 @@ Results show ranked hits with title, headline snippet, source URL, collection, r
 |------------|-------------|
 | `add <NAME> <URL> [flags]` | Create or update a watch subscription. Accepts all `grab` flags. |
 | `list` | Table of watches: name, last run (or "never"), URL |
-| `run [NAME]` | Run one watch (or all if NAME omitted). Each creates a `watch-<name>` session and downloads just the subscription URL. |
+| `run [NAME] [flags]` | Run one watch (or all if NAME omitted). Each creates a `watch-<name>` session and downloads just the subscription URL. With `--every <interval>` (e.g. `24h`, `30m`), the run repeats every interval until interrupted (Ctrl-C exits cleanly; each completed tick records a history entry and updates the watch's last-run time). |
 | `remove <NAME>` | Remove a watch subscription |
 
 Watch runs use yt-dlp/native archives to skip previously-downloaded content.
+
+### `watch run --every`
+
+Repeat the run at a fixed interval instead of a single pass:
+
+```bash
+provenance watch run feeds --every 24h   # re-run forever every 24h
+provenance watch run --every 30m         # all watches, every 30m
+```
+
+- Interval syntax: Go duration (`30m`, `24h`, `7d`…); `0`/empty = one-shot.
+- The first run happens immediately, then on each tick; per-run errors are
+  reported and do not stop the loop.
+- Ctrl+C exits cleanly (in-flight run cancelled, watch state marked).
+- Every run records a `history` entry (see below).
+
+---
+
+## `provenance history`
+
+List and inspect past runs. Every run that goes through `app.Download` — CLI
+`grab`, `watch run` (including `--every` repeats), and `collect sync` — records
+one entry; dry runs are not recorded. Stored under the user cache dir
+(`$XDG_CACHE_HOME/provenance/history.json`).
+
+| Subcommand | Description |
+|------------|-------------|
+| (none) / `list` | Table of runs: ID, finished time, ok/fail/skip counts, title |
+| `show <ID>` | Full details; ID may be a unique prefix |
+| `delete <ID>` | Delete one run (ID or unique prefix) |
+| `clear --yes` | Delete all runs; refuses without `--yes` |
+
+```bash
+provenance history                 # same as list
+provenance history show 20261112-214723
+provenance history clear --yes
+```
+
+`show` prints the run's title, start time, duration, ok/fail/skip counts,
+total bytes, output directory, error text (if any), URLs, and per-file
+results when recorded (the TUI records per-file details; plain CLI runs
+record URL-level results).
 
 ---
 
@@ -541,6 +588,7 @@ The root command's `PersistentPreRunE` calls `extractor.EnsureInstalled()` (inst
 - `sessions` and all subcommands
 - `completion`
 - `tui`
+- `history`
 - `watch` (for `list`, `add`, `remove` - but **not** `watch run`)
 
 ---

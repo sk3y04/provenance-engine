@@ -2,10 +2,13 @@ package extractor
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/lrstanley/go-ytdlp"
 )
 
 type progressEvent struct {
@@ -134,5 +137,19 @@ func TestMetadataPathArgsRespectsCustomAndDot(t *testing.T) {
 	args = metadataPathArgs("out", abs)
 	if args[1] != "infojson:"+abs {
 		t.Fatalf("absolute meta dir not preserved: %q", args[1])
+	}
+}
+
+// TestInstallToolsDeadURL: a failed auto-install must surface as an error,
+// never a panic. go-ytdlp's MustInstall panics on download failure, which used
+// to take the whole CLI down (stack trace) whenever the network was down. A
+// dead local URL makes the failure deterministic without real network access.
+func TestInstallToolsDeadURL(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	err := installTools(context.Background(), &ytdlp.InstallOptions{
+		DownloadURL: "http://127.0.0.1:0/yt-dlp",
+	})
+	if err == nil {
+		t.Fatal("expected an error when the download URL is unreachable")
 	}
 }

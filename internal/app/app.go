@@ -6,11 +6,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/sk3y04/provenance-engine/internal/diagnose"
 	"github.com/sk3y04/provenance-engine/internal/dispatcher"
 	"github.com/sk3y04/provenance-engine/internal/engineerr"
 	"github.com/sk3y04/provenance-engine/internal/event"
+	"github.com/sk3y04/provenance-engine/internal/history"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/resolve"
 )
@@ -23,6 +27,10 @@ import (
 // When opts.Events is set, progress, item, and summary facts are emitted as
 // structured events and nothing is written to the terminal. When it is nil the
 // legacy CLI/TUI output is preserved unchanged.
+//
+// Completed (non-dry-run) runs are recorded in the shared history store, so
+// every transport that goes through app.Download — CLI, watch, collection
+// sync, engine — leaves one auditable entry.
 func Download(ctx context.Context, urls []string, batchPath string, opts dispatcher.Options) error {
 	if batchPath == "" && len(urls) == 0 {
 		return engineerr.Newf(engineerr.Validation, "download", "", "provide at least one URL or use --batch <file>")
@@ -31,6 +39,22 @@ func Download(ctx context.Context, urls []string, batchPath string, opts dispatc
 	ctx = event.WithSink(ctx, opts.Events)
 	cr := dispatcher.NewCountsReporter(opts.Reporter)
 	opts.Reporter = cr
+	startAt := time.Now()
+	var histTitle string
+	histURLs := append([]string(nil), urls...)
+	if batchPath != "" {
+		histTitle = filepath.Base(batchPath)
+		if data, rerr := os.ReadFile(batchPath); rerr == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" && !strings.HasPrefix(line, "#") {
+					histURLs = append(histURLs, line)
+				}
+			}
+		}
+	} else if len(urls) > 0 {
+		histTitle = urls[0]
+	}
 	if batchPath != "" {
 		if err := dispatcher.BatchDispatch(ctx, batchPath, opts); err != nil {
 			firstErr = err
@@ -65,6 +89,26 @@ func Download(ctx context.Context, urls []string, batchPath string, opts dispatc
 		})
 	} else {
 		dispatcher.PrintSummary(os.Stderr, &cr.Counts, opts.OutputDir, "")
+	}
+	if !opts.DryRun {
+		// History is best-effort metadata: a store failure must not fail the
+		// run itself.
+		var errText string
+		if firstErr != nil {
+			errText = firstErr.Error()
+		}
+		_, _ = history.Add(history.Run{
+			Title:       histTitle,
+			URLs:        histURLs,
+			Options:     opts.Config,
+			StartedAt:   startAt,
+			CompletedAt: time.Now(),
+			Duration:    time.Since(startAt),
+			Succeeded:   int(cr.Counts.Succeeded.Load()),
+			Failed:      int(cr.Counts.Failed.Load()),
+			Skipped:     int(cr.Counts.Skipped.Load()),
+			Error:       errText,
+		})
 	}
 	return firstErr
 }
