@@ -158,6 +158,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Session transitions survive concurrent modification**: when a save hit a
+  version conflict, the reload replaced the in-memory entries and the retry
+  saved the unmodified state — silently dropping the status transition (a
+  failed URL could stay "running" forever). The retry now re-applies the
+  pending transition after reloading, matching `ResetRunning`'s behavior.
+  Covered by a conflict-injection regression test.
 - **Blob store is safe under concurrent Puts**: parallel stores of identical
   content shared one deterministic `.tmp` path, and the loser deleted the
   winner's in-progress file — potentially renaming a partially written blob

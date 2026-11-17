@@ -304,19 +304,25 @@ func (s *Session) transition(url string, status Status, lastError string, countA
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.addURLLocked(url, "discovered")
-	e := s.Entries[url]
-	if countAttempt {
-		e.Attempts++
+	apply := func() {
+		s.addURLLocked(url, "discovered")
+		e := s.Entries[url]
+		if countAttempt {
+			e.Attempts++
+		}
+		e.Status = status
+		e.LastError = lastError
+		e.UpdatedAt = time.Now()
+		s.UpdatedAt = e.UpdatedAt
 	}
-	e.Status = status
-	e.LastError = lastError
-	e.UpdatedAt = time.Now()
-	s.UpdatedAt = e.UpdatedAt
-	s.saveWithRetryLocked()
+	apply()
+	s.saveWithRetryLocked(apply)
 }
 
-func (s *Session) saveWithRetryLocked() {
+// saveWithRetryLocked saves, and on a concurrent-modification conflict reloads
+// the disk state and re-applies apply before retrying, so the pending mutation
+// is never silently dropped by the reload.
+func (s *Session) saveWithRetryLocked(apply func()) {
 	for retry := 0; retry < maxSaveRetries; retry++ {
 		err := s.saveLocked()
 		if err == nil {
@@ -330,6 +336,7 @@ func (s *Session) saveWithRetryLocked() {
 			fmt.Fprintf(os.Stderr, "[provenance] session reload warning: %v\n", err)
 			return
 		}
+		apply()
 	}
 	fmt.Fprintf(os.Stderr, "[provenance] session save: max retries exceeded (concurrent modification)\n")
 }

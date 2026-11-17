@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -8,6 +9,52 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/config"
 )
+
+// TestTransitionSurvivesConcurrentModification proves a status transition is
+// re-applied after a conflict reload instead of being silently dropped.
+func TestTransitionSurvivesConcurrentModification(t *testing.T) {
+	t.Setenv("PROVENANCE_SESSION_DIR", t.TempDir())
+
+	s, err := OpenOrCreate("conflict", config.Config{OutputDir: "downloads"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddURLs([]string{"https://example.com/a"}, "argument"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate another process saving the session: bump the on-disk version.
+	data, err := os.ReadFile(s.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk Session
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	onDisk.Version++
+	bumped, err := json.MarshalIndent(&onDisk, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.Path(), bumped, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s.Success("https://example.com/a")
+
+	loaded, err := Load("conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := loaded.Entries["https://example.com/a"]
+	if e == nil || e.Status != StatusSucceeded {
+		t.Fatalf("transition lost on disk after concurrent modification: %+v", e)
+	}
+	if got := s.Entries["https://example.com/a"]; got == nil || got.Status != StatusSucceeded {
+		t.Fatalf("in-memory transition lost after concurrent modification: %+v", got)
+	}
+}
 
 func TestSessionLifecycle(t *testing.T) {
 	t.Setenv("PROVENANCE_SESSION_DIR", t.TempDir())
