@@ -864,6 +864,11 @@ func watchCmd() *cobra.Command {
 				var firstErr error
 				for _, sub := range subs {
 					fmt.Fprintf(os.Stderr, "[provenance] watch %q: %s\n", sub.Name, sub.URL)
+					// A previous run that died mid-flight left "running" behind;
+					// record it as interrupted before the new run starts.
+					if _, err := watch.MarkInterruptedIfRunning(sub.Name); err != nil && firstErr == nil {
+						firstErr = err
+					}
 					sess, err := session.OpenOrCreate("watch-"+sub.Name, sub.Options)
 					if err != nil {
 						return err

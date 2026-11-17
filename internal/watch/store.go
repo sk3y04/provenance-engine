@@ -149,6 +149,34 @@ func MarkRunWithStatus(name string, duration time.Duration, status string) error
 	return save(s)
 }
 
+// MarkInterruptedIfRunning records a previous run that died mid-flight (its
+// status was left "running") as interrupted, preserving its start time and
+// partial duration. It reports whether a recovery was recorded, so a new run
+// starts from an honest status history instead of a stale "running".
+func MarkInterruptedIfRunning(name string) (bool, error) {
+	storeMu.Lock()
+	defer storeMu.Unlock()
+	name, err := safeName(name)
+	if err != nil {
+		return false, err
+	}
+	s, err := load()
+	if err != nil {
+		return false, err
+	}
+	sub, ok := s.Subscriptions[name]
+	if !ok {
+		return false, fmt.Errorf("watch subscription %q not found", name)
+	}
+	if sub.LastRunStatus != "running" {
+		return false, nil
+	}
+	sub.LastRunStatus = "interrupted"
+	sub.UpdatedAt = time.Now()
+	s.Subscriptions[name] = sub
+	return true, save(s)
+}
+
 func load() (Store, error) {
 	path, err := storePath()
 	if err != nil {

@@ -158,6 +158,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Watch runs recover crashed "running" status**: a run killed mid-flight left
+  `last_run_status: running` forever. `watch run` now records such a run as
+  `interrupted` (preserving its start time and partial duration) before
+  starting the next one, so status history stays honest. Covered by store
+  tests for recovery, idempotency, and completed-run preservation.
 - **Session transitions survive concurrent modification**: when a save hit a
   version conflict, the reload replaced the in-memory entries and the retry
   saved the unmodified state — silently dropping the status transition (a

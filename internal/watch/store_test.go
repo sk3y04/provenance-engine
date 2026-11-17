@@ -84,3 +84,53 @@ func TestWatchMarkRunWithStatus(t *testing.T) {
 		t.Fatalf("LastRunDuration = %v, want 1s", sub.LastRunDuration)
 	}
 }
+
+// TestWatchMarkInterruptedIfRunning proves a run left "running" by a crash is
+// recovered as interrupted, preserving its start time and partial duration,
+// and that completed runs are untouched.
+func TestWatchMarkInterruptedIfRunning(t *testing.T) {
+	t.Setenv("PROVENANCE_WATCH_FILE", filepath.Join(t.TempDir(), "watch.json"))
+
+	if err := Add("feed", "https://example.com/feed", config.Config{OutputDir: "downloads"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// No run yet: nothing to recover.
+	if recovered, err := MarkInterruptedIfRunning("feed"); err != nil || recovered {
+		t.Fatalf("recovered = %v, err = %v; want false, nil", recovered, err)
+	}
+
+	if err := MarkRunWithStatus("feed", 0, "running"); err != nil {
+		t.Fatalf("MarkRunWithStatus: %v", err)
+	}
+	before, _ := Get("feed")
+
+	recovered, err := MarkInterruptedIfRunning("feed")
+	if err != nil || !recovered {
+		t.Fatalf("recovered = %v, err = %v; want true, nil", recovered, err)
+	}
+	sub, _ := Get("feed")
+	if sub.LastRunStatus != "interrupted" {
+		t.Fatalf("LastRunStatus = %q, want interrupted", sub.LastRunStatus)
+	}
+	if !sub.LastRunAt.Equal(before.LastRunAt) || sub.LastRunDuration != before.LastRunDuration {
+		t.Fatalf("crashed run's start/duration not preserved: %+v vs %+v", sub, before)
+	}
+
+	// Idempotent: a second call finds nothing to recover.
+	if recovered, err := MarkInterruptedIfRunning("feed"); err != nil || recovered {
+		t.Fatalf("second call recovered = %v, err = %v; want false, nil", recovered, err)
+	}
+
+	// A completed run is not rewritten.
+	if err := MarkRunWithStatus("feed", time.Second, "success"); err != nil {
+		t.Fatalf("MarkRunWithStatus: %v", err)
+	}
+	if recovered, err := MarkInterruptedIfRunning("feed"); err != nil || recovered {
+		t.Fatalf("success run recovered = %v, err = %v; want false, nil", recovered, err)
+	}
+	sub, _ = Get("feed")
+	if sub.LastRunStatus != "success" {
+		t.Fatalf("LastRunStatus = %q, want success untouched", sub.LastRunStatus)
+	}
+}
