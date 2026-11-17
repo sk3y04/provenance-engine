@@ -491,7 +491,7 @@ func archiveImportFromModel(m *model, coll string, dir string) (string, int, err
 }
 
 func archiveImportPDFFromModel(m *model, coll, pdfPath string) (string, int, error) {
-	rev, err := importers.ImportPDF("./provenance-vault", pdfPath, coll)
+	rev, err := importers.ImportPDF(m.ctx, "./provenance-vault", pdfPath, coll)
 	if err != nil {
 		return "", 0, err
 	}
@@ -504,7 +504,7 @@ func archiveImportPDFFromModel(m *model, coll, pdfPath string) (string, int, err
 }
 
 func archiveImportGitFromModel(m *model, coll, repoURL, ref string) (string, int, error) {
-	rev, err := importers.ImportGit("./provenance-vault", repoURL, ref, coll)
+	rev, err := importers.ImportGit(m.ctx, "./provenance-vault", repoURL, ref, coll)
 	if err != nil {
 		return "", 0, err
 	}
@@ -517,7 +517,7 @@ func archiveImportGitFromModel(m *model, coll, repoURL, ref string) (string, int
 }
 
 func archiveImportDocsFromModel(m *model, coll, siteURL, scope string, maxPages int) (string, int, error) {
-	rev, err := importers.ImportDocs("./provenance-vault", siteURL, scope, maxPages, coll)
+	rev, err := importers.ImportDocs(m.ctx, "./provenance-vault", siteURL, scope, maxPages, coll)
 	if err != nil {
 		return "", 0, err
 	}
@@ -530,7 +530,7 @@ func archiveImportDocsFromModel(m *model, coll, siteURL, scope string, maxPages 
 }
 
 func archiveImportOpenAPIFromModel(m *model, coll, specPath string) (string, int, error) {
-	rev, err := importers.ImportOpenAPI("./provenance-vault", specPath, coll)
+	rev, err := importers.ImportOpenAPI(m.ctx, "./provenance-vault", specPath, coll)
 	if err != nil {
 		return "", 0, err
 	}
@@ -543,7 +543,7 @@ func archiveImportOpenAPIFromModel(m *model, coll, specPath string) (string, int
 }
 
 func archiveImportWebFromModel(m *model, coll, url, scope string, maxPages int, screenshot bool, chromePath string) (string, int, error) {
-	rev, err := importers.ImportWeb("./provenance-vault", url, scope, maxPages, screenshot, coll, chromePath)
+	rev, err := importers.ImportWeb(m.ctx, "./provenance-vault", url, scope, maxPages, screenshot, coll, chromePath)
 	if err != nil {
 		return "", 0, err
 	}

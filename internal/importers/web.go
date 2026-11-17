@@ -14,9 +14,13 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/archive"
 	"github.com/sk3y04/provenance-engine/internal/blobstore"
+	"github.com/sk3y04/provenance-engine/internal/event"
 )
 
-func ImportWeb(vaultRoot, seedURL, scope string, maxPages int, screenshot bool, collectionName, chromePath string) (*archive.Revision, error) {
+func ImportWeb(ctx context.Context, vaultRoot, seedURL, scope string, maxPages int, screenshot bool, collectionName, chromePath string) (*archive.Revision, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if maxPages <= 0 {
 		maxPages = 10
 	}
@@ -44,7 +48,7 @@ func ImportWeb(vaultRoot, seedURL, scope string, maxPages int, screenshot bool, 
 	if chromePath != "" {
 		allocOpts = append(allocOpts, chromedp.ExecPath(chromePath))
 	}
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), allocOpts...)
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, allocOpts...)
 	defer cancelAlloc()
 
 	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
@@ -56,12 +60,19 @@ func ImportWeb(vaultRoot, seedURL, scope string, maxPages int, screenshot bool, 
 	pages := 0
 
 	for len(queue) > 0 && pages < maxPages {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		currentURL := queue[0]
 		queue = queue[1:]
 
 		pageData, err := capturePage(browserCtx, currentURL, screenshot)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[provenance] capture failed for %s: %v\n", currentURL, err)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			narratef(ctx, event.KindWarning, event.ReasonWebScrapeFailed, currentURL, "capture failed",
+				"[provenance] capture failed for %s: %v\n", currentURL, err)
 			rev.Entities = append(rev.Entities, archive.Entity{
 				ExternalID: currentURL,
 				URL:        currentURL,

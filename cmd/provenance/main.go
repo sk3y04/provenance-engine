@@ -1187,7 +1187,7 @@ func archiveCmd() *cobra.Command {
 			if flagArchiveCollection == "" {
 				return fmt.Errorf("--collection is required")
 			}
-			rev, err := importers.ImportPDF(flagVaultRoot, args[0], flagArchiveCollection)
+			rev, err := importers.ImportPDF(cmd.Context(), flagVaultRoot, args[0], flagArchiveCollection)
 			if err != nil {
 				return err
 			}
@@ -1203,7 +1203,7 @@ func archiveCmd() *cobra.Command {
 			if flagArchiveCollection == "" {
 				return fmt.Errorf("--collection is required")
 			}
-			rev, err := importers.ImportGit(flagVaultRoot, args[0], flagImportRef, flagArchiveCollection)
+			rev, err := importers.ImportGit(cmd.Context(), flagVaultRoot, args[0], flagImportRef, flagArchiveCollection)
 			if err != nil {
 				return err
 			}
@@ -1219,7 +1219,7 @@ func archiveCmd() *cobra.Command {
 			if flagArchiveCollection == "" {
 				return fmt.Errorf("--collection is required")
 			}
-			rev, err := importers.ImportDocs(flagVaultRoot, args[0], flagImportScope, flagMaxPages, flagArchiveCollection)
+			rev, err := importers.ImportDocs(cmd.Context(), flagVaultRoot, args[0], flagImportScope, flagMaxPages, flagArchiveCollection)
 			if err != nil {
 				return err
 			}
@@ -1235,7 +1235,7 @@ func archiveCmd() *cobra.Command {
 			if flagArchiveCollection == "" {
 				return fmt.Errorf("--collection is required")
 			}
-			rev, err := importers.ImportOpenAPI(flagVaultRoot, args[0], flagArchiveCollection)
+			rev, err := importers.ImportOpenAPI(cmd.Context(), flagVaultRoot, args[0], flagArchiveCollection)
 			if err != nil {
 				return err
 			}
@@ -1251,7 +1251,7 @@ func archiveCmd() *cobra.Command {
 			if flagArchiveCollection == "" {
 				return fmt.Errorf("--collection is required")
 			}
-			rev, err := importers.ImportWeb(flagVaultRoot, args[0], flagImportScope, flagMaxPages, flagScreenshot, flagArchiveCollection, flagChromePath)
+			rev, err := importers.ImportWeb(cmd.Context(), flagVaultRoot, args[0], flagImportScope, flagMaxPages, flagScreenshot, flagArchiveCollection, flagChromePath)
 			if err != nil {
 				return err
 			}

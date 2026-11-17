@@ -1,6 +1,7 @@
 package importers
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,14 +15,20 @@ import (
 
 var wsRE = regexp.MustCompile(`\s+`)
 
-func ImportDocs(vaultRoot, siteURL, scope string, maxPages int, collectionName string) (*archive.Revision, error) {
+func ImportDocs(ctx context.Context, vaultRoot, siteURL, scope string, maxPages int, collectionName string) (*archive.Revision, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if maxPages <= 0 {
 		maxPages = 100
 	}
 
-	_, err := url.Parse(siteURL)
+	u, err := url.Parse(siteURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid url: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported url scheme %q", u.Scheme)
 	}
 
 	rev := newRevision(siteURL, "provenance-import-docs", "1.0")
@@ -46,6 +53,9 @@ func ImportDocs(vaultRoot, siteURL, scope string, maxPages int, collectionName s
 	tagStripRE := regexp.MustCompile(`<[^>]*>`)
 
 	for len(queue) > 0 && pages < maxPages {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		currentURL := queue[0]
 		queue = queue[1:]
 
@@ -58,8 +68,15 @@ func ImportDocs(vaultRoot, siteURL, scope string, maxPages int, collectionName s
 			continue
 		}
 
-		resp, err := client.Get(currentURL)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, currentURL, nil)
 		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 

@@ -1,15 +1,21 @@
 package importers
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/sk3y04/provenance-engine/internal/archive"
 )
+
+// gitWaitDelay bounds how long Wait drains the output pipes after the process
+// is killed, so a surviving helper holding a pipe open cannot stall the import.
+const gitWaitDelay = 5 * time.Second
 
 func validateGitArgs(repoURL, ref string) error {
 	if strings.HasPrefix(repoURL, "ext::") {
@@ -30,7 +36,10 @@ func validateGitArgs(repoURL, ref string) error {
 	return nil
 }
 
-func ImportGit(vaultRoot, repoURL, ref, collectionName string) (*archive.Revision, error) {
+func ImportGit(ctx context.Context, vaultRoot, repoURL, ref, collectionName string) (*archive.Revision, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := validateGitArgs(repoURL, ref); err != nil {
 		return nil, err
 	}
@@ -46,14 +55,24 @@ func ImportGit(vaultRoot, repoURL, ref, collectionName string) (*archive.Revisio
 		args = append(args, "--branch", ref)
 	}
 	args = append(args, "--", repoURL, tmpDir)
-	cloneCmd := exec.Command("git", args...)
+	cloneCmd := exec.CommandContext(ctx, "git", args...)
+	configureGitCmd(cloneCmd)
+	cloneCmd.WaitDelay = gitWaitDelay
 	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("clone %s: %w\n%s", repoURL, err, string(out))
 	}
 
-	commitCmd := exec.Command("git", "-C", tmpDir, "rev-parse", "HEAD")
+	commitCmd := exec.CommandContext(ctx, "git", "-C", tmpDir, "rev-parse", "HEAD")
+	configureGitCmd(commitCmd)
+	commitCmd.WaitDelay = gitWaitDelay
 	commitOut, err := commitCmd.Output()
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("get commit: %w", err)
 	}
 	commitSHA := strings.TrimSpace(string(commitOut))
@@ -73,6 +92,9 @@ func ImportGit(vaultRoot, repoURL, ref, collectionName string) (*archive.Revisio
 
 	docFiles := []string{".md", ".adoc", ".txt", ".rst", ".markdown"}
 	err = filepath.Walk(tmpDir, func(path string, info os.FileInfo, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err != nil || info.IsDir() || strings.HasPrefix(info.Name(), ".") {
 			return nil
 		}

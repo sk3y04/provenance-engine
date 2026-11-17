@@ -103,6 +103,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`encode --remove-original`**: deletes each source file only after its encode
   succeeds. A failed encode leaves its source in place, and `--dry-run` never
   removes anything.
+- **Context-cancellable importers**: `ImportGit`, `ImportPDF`, `ImportDocs`,
+  `ImportOpenAPI`, and `ImportWeb` now take the operation context. The CLI
+  passes the signal context and the TUI its root context, so Ctrl-C stops an
+  import. Git subprocesses run in their own process group and the whole group
+  is killed on cancellation (Unix), with a bounded `WaitDelay` on every
+  platform; the docs crawl uses context-aware HTTP requests; the web importer's
+  chromedp allocator inherits the caller context instead of
+  `context.Background()`; capture-failure narration is emitted as a structured
+  `web_scrape_failed` warning (legacy CLI text unchanged without a sink).
+- **Importers under test**: first test coverage for `internal/importers` —
+  git-arg validation (ext:: transport, scheme allowlist, dash-prefixed refs),
+  mid-clone and mid-crawl cancellation against fixture servers, PDF/OpenAPI
+  ingest into a temp vault with blob verification, docs scope/maxPages bounds,
+  web pre-flight validation, UTF-8-safe truncation, and the narration
+  transport-neutrality contract. No test contacts a live service.
 
 ### Changed
 
@@ -130,9 +145,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Rate-limit waits are bounded**: a server `Retry-After` longer than 5 minutes
   is clipped to the cap with a one-line notice, so a hostile or broken platform
   response cannot stall a run for hours. Waits within the cap are unchanged.
+- **`archive import-docs` validates the URL scheme**: only `http`/`https` seeds
+  are accepted, matching `import-web`. Other schemes previously produced an
+  empty revision instead of a clear error.
 
 ### Fixed
 
+- **Canceled git imports no longer hang or orphan helpers**: `git clone` spawns
+  remote helpers (for example `git-remote-https`) that inherit the output pipes.
+  Killing only the parent left them holding the pipes open, so `CombinedOutput`
+  waited for EOF forever and the helpers kept running. The clone now runs in its
+  own process group, cancellation kills the whole group, and a bounded
+  `WaitDelay` guarantees the import returns even if a pipe lingers.
 - **Auto-install no longer panics**: `extractor.EnsureInstalled` used
   go-ytdlp's `MustInstall`, which panics when the download fails (network
   down, empty cache) and dumped a full stack trace instead of a clean

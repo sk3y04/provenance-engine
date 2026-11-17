@@ -1,6 +1,7 @@
 package importers
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -25,7 +26,10 @@ type openAPISpec struct {
 	Paths map[string]interface{} `yaml:"paths" json:"paths"`
 }
 
-func ImportOpenAPI(vaultRoot, specPath, collectionName string) (*archive.Revision, error) {
+func ImportOpenAPI(ctx context.Context, vaultRoot, specPath, collectionName string) (*archive.Revision, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if _, err := os.Stat(specPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("spec not found: %s", specPath)
 	}

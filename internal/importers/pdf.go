@@ -1,6 +1,7 @@
 package importers
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,7 +12,10 @@ import (
 	"github.com/sk3y04/provenance-engine/internal/blobstore"
 )
 
-func ImportPDF(vaultRoot, pdfPath, collectionName string) (*archive.Revision, error) {
+func ImportPDF(ctx context.Context, vaultRoot, pdfPath, collectionName string) (*archive.Revision, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	bs := blobstore.New(vaultRoot)
 
 	if _, err := os.Stat(pdfPath); os.IsNotExist(err) {
@@ -50,6 +54,9 @@ func ImportPDF(vaultRoot, pdfPath, collectionName string) (*archive.Revision, er
 	}
 
 	for pageNum := 1; pageNum <= totalPage; pageNum++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		page := reader.Page(pageNum)
 		text, err := page.GetPlainText(nil)
 		if err != nil || text == "" {

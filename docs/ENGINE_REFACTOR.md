@@ -872,9 +872,12 @@ preserve historical behavior.
 - `engine.ArtifactSink` (streaming artifacts without a shared filesystem).
 - Archive/vault/encode/import facades, and the process-global catalog store; those
   paths are not reachable from `Resolve`/`Download` and stay CLI-local.
-- `internal/importers` context propagation (`ImportGit`/`ImportPDF`/`ImportDocs`/
-  `ImportOpenAPI` still take no context) — out of the facade boundary.
 - Distinct exit codes per `ErrorKind`; every category still maps to `1`.
+
+`internal/importers` context propagation, previously deferred here, is now
+complete: every `Import*` takes the operation context, git subprocesses are
+killed as a process group on cancellation, the chromedp allocator inherits the
+caller context, and capture-failure narration is event-driven.
 
 ### Verified
 
