@@ -471,9 +471,9 @@ func historyCmd() *cobra.Command {
 			fmt.Println("No runs recorded yet.")
 			return nil
 		}
-		fmt.Fprintf(os.Stdout, "%-10s %-19s %-8s %-8s %-8s %s\n", "ID", "Finished", "OK", "FAIL", "SKIP", "Title")
+		_, _ = fmt.Fprintf(os.Stdout, "%-10s %-19s %-8s %-8s %-8s %s\n", "ID", "Finished", "OK", "FAIL", "SKIP", "Title")
 		for _, run := range runs {
-			fmt.Fprintf(os.Stdout, "%s %-19s %-8d %-8d %-8d %s\n",
+			_, _ = fmt.Fprintf(os.Stdout, "%s %-19s %-8d %-8d %-8d %s\n",
 				run.ID, run.CompletedAt.Format("2006-01-02 15:04"),
 				run.Succeeded, run.Failed, run.Skipped, historyTitle(run))
 		}
@@ -500,36 +500,36 @@ func historyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(os.Stdout, "ID:       %s\n", run.ID)
-			fmt.Fprintf(os.Stdout, "Title:    %s\n", historyTitle(run))
-			fmt.Fprintf(os.Stdout, "Started:  %s\n", run.StartedAt.Format("2006-01-02 15:04:05"))
-			fmt.Fprintf(os.Stdout, "Duration: %s\n", run.Duration.Round(time.Millisecond))
+			_, _ = fmt.Fprintf(os.Stdout, "ID:       %s\n", run.ID)
+			_, _ = fmt.Fprintf(os.Stdout, "Title:    %s\n", historyTitle(run))
+			_, _ = fmt.Fprintf(os.Stdout, "Started:  %s\n", run.StartedAt.Format("2006-01-02 15:04:05"))
+			_, _ = fmt.Fprintf(os.Stdout, "Duration: %s\n", run.Duration.Round(time.Millisecond))
 			summary := fmt.Sprintf("%d succeeded, %d failed, %d skipped", run.Succeeded, run.Failed, run.Skipped)
 			if run.TotalBytes > 0 {
 				summary += fmt.Sprintf(", %s", cliHumanBytes(run.TotalBytes))
 			}
-			fmt.Fprintf(os.Stdout, "Result:   %s\n", summary)
+			_, _ = fmt.Fprintf(os.Stdout, "Result:   %s\n", summary)
 			if dest := strings.TrimSpace(run.Options.OutputDir); dest != "" {
-				fmt.Fprintf(os.Stdout, "Output:   %s\n", dest)
+				_, _ = fmt.Fprintf(os.Stdout, "Output:   %s\n", dest)
 			}
 			if run.Error != "" {
-				fmt.Fprintf(os.Stdout, "Error:    %s\n", run.Error)
+				_, _ = fmt.Fprintf(os.Stdout, "Error:    %s\n", run.Error)
 			}
 			if len(run.URLs) > 0 {
-				fmt.Fprintln(os.Stdout, "URLs:")
+				_, _ = fmt.Fprintln(os.Stdout, "URLs:")
 				for i, u := range run.URLs {
 					if i == 20 {
-						fmt.Fprintf(os.Stdout, "  ... and %d more\n", len(run.URLs)-i)
+						_, _ = fmt.Fprintf(os.Stdout, "  ... and %d more\n", len(run.URLs)-i)
 						break
 					}
-					fmt.Fprintf(os.Stdout, "  - %s\n", u)
+					_, _ = fmt.Fprintf(os.Stdout, "  - %s\n", u)
 				}
 			}
 			if len(run.Files) > 0 {
-				fmt.Fprintln(os.Stdout, "Files:")
+				_, _ = fmt.Fprintln(os.Stdout, "Files:")
 				for i, f := range run.Files {
 					if i == 10 {
-						fmt.Fprintf(os.Stdout, "  ... and %d more\n", len(run.Files)-i)
+						_, _ = fmt.Fprintf(os.Stdout, "  ... and %d more\n", len(run.Files)-i)
 						break
 					}
 					mark := "ok  "
@@ -537,9 +537,9 @@ func historyCmd() *cobra.Command {
 						mark = "FAIL"
 					}
 					if f.Success {
-						fmt.Fprintf(os.Stdout, "  [%s] %s (%s)\n", mark, f.Path, cliHumanBytes(f.Size))
+						_, _ = fmt.Fprintf(os.Stdout, "  [%s] %s (%s)\n", mark, f.Path, cliHumanBytes(f.Size))
 					} else {
-						fmt.Fprintf(os.Stdout, "  [%s] %s: %s\n", mark, f.Path, f.Error)
+						_, _ = fmt.Fprintf(os.Stdout, "  [%s] %s: %s\n", mark, f.Path, f.Error)
 					}
 				}
 			}

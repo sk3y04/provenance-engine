@@ -167,14 +167,14 @@ func databaseTarget(dsn string) string {
 // Render writes the report as a plain table to w.
 func Render(w io.Writer, rep Report) {
 	tw := tabwriter.NewWriter(w, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(tw, "provenance doctor")
+	_, _ = fmt.Fprintln(tw, "provenance doctor")
 	for _, c := range rep.Checks {
-		fmt.Fprintf(tw, "  %s\t%s\t%s\n", c.Name, c.Status, c.Detail)
+		_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\n", c.Name, c.Status, c.Detail)
 	}
 	_ = tw.Flush()
 	if rep.OK {
-		fmt.Fprintln(w, "result: ok")
+		_, _ = fmt.Fprintln(w, "result: ok")
 	} else {
-		fmt.Fprintln(w, "result: failed — required check(s) not ok")
+		_, _ = fmt.Fprintln(w, "result: failed — required check(s) not ok")
 	}
 }
