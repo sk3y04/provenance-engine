@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -252,7 +251,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.archiveLoading = true
 		return m, func() tea.Msg {
-			result, err := catalog.Store().Search(context.Background(), msg.query, catalog.SearchOptions{Limit: 20})
+			result, err := catalog.Store().Search(m.ctx, msg.query, catalog.SearchOptions{Limit: 20})
 			return archiveResultsMsg{query: msg.query, result: result, err: err}
 		}
 

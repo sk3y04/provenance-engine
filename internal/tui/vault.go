@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -16,7 +15,7 @@ func (m *model) loadVaultCmd() tea.Cmd {
 		hasVault := catalog.HasStore()
 		var cols []archive.ArchiveCollection
 		if hasVault {
-			c, _ := catalog.Store().ListCollections(context.Background())
+			c, _ := catalog.Store().ListCollections(m.ctx)
 			cols = c
 		}
 		return vaultLoadedMsg{initialized: hasVault, cols: cols}
@@ -76,7 +75,7 @@ func (m *model) loadRevisionsCmd(collectionName string) tea.Cmd {
 		if !catalog.HasStore() {
 			return vaultRevisionsMsg{collection: collectionName, err: fmt.Errorf("vault not initialized")}
 		}
-		revisions, err := catalog.Store().ListRevisions(context.Background(), collectionName)
+		revisions, err := catalog.Store().ListRevisions(m.ctx, collectionName)
 		if err != nil {
 			return vaultRevisionsMsg{collection: collectionName, err: err}
 		}
@@ -151,11 +150,11 @@ func (m *model) computeDiffCmd() tea.Cmd {
 		if !catalog.HasStore() {
 			return vaultDiffMsg{err: fmt.Errorf("vault not initialized")}
 		}
-		revA, errA := catalog.Store().GetRevision(context.Background(), m.vaultRevA)
+		revA, errA := catalog.Store().GetRevision(m.ctx, m.vaultRevA)
 		if errA != nil {
 			return vaultDiffMsg{err: fmt.Errorf("load revision A: %w", errA)}
 		}
-		revB, errB := catalog.Store().GetRevision(context.Background(), m.vaultRevB)
+		revB, errB := catalog.Store().GetRevision(m.ctx, m.vaultRevB)
 		if errB != nil {
 			return vaultDiffMsg{err: fmt.Errorf("load revision B: %w", errB)}
 		}

@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -256,7 +255,7 @@ func (m *model) viewCollectionDetail() string {
 func (m *model) syncCollectionCmd(name string) tea.Cmd {
 	return func() tea.Msg {
 		opts := collection.SyncOptions{RateLimiter: m.rateLimiter, Record: true}
-		result, err := collection.Sync(context.Background(), name, opts)
+		result, err := collection.Sync(m.ctx, name, opts)
 		return collectionSyncedMsg{name: name, result: result, err: err}
 	}
 }
@@ -264,7 +263,7 @@ func (m *model) syncCollectionCmd(name string) tea.Cmd {
 func (m *model) syncAllCmd() tea.Cmd {
 	return func() tea.Msg {
 		opts := collection.SyncOptions{RateLimiter: m.rateLimiter, Record: true}
-		err := collection.SyncAll(context.Background(), opts)
+		err := collection.SyncAll(m.ctx, opts)
 		return collectionSyncedMsg{name: "all", err: err}
 	}
 }
@@ -277,14 +276,14 @@ func (m *model) archiveCollectionCmd(c collection.Collection) tea.Cmd {
 
 func (m *model) loadCollectionRevsCmd(name string) tea.Cmd {
 	return func() tea.Msg {
-		ids, err := catalog.Store().ListRevisionIDsByCollection(context.Background(), name)
+		ids, err := catalog.Store().ListRevisionIDsByCollection(m.ctx, name)
 		return collectionRevsMsg{name: name, revIDs: ids, err: err}
 	}
 }
 
 func (m *model) removeCollection(name string) error {
 	if catalog.HasStore() {
-		if err := catalog.Store().DeleteRevisionsByCollection(context.Background(), name); err != nil {
+		if err := catalog.Store().DeleteRevisionsByCollection(m.ctx, name); err != nil {
 			return fmt.Errorf("delete vault revisions: %w", err)
 		}
 	}

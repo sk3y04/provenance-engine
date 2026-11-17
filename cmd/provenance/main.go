@@ -1404,7 +1404,7 @@ func archiveFromOutput(ctx context.Context, outputDir string, src archive.Source
 	return nil
 }
 
-func ensureVaultStore() error {
+func ensureVaultStore(ctx context.Context) error {
 	if catalog.HasStore() {
 		return nil
 	}
@@ -1412,7 +1412,7 @@ func ensureVaultStore() error {
 	if connStr == "" {
 		return fmt.Errorf("PROVENANCE_DATABASE_URL not set")
 	}
-	store, err := catalog.NewPgStore(context.Background(), connStr)
+	store, err := catalog.NewPgStore(ctx, connStr)
 	if err != nil {
 		return fmt.Errorf("connect to PostgreSQL: %w\nhint: run 'provenance vault init' first", err)
 	}
@@ -1458,7 +1458,7 @@ func revisionShowCmd() *cobra.Command {
 		Short: "Show revision details",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := ensureVaultStore(); err != nil {
+			if err := ensureVaultStore(cmd.Context()); err != nil {
 				return err
 			}
 			rev, err := catalog.Store().GetRevision(cmd.Context(), args[0])
@@ -1490,7 +1490,7 @@ func citeCmd() *cobra.Command {
 		Short: "Generate a citation for a revision entity",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := ensureVaultStore(); err != nil {
+			if err := ensureVaultStore(cmd.Context()); err != nil {
 				return err
 			}
 			rev, err := catalog.Store().GetRevision(cmd.Context(), args[0])
@@ -1640,7 +1640,7 @@ func searchCmd() *cobra.Command {
 		Short: "Full-text search across archived content",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := ensureVaultStore(); err != nil {
+			if err := ensureVaultStore(cmd.Context()); err != nil {
 				return err
 			}
 			opts := catalog.SearchOptions{
