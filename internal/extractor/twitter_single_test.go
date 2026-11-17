@@ -169,7 +169,7 @@ func TestScanTwitterResolvedStatusIsOnePost(t *testing.T) {
 			"Mon Jan 15 10:00:00 +0000 2024", []map[string]interface{}{twVideoMedia()}, nil))
 	})
 
-	src, err := ScanTwitterResolved(context.Background(), "https://x.com/artist/status/1234567890123456789/video/1", t.TempDir(), cookies, TwOptions{})
+	src, err := ScanTwitterResolved(context.Background(), "https://x.com/artist/status/1234567890123456789/video/1", t.TempDir(), cookies, TwOptions{Deps: srv.deps})
 	if err != nil {
 		t.Fatalf("ScanTwitterResolved: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestScanTwitterStatusManifestPaths(t *testing.T) {
 	})
 
 	out := t.TempDir()
-	m, err := ScanTwitter(context.Background(), "https://x.com/artist/status/1234567890123456789", out, cookies, TwOptions{IncludePosts: true})
+	m, err := ScanTwitter(context.Background(), "https://x.com/artist/status/1234567890123456789", out, cookies, TwOptions{IncludePosts: true, Deps: srv.deps})
 	if err != nil {
 		t.Fatalf("ScanTwitter: %v", err)
 	}

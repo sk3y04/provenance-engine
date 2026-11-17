@@ -620,13 +620,13 @@ func keysOf(m map[string]manifest.Item) []string {
 func TestScanTwitterHashtagManifest(t *testing.T) {
 	t.Setenv("TWITTER_QUERY_SEARCH_TIMELINE", "testqid")
 	cookies := writeTwCookies(t)
-	newTwSearchServer(t, func(cursor, _ string) []byte {
+	ts := newTwSearchServer(t, func(cursor, _ string) []byte {
 		return twTestSearchResponse([]interface{}{
 			twTestTweetItem("tweet-1", twTestTweet("111", "alice", "hello", "Mon Jan 15 10:00:00 +0000 2024", []map[string]interface{}{twPhotoMedia("A")}, nil)),
 		}, "")
 	})
 
-	m, err := ScanTwitter(context.Background(), "x:#golang", t.TempDir(), cookies, TwOptions{IncludePosts: true})
+	m, err := ScanTwitter(context.Background(), "x:#golang", t.TempDir(), cookies, TwOptions{IncludePosts: true, Deps: ts.deps})
 	if err != nil {
 		t.Fatalf("ScanTwitter: %v", err)
 	}
@@ -655,13 +655,13 @@ func TestScanTwitterHashtagManifest(t *testing.T) {
 func TestScanTwitterResolvedHashtag(t *testing.T) {
 	t.Setenv("TWITTER_QUERY_SEARCH_TIMELINE", "testqid")
 	cookies := writeTwCookies(t)
-	newTwSearchServer(t, func(cursor, _ string) []byte {
+	ts := newTwSearchServer(t, func(cursor, _ string) []byte {
 		return twTestSearchResponse([]interface{}{
 			twTestTweetItem("tweet-1", twTestTweet("111", "alice", "hello", "Mon Jan 15 10:00:00 +0000 2024", []map[string]interface{}{twPhotoMedia("A")}, nil)),
 		}, "")
 	})
 
-	src, err := ScanTwitterResolved(context.Background(), "#golang", t.TempDir(), cookies, TwOptions{})
+	src, err := ScanTwitterResolved(context.Background(), "#golang", t.TempDir(), cookies, TwOptions{Deps: ts.deps})
 	if err != nil {
 		t.Fatalf("ScanTwitterResolved: %v", err)
 	}
@@ -689,13 +689,13 @@ func TestDownloadTwitterHashtagDryRunDoesNotWrite(t *testing.T) {
 	t.Setenv("TWITTER_QUERY_SEARCH_TIMELINE", "testqid")
 	cookies := writeTwCookies(t)
 	outDir := filepath.Join(t.TempDir(), "downloads")
-	newTwSearchServer(t, func(cursor, _ string) []byte {
+	ts := newTwSearchServer(t, func(cursor, _ string) []byte {
 		return twTestSearchResponse([]interface{}{
 			twTestTweetItem("tweet-1", twTestTweet("111", "alice", "hello", "Mon Jan 15 10:00:00 +0000 2024", []map[string]interface{}{twPhotoMedia("A")}, nil)),
 		}, "")
 	})
 
-	if err := DownloadTwitter(context.Background(), "x:#golang", outDir, cookies, TwOptions{IncludePosts: true}, true); err != nil {
+	if err := DownloadTwitter(context.Background(), "x:#golang", outDir, cookies, TwOptions{IncludePosts: true, Deps: ts.deps}, true); err != nil {
 		t.Fatalf("DownloadTwitter dry-run: %v", err)
 	}
 	if _, err := os.Stat(outDir); !os.IsNotExist(err) {

@@ -61,13 +61,12 @@ type Client struct {
 	LastPath string
 }
 
-// New returns a Client with sane defaults.
-//
-// The HTTP transport bounds dial and TLS handshake durations so an unreachable
-// CDN host fails in seconds instead of stalling for the full per-request
-// budget. The 30 minute Timeout still caps the total streaming time.
-func New() *Client {
-	dialer := &net.Dialer{
+// NewDialer returns a dialer that refuses connections to private networks.
+// Any transport that fetches platform-supplied URLs (media CDNs, album file
+// hosts) should use it so a hostile response cannot aim the engine at internal
+// services or cloud metadata endpoints.
+func NewDialer() *net.Dialer {
+	return &net.Dialer{
 		Timeout:   15 * time.Second,
 		KeepAlive: 30 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -81,6 +80,15 @@ func New() *Client {
 			return nil
 		},
 	}
+}
+
+// New returns a Client with sane defaults.
+//
+// The HTTP transport bounds dial and TLS handshake durations so an unreachable
+// CDN host fails in seconds instead of stalling for the full per-request
+// budget. The 30 minute Timeout still caps the total streaming time.
+func New() *Client {
+	dialer := NewDialer()
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           dialer.DialContext,
@@ -134,6 +142,20 @@ func SafeRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
+// contentRangeTotal parses the current resource length from a Content-Range
+// header of the form "bytes */<length>" (RFC 7233 range-not-satisfiable).
+func contentRangeTotal(h string) (int64, bool) {
+	i := strings.LastIndex(h, "/")
+	if i < 0 || i+1 >= len(h) {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(h[i+1:]), 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 // Download fetches `rawURL` and writes it to `dest`. Resumes if a .part file
 // already exists. The destination directory is created if missing.
 func (c *Client) Download(ctx context.Context, rawURL, dest, referer string) (err error) {
@@ -141,6 +163,8 @@ func (c *Client) Download(ctx context.Context, rawURL, dest, referer string) (er
 	c.LastPath = ""
 
 	if fi, err := os.Stat(dest); err == nil && fi.Size() > 0 {
+		// Any leftover .part is stale once the final file exists.
+		_ = os.Remove(dest + ".part")
 		if c.Progress != nil {
 			c.Progress.OnStart(rawURL, dest, fi.Size())
 			c.Progress.OnProgress(rawURL, fi.Size(), fi.Size())
@@ -211,13 +235,33 @@ func (c *Client) Download(ctx context.Context, rawURL, dest, referer string) (er
 	case http.StatusPartialContent:
 		// good, resuming
 	case http.StatusRequestedRangeNotSatisfiable:
-		// Already fully downloaded.
-		_ = os.Remove(partPath)
+		// The resume offset is past the end of the resource. If the final file
+		// already exists, the .part is stale; otherwise the .part may already
+		// hold the complete resource — recover it when the server's
+		// Content-Range total confirms the sizes match, and never delete it
+		// blindly.
 		if _, err := os.Stat(dest); err == nil {
+			_ = os.Remove(partPath)
+			c.LastPath = dest
+			if fh, err := fileHash(dest); err == nil {
+				c.LastHash = fh
+			}
 			if c.Progress != nil {
 				c.Progress.OnDone(rawURL, nil)
 			}
 			return nil
+		}
+		if total, ok := contentRangeTotal(resp.Header.Get("Content-Range")); ok && total == existing {
+			if err := os.Rename(partPath, dest); err == nil {
+				c.LastPath = dest
+				if fh, err := fileHash(dest); err == nil {
+					c.LastHash = fh
+				}
+				if c.Progress != nil {
+					c.Progress.OnDone(rawURL, nil)
+				}
+				return nil
+			}
 		}
 		return fmt.Errorf("range not satisfiable and no final file")
 	default:
@@ -231,7 +275,9 @@ func (c *Client) Download(ctx context.Context, rawURL, dest, referer string) (er
 	if existing > 0 {
 		flag |= os.O_APPEND
 	} else {
-		flag |= os.O_EXCL
+		// O_TRUNC, not O_EXCL: a zero-byte .part left by an interrupted attempt
+		// must not block every future download of this destination.
+		flag |= os.O_TRUNC
 	}
 	// Defer directory creation until we are sure the response is good, so
 	// failed downloads do not leave behind empty post folders.

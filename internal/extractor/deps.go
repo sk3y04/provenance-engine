@@ -2,7 +2,6 @@ package extractor
 
 import (
 	"context"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -77,11 +76,8 @@ func Transport() *http.Transport {
 }
 
 var sharedTransport = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
-	DialContext: (&net.Dialer{
-		Timeout:   15 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).DialContext,
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           downloader.NewDialer().DialContext,
 	ForceAttemptHTTP2:     true,
 	MaxIdleConns:          10,
 	IdleConnTimeout:       90 * time.Second,

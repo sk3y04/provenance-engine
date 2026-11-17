@@ -118,6 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ingest into a temp vault with blob verification, docs scope/maxPages bounds,
   web pre-flight validation, UTF-8-safe truncation, and the narration
   transport-neutrality contract. No test contacts a live service.
+- **SSRF dial guard on the shared extractor transport**: the private-network
+  dial control from `downloader.New` is exported as `downloader.NewDialer` and
+  now also protects the extractors' shared transport, so platform-supplied URLs
+  (for example album CDN hosts) cannot reach loopback, RFC1918, link-local, or
+  cloud-metadata addresses even via a non-literal hostname. Downloader resume,
+  416 recovery, redirect, and dial-guard behavior are covered by new hermetic
+  tests.
 
 ### Changed
 
@@ -151,6 +158,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Downloader resume edge cases**: a zero-byte `.part` left by an interrupted
+  attempt no longer blocks every future download of the destination (`O_EXCL`
+  became `O_TRUNC` for fresh starts). A 416 "range not satisfiable" response no
+  longer deletes a `.part` that may already hold the complete file: when the
+  server's `Content-Range` total matches the `.part` size it is renamed into
+  place, and without confirmation the `.part` is preserved instead of
+  destroyed. The already-downloaded skip and 416 completion paths now report
+  `LastPath`/`LastHash` like a normal download and clean up stale `.part` files.
 - **Canceled git imports no longer hang or orphan helpers**: `git clone` spawns
   remote helpers (for example `git-remote-https`) that inherit the output pipes.
   Killing only the parent left them holding the pipes open, so `CombinedOutput`
