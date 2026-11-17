@@ -27,7 +27,10 @@ func Parse(s string) (*Reference, error) {
 		return nil, fmt.Errorf("invalid citation reference %q: expected provenance://<collection>@<revision>#<entity>", s)
 	}
 	rest := strings.TrimPrefix(s, "provenance://")
-	atIdx := strings.LastIndex(rest, "@")
+	// Split at the first @ and the first # after it: revision ids are hex
+	// digests, while entity ids are URLs/paths that may themselves contain
+	// @ (e.g. medium.com/@user) or # (e.g. page#text).
+	atIdx := strings.Index(rest, "@")
 	if atIdx < 0 {
 		return nil, fmt.Errorf("invalid citation reference %q: missing @ separator", s)
 	}
@@ -35,11 +38,15 @@ func Parse(s string) (*Reference, error) {
 	if hashIdx < 0 {
 		return nil, fmt.Errorf("invalid citation reference %q: missing # separator", s)
 	}
-	return &Reference{
+	ref := &Reference{
 		Collection: rest[:atIdx],
 		RevisionID: rest[atIdx+1 : atIdx+1+hashIdx],
 		EntityID:   rest[atIdx+1+hashIdx+1:],
-	}, nil
+	}
+	if ref.Collection == "" || ref.RevisionID == "" || ref.EntityID == "" {
+		return nil, fmt.Errorf("invalid citation reference %q: empty collection, revision, or entity", s)
+	}
+	return ref, nil
 }
 
 func Format(collection, revisionID, entityID string) string {

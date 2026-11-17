@@ -118,6 +118,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ingest into a temp vault with blob verification, docs scope/maxPages bounds,
   web pre-flight validation, UTF-8-safe truncation, and the narration
   transport-neutrality contract. No test contacts a live service.
+- **Config, citation, and resolve under test**: the persisted `config.Config`
+  JSON shape (field names, omitempty behavior, round trip) and the
+  capture-options mapping are pinned; `internal/citation` gains round-trip,
+  formatter, and entity-mapping coverage; `internal/resolve` pins the
+  `scan --json` field-name contract and error-category semantics. Every
+  package in the module now has tests.
 - **SSRF dial guard on the shared extractor transport**: the private-network
   dial control from `downloader.New` is exported as `downloader.NewDialer` and
   now also protects the extractors' shared transport, so platform-supplied URLs
@@ -158,6 +164,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Citation references round-trip**: `citation.Parse` split at the last `@`,
+  so entity ids containing `@` (for example `medium.com/@user/...` URLs) failed
+  to parse. It now splits at the first `@` and first `#`, rejects empty
+  components, and round-trips `Format` for URL-shaped entity ids.
 - **Watch runs recover crashed "running" status**: a run killed mid-flight left
   `last_run_status: running` forever. `watch run` now records such a run as
   `interrupted` (preserving its start time and partial duration) before
