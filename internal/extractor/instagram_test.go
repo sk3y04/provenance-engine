@@ -2,6 +2,7 @@ package extractor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -622,5 +623,80 @@ func TestIgPostItemsWithoutIncludePosts(t *testing.T) {
 	}
 	if items[0].Kind == "post" {
 		t.Errorf("should not have post item when IncludePosts is false")
+	}
+}
+
+func TestExtractIgProfileIDPrefersProfileID(t *testing.T) {
+	data, err := os.ReadFile("testdata/instagram_web_profile.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(data)
+	if got := extractIgProfileID(html); got != "9000000001" {
+		t.Fatalf("extractIgProfileID = %q, want 9000000001 (decoy user_id must not win)", got)
+	}
+}
+
+func TestParseIgProfilePosts(t *testing.T) {
+	data, err := os.ReadFile("testdata/instagram_web_profile.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	posts, more, err := parseIgProfilePosts(string(data))
+	if err != nil {
+		t.Fatalf("parseIgProfilePosts: %v", err)
+	}
+	if len(posts) != 2 {
+		t.Fatalf("got %d posts, want 2", len(posts))
+	}
+	if posts[0].Code != "AAA111" {
+		t.Errorf("first code = %q", posts[0].Code)
+	}
+	if posts[0].Caption == nil || !strings.Contains(posts[0].Caption.Text, "{braces}") || !strings.Contains(posts[0].Caption.Text, `"quote"`) {
+		t.Errorf("caption not decoded intact: %+v", posts[0].Caption)
+	}
+	if got := posts[0].User.Pk.String(); got != "9000000001" {
+		t.Errorf("user pk = %q, want string pk preserved", got)
+	}
+	if !more {
+		t.Error("expected has_next_page to be reported")
+	}
+	if len(posts[1].CarouselMedia) != 2 {
+		t.Fatalf("carousel items = %d, want 2", len(posts[1].CarouselMedia))
+	}
+	if got := posts[1].CarouselMedia[1].VideoVersions[0].URL; got != "https://cdn.example/c2.mp4" {
+		t.Errorf("carousel video = %q", got)
+	}
+}
+
+func TestParseIgPostPage(t *testing.T) {
+	html := `<html><script type="application/json">{"require":[["X","y",[],["p",{"__bbox":{"result":{"data":{"xdt_api__v1__media__shortcode__web_info":{"items":[{"code":"SHORT1","pk":"42","media_type":1,"taken_at":1700000000,"user":{"pk":"99","username":"poster"},"image_versions2":{"candidates":[{"url":"https://cdn.example/p.jpg","width":100,"height":100}]}}]}}}}]]]}</script></html>`
+	post, err := parseIgPostPage(html)
+	if err != nil {
+		t.Fatalf("parseIgPostPage: %v", err)
+	}
+	if post.Code != "SHORT1" || post.User.Username != "poster" {
+		t.Fatalf("unexpected post: %+v", post)
+	}
+	if post.User.Pk.String() != "99" {
+		t.Errorf("pk = %q", post.User.Pk.String())
+	}
+}
+
+func TestIgFlexStringAcceptsNumberAndString(t *testing.T) {
+	var v struct {
+		Pk igFlexString `json:"pk"`
+	}
+	if err := json.Unmarshal([]byte(`{"pk":12345}`), &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.Pk.String() != "12345" {
+		t.Errorf("numeric pk = %q", v.Pk.String())
+	}
+	if err := json.Unmarshal([]byte(`{"pk":"67890"}`), &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.Pk.String() != "67890" {
+		t.Errorf("string pk = %q", v.Pk.String())
 	}
 }

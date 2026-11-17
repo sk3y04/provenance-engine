@@ -54,11 +54,13 @@ func igSessionRejected(err error) bool {
 	return strings.Contains(msg, "status 401") || strings.Contains(msg, "status 403") || strings.Contains(msg, "status 404")
 }
 
-// igNoteLoginState prints a hint when an API response is an HTML login page,
-// which usually means the exported cookies do not apply to that host.
+// igNoteLoginState prints a hint when an API response is an HTML login page.
+// A valid browser session does not help here: Instagram's private API hosts
+// reject web sessions even when the cookies are present, so the extractor
+// falls back to the server-rendered page where possible.
 func igNoteLoginState(ctx context.Context, base, body string) {
 	if strings.Contains(body, "not-logged-in") {
-		narratef(ctx, kindWarn, event.ReasonNotLoggedIn, "", "", "[instagram] %s served a not-logged-in page; the exported cookies may not cover this host (check that cookies.txt contains .instagram.com domain cookies such as sessionid)\n", base)
+		narratef(ctx, kindWarn, event.ReasonNotLoggedIn, "", "", "[instagram] %s served a logged-out page (private API rejects browser sessions); falling back to the server-rendered web page where possible\n", base)
 	}
 }
 
@@ -219,11 +221,36 @@ func igHeaders(cookiesFile, csrfToken string) (http.Header, error) {
 	return h, nil
 }
 
+// igFlexString accepts either a JSON string or number. Instagram's REST API
+// returns numeric pks while the server-rendered web page and GraphQL payloads
+// quote them as strings.
+type igFlexString string
+
+func (s *igFlexString) UnmarshalJSON(b []byte) error {
+	raw := strings.TrimSpace(string(b))
+	if raw == "" || raw == "null" {
+		*s = ""
+		return nil
+	}
+	if raw[0] == '"' {
+		var v string
+		if err := json.Unmarshal(b, &v); err != nil {
+			return err
+		}
+		*s = igFlexString(v)
+		return nil
+	}
+	*s = igFlexString(raw)
+	return nil
+}
+
+func (s igFlexString) String() string { return string(s) }
+
 type igUserResult struct {
-	Pk       json.Number `json:"pk"`
-	ID       string      `json:"id"`
-	Username string      `json:"username"`
-	FullName string      `json:"full_name"`
+	Pk       igFlexString `json:"pk"`
+	ID       string       `json:"id"`
+	Username string       `json:"username"`
+	FullName string       `json:"full_name"`
 }
 
 type igProfileResponse struct {
@@ -280,6 +307,20 @@ type igFeedResponse struct {
 
 type igMediaInfoResponse struct {
 	Items []igFeedMedia `json:"items"`
+}
+
+// igWebFeedObject is the subset of Instagram's server-rendered payloads used by
+// the web fallback. Profile pages carry a feed connection with edges; single
+// post pages carry an items array. Both wrap the same node shape.
+type igWebFeedObject struct {
+	Edges []struct {
+		Node *igFeedMedia `json:"node"`
+	} `json:"edges"`
+	Items    []igFeedMedia `json:"items"`
+	PageInfo struct {
+		EndCursor   string `json:"end_cursor"`
+		HasNextPage bool   `json:"has_next_page"`
+	} `json:"page_info"`
 }
 
 func resolveIgUserID(ctx context.Context, d *Deps, cookiesFile, csrfToken, username string, rl *ratelimit.Manager) (string, error) {
@@ -454,13 +495,11 @@ func resolveIgUserIDWWW(ctx context.Context, d *Deps, cookiesFile, csrfToken, us
 	return userID, nil
 }
 
-func resolveIgUserIDFromWeb(ctx context.Context, d *Deps, cookiesFile, username string) (string, error) {
-	profileURL := fmt.Sprintf("https://www.instagram.com/%s/", username)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, profileURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("new request: %w", err)
-	}
-
+// igBrowserHeaders builds the headers a top-level browser navigation sends to
+// www.instagram.com. Instagram only server-renders profile and post data (as
+// opposed to an empty app shell) when the Sec-Fetch-* navigation headers are
+// present, so these matter even outside a real browser.
+func igBrowserHeaders(cookiesFile string, hosts ...string) (http.Header, error) {
 	h := http.Header{}
 	h.Set("User-Agent", igUserAgent)
 	h.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -470,36 +509,142 @@ func resolveIgUserIDFromWeb(ctx context.Context, d *Deps, cookiesFile, username 
 	h.Set("Sec-Fetch-Site", "none")
 	h.Set("Sec-Fetch-User", "?1")
 	h.Set("Upgrade-Insecure-Requests", "1")
-	cv, err := cookieHeaderForHosts(cookiesFile, "www.instagram.com")
+	if len(hosts) == 0 {
+		hosts = []string{"www.instagram.com"}
+	}
+	cv, err := cookieHeaderForHosts(cookiesFile, hosts...)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if cv != "" {
 		h.Set("Cookie", cv)
 	}
-	req.Header = h
+	return h, nil
+}
+
+// fetchIgHTMLPage fetches a www.instagram.com page as a browser navigation and
+// returns the server-rendered HTML.
+func fetchIgHTMLPage(ctx context.Context, d *Deps, cookiesFile, pageURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("new request: %w", err)
+	}
+	headers, err := igBrowserHeaders(cookiesFile, "www.instagram.com")
+	if err != nil {
+		return "", err
+	}
+	req.Header = headers
 
 	resp, err := d.HTTPClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fetch profile page: %w", err)
+		return "", fmt.Errorf("fetch page: %w", err)
 	}
-
 	if resp.StatusCode >= 400 {
 		preview, _ := io.ReadAll(io.LimitReader(resp.Body, igErrorPreviewLimit))
 		_ = resp.Body.Close()
-		return "", fmt.Errorf("profile page status %d: %s", resp.StatusCode, sanitizeErrorBody(string(preview)))
+		return "", fmt.Errorf("page status %d: %s", resp.StatusCode, sanitizeErrorBody(string(preview)))
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
-		return "", fmt.Errorf("read profile page: %w", err)
+		return "", fmt.Errorf("read page: %w", err)
+	}
+	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web page: status %d, body length %d\n", resp.StatusCode, len(body))
+	return string(body), nil
+}
+
+// igExtractJSONObject returns the JSON object that follows key in html. The
+// object is located by brace matching so braces and escapes inside string
+// values do not truncate it.
+func igExtractJSONObject(html, key string) (string, bool) {
+	idx := strings.Index(html, key)
+	if idx < 0 {
+		return "", false
+	}
+	idx += len(key)
+	for idx < len(html) && (html[idx] == ' ' || html[idx] == '\n' || html[idx] == '\r' || html[idx] == '\t') {
+		idx++
+	}
+	if idx >= len(html) || html[idx] != '{' {
+		return "", false
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := idx; i < len(html); i++ {
+		c := html[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return html[idx : i+1], true
+			}
+		}
+	}
+	return "", false
+}
+
+// digitsAfter returns the run of digits immediately following the first
+// occurrence of marker in s.
+func digitsAfter(s, marker string) string {
+	idx := strings.Index(s, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := s[idx+len(marker):]
+	var b strings.Builder
+	for _, c := range rest {
+		if c < '0' || c > '9' {
+			break
+		}
+		b.WriteByte(byte(c))
+	}
+	return b.String()
+}
+
+func extractIgProfileID(html string) string {
+	// The server-rendered profile route embeds the owner id in page logging
+	// params. Prefer it over the generic "user_id" key, which may belong to a
+	// suggested account or to the viewer.
+	if id := digitsAfter(html, `"profile_id":"`); id != "" {
+		return id
+	}
+	if obj, ok := igExtractJSONObject(html, `"xdt_api__v1__feed__user_timeline_graphql_connection":`); ok {
+		var conn igWebFeedObject
+		if err := json.Unmarshal([]byte(obj), &conn); err == nil {
+			for _, edge := range conn.Edges {
+				if edge.Node != nil && edge.Node.User.Pk.String() != "" {
+					return edge.Node.User.Pk.String()
+				}
+			}
+		}
+	}
+	return extractIgUserID(html)
+}
+
+func resolveIgUserIDFromWeb(ctx context.Context, d *Deps, cookiesFile, username string) (string, error) {
+	html, err := fetchIgHTMLPage(ctx, d, cookiesFile, fmt.Sprintf("https://www.instagram.com/%s/", username))
+	if err != nil {
+		return "", err
 	}
 
-	html := string(body)
-	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web scrape: status %d, body length %d\n", resp.StatusCode, len(body))
-
-	if userID := extractIgUserID(html); userID != "" {
+	if userID := extractIgProfileID(html); userID != "" {
 		return userID, nil
 	}
 
@@ -510,6 +655,66 @@ func resolveIgUserIDFromWeb(ctx context.Context, d *Deps, cookiesFile, username 
 	}
 
 	return "", fmt.Errorf("could not find user id in profile page html")
+}
+
+// parseIgProfilePosts extracts the first page of the feed embedded in a
+// server-rendered profile page.
+func parseIgProfilePosts(html string) ([]igFeedMedia, bool, error) {
+	obj, ok := igExtractJSONObject(html, `"xdt_api__v1__feed__user_timeline_graphql_connection":`)
+	if !ok {
+		return nil, false, fmt.Errorf("profile page did not embed a feed connection (possibly a login/challenge wall)")
+	}
+	var conn igWebFeedObject
+	if err := json.Unmarshal([]byte(obj), &conn); err != nil {
+		return nil, false, fmt.Errorf("decode embedded feed: %w", err)
+	}
+
+	posts := make([]igFeedMedia, 0, len(conn.Edges))
+	for _, edge := range conn.Edges {
+		if edge.Node != nil {
+			posts = append(posts, *edge.Node)
+		}
+	}
+	if len(posts) == 0 {
+		return nil, conn.PageInfo.HasNextPage, fmt.Errorf("profile page embedded no posts")
+	}
+	return posts, conn.PageInfo.HasNextPage, nil
+}
+
+// fetchIgProfilePostsFromWeb reads the posts embedded in the server-rendered
+// profile page. Instagram's REST endpoints now reject web sessions, but the
+// navigation response still contains the first page of the Relay feed.
+func fetchIgProfilePostsFromWeb(ctx context.Context, d *Deps, cookiesFile, username string) ([]igFeedMedia, bool, error) {
+	html, err := fetchIgHTMLPage(ctx, d, cookiesFile, fmt.Sprintf("https://www.instagram.com/%s/", username))
+	if err != nil {
+		return nil, false, err
+	}
+	return parseIgProfilePosts(html)
+}
+
+func parseIgPostPage(html string) (*igFeedMedia, error) {
+	obj, ok := igExtractJSONObject(html, `"xdt_api__v1__media__shortcode__web_info":`)
+	if !ok {
+		return nil, fmt.Errorf("post page did not embed media info")
+	}
+	var info igWebFeedObject
+	if err := json.Unmarshal([]byte(obj), &info); err != nil {
+		return nil, fmt.Errorf("decode embedded media info: %w", err)
+	}
+	if len(info.Items) == 0 {
+		return nil, fmt.Errorf("post page embedded no media")
+	}
+	return &info.Items[0], nil
+}
+
+// fetchIgPostFromWeb reads a single post or reel from the server-rendered
+// post page.
+func fetchIgPostFromWeb(ctx context.Context, d *Deps, cookiesFile, shortcode string) (*igFeedMedia, error) {
+	html, err := fetchIgHTMLPage(ctx, d, cookiesFile, fmt.Sprintf("https://www.instagram.com/p/%s/", shortcode))
+	if err != nil {
+		return nil, err
+	}
+	return parseIgPostPage(html)
 }
 
 func resolveIgUserIDJSON(ctx context.Context, d *Deps, cookiesFile, csrfToken, username string) (string, error) {
@@ -596,8 +801,8 @@ func resolveIgUserIDSearch(ctx context.Context, d *Deps, cookiesFile, csrfToken,
 
 	var result struct {
 		Users []struct {
-			Pk       json.Number `json:"pk"`
-			Username string      `json:"username"`
+			Pk       igFlexString `json:"pk"`
+			Username string       `json:"username"`
 		} `json:"users"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
@@ -770,7 +975,25 @@ func fetchIgMediaPageHost(ctx context.Context, d *Deps, cookiesFile, csrfToken, 
 	return nil, "", lastErr
 }
 
-func FetchAllIgPosts(ctx context.Context, d *Deps, cookiesFile, csrfToken, userID string, limit int, rl *ratelimit.Manager) ([]igFeedMedia, error) {
+func FetchAllIgPosts(ctx context.Context, d *Deps, cookiesFile, csrfToken, userID, username string, limit int, rl *ratelimit.Manager) ([]igFeedMedia, error) {
+	// The private REST feed endpoint is increasingly rejected for browser
+	// sessions. The profile page still server-renders the first page of the
+	// same feed, so prefer it and fall back to the API only if it is missing.
+	if username != "" {
+		posts, more, err := fetchIgProfilePostsFromWeb(ctx, d, cookiesFile, username)
+		if err == nil {
+			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] fetched %d posts from the profile page\n", len(posts))
+			if more && (limit == 0 || len(posts) < limit) {
+				narratef(ctx, kindWarn, reasonInfo, "", "", "[instagram] profile page only exposes the first %d posts; older posts need Instagram's authenticated API, which currently rejects web sessions\n", len(posts))
+			}
+			if limit > 0 && len(posts) > limit {
+				posts = posts[:limit]
+			}
+			return posts, nil
+		}
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] profile page fallback failed: %v\n", err)
+	}
+
 	var all []igFeedMedia
 	cursor := ""
 	pages := 0
@@ -814,9 +1037,15 @@ func fetchSingleIgPost(ctx context.Context, d *Deps, cookiesFile, csrfToken, sho
 		}
 		lastErr = err
 		if i == len(igAPIHosts)-1 || !igSessionRejected(err) {
-			return nil, err
+			break
 		}
 		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
+	}
+	if post, err := fetchIgPostFromWeb(ctx, d, cookiesFile, shortcode); err == nil {
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] fetched post %s from the post page\n", shortcode)
+		return post, nil
+	} else {
+		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] post page fallback failed: %v\n", err)
 	}
 	return nil, lastErr
 }
@@ -1465,7 +1694,7 @@ func ScanInstagram(ctx context.Context, rawURL, outDir string, cookiesFile strin
 		if err != nil {
 			return manifest.Manifest{}, fmt.Errorf("resolve user id: %w", err)
 		}
-		posts, err = FetchAllIgPosts(ctx, d, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
+		posts, err = FetchAllIgPosts(ctx, d, cookiesFile, csrfToken, userID, target.Username, opts.Limit, opts.RateLimiter)
 		if err != nil {
 			return manifest.Manifest{}, err
 		}
@@ -1533,7 +1762,7 @@ func DownloadInstagram(ctx context.Context, rawURL, outDir string, cookiesFile s
 		if err != nil {
 			return fmt.Errorf("resolve user id: %w", err)
 		}
-		posts, err = FetchAllIgPosts(ctx, d, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
+		posts, err = FetchAllIgPosts(ctx, d, cookiesFile, csrfToken, userID, target.Username, opts.Limit, opts.RateLimiter)
 		if err != nil {
 			return err
 		}
@@ -1792,7 +2021,7 @@ func ScanInstagramResolved(ctx context.Context, rawURL, outDir, cookiesFile stri
 		if err != nil {
 			return resolve.Source{}, fmt.Errorf("resolve user id: %w", err)
 		}
-		posts, err = FetchAllIgPosts(ctx, d, cookiesFile, csrfToken, userID, opts.Limit, opts.RateLimiter)
+		posts, err = FetchAllIgPosts(ctx, d, cookiesFile, csrfToken, userID, target.Username, opts.Limit, opts.RateLimiter)
 		if err != nil {
 			return resolve.Source{}, err
 		}
