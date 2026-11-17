@@ -315,7 +315,7 @@ func browserFallback(ctx context.Context, d *extractor.Deps, rawURL string, opts
 				narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance]   (re-run later with: provenance grab --batch %q)\n", cachePath)
 			}
 		} else if opts.Events == nil {
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] WARNING: could not save link cache: %v\n", cerr)
+			narratef(ctx, kindInfo, reasonInfo, "", "could not save link cache", "[provenance] WARNING: could not save link cache: %v\n", cerr)
 		}
 		return downloadVideoLinks(ctx, d, links, opts)
 	}
@@ -323,10 +323,10 @@ func browserFallback(ctx context.Context, d *extractor.Deps, rawURL string, opts
 		if opts.Events != nil {
 			emitEvent(ctx, opts.Events, event.Event{
 				Kind: event.KindWarning, URL: rawURL, Reason: "link_scrape_failed",
-				Detail: scrapeErr.Error(),
+				Detail: "link scrape failed, falling back to media-URL sniffer",
 			})
 		} else {
-			narrateOut(ctx, kindInfo, reasonInfo, "", "", "[provenance] link scrape failed: %v - falling back to media-URL sniffer\n", scrapeErr)
+			narrateOut(ctx, kindInfo, reasonInfo, "", "link scrape failed, falling back to media-URL sniffer", "[provenance] link scrape failed: %v - falling back to media-URL sniffer\n", scrapeErr)
 		}
 	} else if opts.Events == nil {
 		narrateOut(ctx, kindInfo, event.ReasonLinkScrapeFailed, rawURL, "no video links found on page - falling back to media-URL sniffer", "[provenance] no video links found on page - falling back to media-URL sniffer\n")
@@ -541,7 +541,7 @@ func downloadVideoLinks(ctx context.Context, d *extractor.Deps, links []string, 
 		var err error
 		grabArch, err = openURLArchive(filepath.Join(cacheDir, "archive.txt"))
 		if err != nil {
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] WARNING: could not open URL archive: %v\n", err)
+			narratef(ctx, kindInfo, reasonInfo, "", "could not open URL archive", "[provenance] WARNING: could not open URL archive: %v\n", err)
 			grabArch = nil
 		}
 		ytdlpArchivePath = filepath.Join(cacheDir, "ytdlp_archive.txt")
@@ -644,7 +644,7 @@ func downloadVideoLinks(ctx context.Context, d *extractor.Deps, links []string, 
 				firstErr = err
 			}
 			errMu.Unlock()
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] FAILED %s: %v\n", link, err)
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("FAILED %s", link), "[provenance] FAILED %s: %v\n", link, err)
 			if opts.Reporter != nil {
 				opts.Reporter.Failure(link, err)
 			}
@@ -719,7 +719,7 @@ func BatchDispatch(ctx context.Context, path string, opts Options) error {
 	}
 	for _, u := range slow {
 		if err := Dispatch(ctx, u, opts); err != nil {
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] %s: %v\n", u, err)
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("failed: %s", u), "[provenance] %s: %v\n", u, err)
 			if firstErr == nil {
 				firstErr = err
 			}

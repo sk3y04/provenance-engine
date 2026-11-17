@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/sk3y04/provenance-engine/internal/downloader"
@@ -83,6 +84,25 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// maxRetryAfter caps server-supplied Retry-After delays so a hostile or broken
+// platform response cannot stall an operation for hours. The wait itself stays
+// cancellable through sleepCtx.
+const maxRetryAfter = 5 * time.Minute
+
+// retryAfterDelay picks the wait before retrying a rate-limited request: the
+// server's Retry-After seconds when positive, capped at maxRetryAfter, else
+// fallback. capped reports whether the server asked for more than the cap.
+func retryAfterDelay(header string, fallback time.Duration) (delay time.Duration, capped bool) {
+	sec, err := strconv.Atoi(header)
+	if err != nil || sec <= 0 {
+		return fallback, false
+	}
+	if sec > int(maxRetryAfter/time.Second) {
+		return maxRetryAfter, true
+	}
+	return time.Duration(sec) * time.Second, false
 }
 
 // progressFor returns the reporter a download should use. An explicit reporter

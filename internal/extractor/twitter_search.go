@@ -8,9 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/sk3y04/provenance-engine/internal/event"
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
@@ -134,7 +132,9 @@ func fetchTwSearchPage(ctx context.Context, d *Deps, cookiesFile, csrfToken, que
 				if attempt == twMaxAttempts {
 					return nil, "", fmt.Errorf("twitter search request failed after %d attempts: %w", attempt, lastErr)
 				}
-				time.Sleep(twRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, twRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return nil, "", err
+				}
 				continue
 			}
 
@@ -151,23 +151,26 @@ func fetchTwSearchPage(ctx context.Context, d *Deps, cookiesFile, csrfToken, que
 					return nil, "", fmt.Errorf("twitter search authentication failed (status %d): re-export cookies from a logged-in x.com session", resp.StatusCode)
 				}
 				lastErr = fmt.Errorf("twitter status %d", resp.StatusCode)
-				narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] search response: %s\n", sanitizeErrorBody(bodyStr))
+				narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", resp.StatusCode), "[twitter] search response: %s\n", sanitizeErrorBody(bodyStr))
 				if resp.StatusCode == http.StatusTooManyRequests {
-					delay := twMaxRetryBackoff
-					if ra := resp.Header.Get("Retry-After"); ra != "" {
-						if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
-							delay = time.Duration(sec) * time.Second
-						}
+					delay, capped := retryAfterDelay(resp.Header.Get("Retry-After"), twMaxRetryBackoff)
+					if capped {
+						narratef(ctx, kindWarn, event.ReasonRetryAfterCapped, "", fmt.Sprintf("retry-after capped to %s", delay),
+							"[twitter] search Retry-After exceeds %s cap, waiting %v...\n", maxRetryAfter, delay)
 					}
-					narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] search rate limited (429), waiting %v...\n", delay)
-					time.Sleep(delay)
+					narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("waiting %s", delay), "[twitter] search rate limited (429), waiting %v...\n", delay)
+					if err := sleepCtx(ctx, delay); err != nil {
+						return nil, "", err
+					}
 					continue
 				}
 				if resp.StatusCode >= 400 && resp.StatusCode < 500 && attempt == twMaxAttempts {
 					return nil, "", lastErr
 				}
 				if resp.StatusCode >= 500 && attempt < twMaxAttempts {
-					time.Sleep(twRetryBackoff << min(attempt-1, 3))
+					if err := sleepCtx(ctx, twRetryBackoff<<min(attempt-1, 3)); err != nil {
+						return nil, "", err
+					}
 					continue
 				}
 				return nil, "", lastErr

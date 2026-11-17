@@ -62,8 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Event redaction** (`internal/redact`): `Detail` bounds, normalizes, and removes
   cookie/authorization/bearer/token/session fragments, and `URL` drops query
   strings and fragments, so events never carry raw platform response bodies,
-  cookies, auth headers, or secret-bearing URLs. Response-body narration now emits
-  a stable fact (for example a status code) instead of a body preview.
+  cookies, auth headers, or secret-bearing URLs. Response-body, error, and
+  fallback narration now emits stable facts (for example a status code) instead
+  of body previews or raw error text.
 - **Operation-scoped workspace** (`internal/workspace`): `Download` runs in a
   workspace that records what already existed and reports only files the operation
   created, excluding engine bookkeeping directories and in-progress partials.
@@ -78,8 +79,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache and the tool paths are now per-engine instead of process-global. The
   transport stays a package-level immutable, concurrency-safe shared service.
 - **Cancellable retry/backoff paths**: `sleepCtx` replaces `time.Sleep` in every
-  extractor retry and rate-limit backoff, so a canceled operation stops instead of
-  waiting out a `Retry-After`.
+  extractor retry and rate-limit backoff (Instagram, X/Twitter, hashtag search,
+  Reddit, Album) and in the downloader's speed-limit wait, so a canceled
+  operation stops instead of waiting out a backoff. Server-supplied
+  `Retry-After` values are parsed by one shared helper (`retryAfterDelay`) and
+  capped at 5 minutes; an over-cap value emits a `retry_after_capped` warning
+  event.
+- **Backoff and event-fact invariants under test**: fixture-server tests prove
+  each native extractor's rate-limit and 5xx backoff honors cancellation, an
+  over-cap `Retry-After` is clipped with a warning, error-response events carry
+  only stable status facts (canary response bodies never leak into events or
+  errors), and a speed-limited download aborts promptly on cancellation.
 - **Bounded sink close**: `event.Notifier.Close` waits at most a grace period for
   an in-flight delivery, so a blocked foreign sink can never stall the caller.
 - **Single X post resolution**: `https://x.com/<user>/status/<id>` is now a
@@ -117,6 +127,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumers in a shared process.
 - `Notifier.Close` is bounded by a grace period rather than waiting indefinitely
   for a slow sink.
+- **Rate-limit waits are bounded**: a server `Retry-After` longer than 5 minutes
+  is clipped to the cap with a one-line notice, so a hostile or broken platform
+  response cannot stall a run for hours. Waits within the cap are unchanged.
 
 ### Fixed
 

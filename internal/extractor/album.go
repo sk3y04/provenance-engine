@@ -292,7 +292,7 @@ func DownloadAlbum(ctx context.Context, rawURL, outDir, cookiesFile string, opts
 		failMu.Lock()
 		failed[id] = err.Error()
 		failMu.Unlock()
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] album download failed: %s: %v\n", id, err)
+		narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("album download failed: %s", id), "[provenance] album download failed: %s: %v\n", id, err)
 	}
 
 	for _, it := range items {
@@ -599,7 +599,7 @@ func albSigningDownloadURL(ctx context.Context, d *Deps, info *albFileInfo, rl *
 		return "", "", false
 	}
 	if status != http.StatusOK {
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[album] sign endpoint status %d: %s\n", status, sanitizeErrorBody(string(body)))
+		narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", status), "[album] sign endpoint status %d: %s\n", status, sanitizeErrorBody(string(body)))
 		return "", "", false
 	}
 	var sig struct {
@@ -647,7 +647,7 @@ func resolveFileViaAPI(ctx context.Context, d *Deps, info *albFileInfo, s *albRe
 			u, ref, ok, err := albAPIGet(ctx, d, cdn, suffix, info, s, rl)
 			if err != nil {
 				lastErr = err
-				narratef(ctx, kindInfo, reasonInfo, "", "", "[album] API %s%s failed: %v\n", cdn, suffix, err)
+				narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("API %s%s failed", cdn, suffix), "[album] API %s%s failed: %v\n", cdn, suffix, err)
 				continue
 			}
 			if !ok {
@@ -929,7 +929,9 @@ func albFetchHTML(ctx context.Context, d *Deps, rawURL, referer string, rl *rate
 			if attempt == albMaxAttempts {
 				return nil, fmt.Errorf("album request failed after %d attempts: %w", attempt, lastErr)
 			}
-			time.Sleep(albRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, albRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if resp.StatusCode >= 400 {
@@ -937,16 +939,20 @@ func albFetchHTML(ctx context.Context, d *Deps, rawURL, referer string, rl *rate
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("album status %d", resp.StatusCode)
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[album] response: %s\n", sanitizeErrorBody(body))
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", resp.StatusCode), "[album] response: %s\n", sanitizeErrorBody(body))
 			if resp.StatusCode == http.StatusTooManyRequests {
-				time.Sleep(albMaxRetryBackoff)
+				if err := sleepCtx(ctx, albMaxRetryBackoff); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 && attempt == albMaxAttempts {
 				return preview, lastErr
 			}
 			if resp.StatusCode >= 500 && attempt < albMaxAttempts {
-				time.Sleep(albRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, albRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			return preview, lastErr
@@ -998,7 +1004,9 @@ func albFetchJSON(ctx context.Context, d *Deps, rawURL, referer, origin string, 
 			if attempt == albMaxAttempts {
 				return nil, 0, fmt.Errorf("album api request failed after %d attempts: %w", attempt, lastErr)
 			}
-			time.Sleep(albRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, albRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, 0, err
+			}
 			continue
 		}
 		if resp.StatusCode >= 400 {
@@ -1006,16 +1014,20 @@ func albFetchJSON(ctx context.Context, d *Deps, rawURL, referer, origin string, 
 			_ = resp.Body.Close()
 			status := resp.StatusCode
 			lastErr = fmt.Errorf("album api status %d", status)
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[album] api response: %s\n", sanitizeErrorBody(string(preview)))
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", status), "[album] api response: %s\n", sanitizeErrorBody(string(preview)))
 			if status == http.StatusTooManyRequests {
-				time.Sleep(albMaxRetryBackoff)
+				if err := sleepCtx(ctx, albMaxRetryBackoff); err != nil {
+					return nil, 0, err
+				}
 				continue
 			}
 			if status >= 400 && status < 500 && attempt == albMaxAttempts {
 				return preview, status, lastErr
 			}
 			if status >= 500 && attempt < albMaxAttempts {
-				time.Sleep(albRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, albRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return nil, 0, err
+				}
 				continue
 			}
 			return preview, status, lastErr

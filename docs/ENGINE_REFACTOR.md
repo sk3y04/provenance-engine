@@ -828,8 +828,11 @@ status code) instead of a body preview.
 ### Context propagation
 
 `sleepCtx` replaced `time.Sleep` in every extractor retry and rate-limit backoff
-(Twitter, Twitter search, Reddit, Instagram), so cancellation reaches the backoff
-paths. Subprocess and HTTP paths already inherited the operation context.
+(Twitter, Twitter search, Reddit, Instagram, Album) and in the downloader's
+speed-limit wait, so cancellation reaches every backoff path. Server-supplied
+`Retry-After` values are capped at 5 minutes by the shared `retryAfterDelay`
+helper, with a `retry_after_capped` warning when the cap clips a value.
+Subprocess and HTTP paths already inherited the operation context.
 
 ### Workspace and artifact isolation
 

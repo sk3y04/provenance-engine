@@ -28,6 +28,7 @@ const (
 	ReasonPageResults      = "page_results"
 	ReasonFoundItems       = "found_items"
 	ReasonCapabilityRetry  = "capability_retry"
+	ReasonRetryAfterCapped = "retry_after_capped"
 
 	// Diagnostics that may only carry redacted facts.
 	ReasonResponseError     = "response_error"

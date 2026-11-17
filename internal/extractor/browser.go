@@ -620,7 +620,7 @@ func ScrapePlaylistVideoLinks(ctx context.Context, d *Deps, pageURL, cookiesFile
 		// Harvest video links from the current page.
 		hrefs, err := scrapeVideoHrefs()
 		if err != nil {
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] page %d scrape failed: %v\n", pageNum, err)
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("page %d scrape failed", pageNum), "[provenance] page %d scrape failed: %v\n", pageNum, err)
 			break
 		}
 		newVideos := 0
@@ -634,7 +634,7 @@ func ScrapePlaylistVideoLinks(ctx context.Context, d *Deps, pageURL, cookiesFile
 
 		fp, err := fingerprint()
 		if err != nil {
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] page %d fingerprint failed: %v\n", pageNum, err)
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("page %d fingerprint failed", pageNum), "[provenance] page %d fingerprint failed: %v\n", pageNum, err)
 			break
 		}
 		narrateOut(ctx, kindInfo, reasonInfo, "", "", "[provenance]   page %d: +%d videos (total: %d)\n", pageNum, newVideos, len(allVideos))
@@ -642,7 +642,7 @@ func ScrapePlaylistVideoLinks(ctx context.Context, d *Deps, pageURL, cookiesFile
 		// Try to advance to the next page.
 		clicked, err := clickNext()
 		if err != nil {
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] click next failed: %v\n", err)
+			narratef(ctx, kindInfo, reasonInfo, "", "click next failed", "[provenance] click next failed: %v\n", err)
 			break
 		}
 		if !clicked {
@@ -652,7 +652,7 @@ func ScrapePlaylistVideoLinks(ctx context.Context, d *Deps, pageURL, cookiesFile
 		// Wait for the DOM/URL to actually change.
 		newFp, err := waitForChange(fp)
 		if err != nil {
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] %v (stopping at page %d)\n", err, pageNum)
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("stopping at page %d", pageNum), "[provenance] %v (stopping at page %d)\n", err, pageNum)
 			break
 		}
 		if newFp == prevFingerprint {

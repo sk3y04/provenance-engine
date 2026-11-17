@@ -291,7 +291,7 @@ func (c *Client) Download(ctx context.Context, rawURL, dest, referer string) (er
 
 	reader := io.Reader(resp.Body)
 	if c.SpeedLimit > 0 {
-		reader = newLimitReader(resp.Body, c.SpeedLimit)
+		reader = newLimitReader(ctx, resp.Body, c.SpeedLimit)
 	}
 	reader = newContextReader(ctx, reader)
 	_, copyErr := io.Copy(io.MultiWriter(sinks...), reader)
@@ -351,6 +351,7 @@ func (t *progressTracker) flush() {
 }
 
 type limitReader struct {
+	ctx     context.Context
 	r       io.Reader
 	limit   int64
 	start   time.Time
@@ -358,8 +359,8 @@ type limitReader struct {
 	started bool
 }
 
-func newLimitReader(r io.Reader, limit int64) io.Reader {
-	return &limitReader{r: r, limit: limit}
+func newLimitReader(ctx context.Context, r io.Reader, limit int64) io.Reader {
+	return &limitReader{ctx: ctx, r: r, limit: limit}
 }
 
 func (r *limitReader) Read(p []byte) (int, error) {
@@ -372,7 +373,17 @@ func (r *limitReader) Read(p []byte) (int, error) {
 		r.read += int64(n)
 		expected := time.Duration(float64(r.read) / float64(r.limit) * float64(time.Second))
 		if sleep := time.Until(r.start.Add(expected)); sleep > 0 {
-			time.Sleep(sleep)
+			if r.ctx == nil {
+				time.Sleep(sleep)
+			} else {
+				timer := time.NewTimer(sleep)
+				select {
+				case <-r.ctx.Done():
+					timer.Stop()
+					return n, r.ctx.Err()
+				case <-timer.C:
+				}
+			}
 		}
 	}
 	return n, err

@@ -24,7 +24,6 @@ import (
 )
 
 const (
-	rdAPIBase           = "https://old.reddit.com"
 	rdAPIFallback       = "https://www.reddit.com"
 	rdPageSize          = 100
 	rdMaxAttempts       = 4
@@ -32,6 +31,10 @@ const (
 	rdRetryBackoff      = 3 * time.Second
 	rdMaxRetryBackoff   = 20 * time.Second
 )
+
+// rdAPIBase is overridable so tests can point the JSON API at an httptest
+// server without weakening production TLS or redirect safety.
+var rdAPIBase = "https://old.reddit.com"
 
 var rdUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -242,7 +245,9 @@ func fetchRdPage(ctx context.Context, d *Deps, cookiesFile string, target RdTarg
 			if attempt == rdMaxAttempts {
 				return nil, "", fmt.Errorf("reddit request failed after %d attempts: %w", attempt, lastErr)
 			}
-			time.Sleep(rdRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, rdRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, "", err
+			}
 			continue
 		}
 
@@ -251,16 +256,20 @@ func fetchRdPage(ctx context.Context, d *Deps, cookiesFile string, target RdTarg
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("reddit status %d", resp.StatusCode)
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[reddit] response: %s\n", sanitizeErrorBody(body))
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", resp.StatusCode), "[reddit] response: %s\n", sanitizeErrorBody(body))
 			if resp.StatusCode == http.StatusTooManyRequests {
-				time.Sleep(rdMaxRetryBackoff)
+				if err := sleepCtx(ctx, rdMaxRetryBackoff); err != nil {
+					return nil, "", err
+				}
 				continue
 			}
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 && attempt == rdMaxAttempts {
 				return nil, "", lastErr
 			}
 			if resp.StatusCode >= 500 && attempt < rdMaxAttempts {
-				time.Sleep(rdRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, rdRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return nil, "", err
+				}
 				continue
 			}
 			return nil, "", lastErr
@@ -607,7 +616,7 @@ func DownloadReddit(ctx context.Context, rawURL, outDir string, cookiesFile stri
 		failMu.Lock()
 		failed[url] = err.Error()
 		failMu.Unlock()
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] reddit download failed: %s: %v\n", url, err)
+		narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("reddit download failed: %s", url), "[provenance] reddit download failed: %s: %v\n", url, err)
 	}
 
 	for _, p := range posts {
@@ -810,7 +819,9 @@ func fetchRdComments(ctx context.Context, d *Deps, cookiesFile string, permalink
 			if attempt == rdMaxAttempts {
 				return nil, fmt.Errorf("reddit comments request failed after %d attempts: %w", attempt, lastErr)
 			}
-			time.Sleep(rdRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, rdRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, err
+			}
 			continue
 		}
 
@@ -818,12 +829,16 @@ func fetchRdComments(ctx context.Context, d *Deps, cookiesFile string, permalink
 			_ = resp.Body.Close()
 			lastErr = fmt.Errorf("reddit comments status %d", resp.StatusCode)
 			if resp.StatusCode == http.StatusTooManyRequests {
-				time.Sleep(rdMaxRetryBackoff)
+				if err := sleepCtx(ctx, rdMaxRetryBackoff); err != nil {
+					return nil, err
+				}
 			}
 			if attempt == rdMaxAttempts {
 				return nil, fmt.Errorf("reddit comments request failed after %d attempts: %w", attempt, lastErr)
 			}
-			time.Sleep(rdRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, rdRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, err
+			}
 			continue
 		}
 
@@ -834,7 +849,9 @@ func fetchRdComments(ctx context.Context, d *Deps, cookiesFile string, permalink
 			if attempt == rdMaxAttempts {
 				return nil, err
 			}
-			time.Sleep(rdRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, rdRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, err
+			}
 			continue
 		}
 

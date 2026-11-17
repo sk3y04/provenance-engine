@@ -366,11 +366,10 @@ func resolveTwUserID(ctx context.Context, d *Deps, cookiesFile, csrfToken, usern
 					break
 				}
 				if resp.StatusCode == http.StatusTooManyRequests {
-					delay := twRetryBackoff << min(attempt-1, 3)
-					if ra := resp.Header.Get("Retry-After"); ra != "" {
-						if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
-							delay = time.Duration(sec) * time.Second
-						}
+					delay, capped := retryAfterDelay(resp.Header.Get("Retry-After"), twRetryBackoff<<min(attempt-1, 3))
+					if capped {
+						narratef(ctx, kindWarn, event.ReasonRetryAfterCapped, "", fmt.Sprintf("retry-after capped to %s", delay),
+							"[twitter] Retry-After exceeds %s cap, waiting %v...\n", maxRetryAfter, delay)
 					}
 					narratef(ctx, event.KindRetry, event.ReasonRateLimited, "", fmt.Sprintf("attempt %d, waiting %s", attempt, delay),
 						"[twitter] rate limited (429), attempt %d, waiting %v...\n", attempt, delay)
@@ -703,7 +702,9 @@ func fetchTwMediaPage(ctx context.Context, d *Deps, cookiesFile, csrfToken, user
 				if attempt == twMaxAttempts {
 					return nil, "", fmt.Errorf("twitter request failed after %d attempts: %w", attempt, lastErr)
 				}
-				time.Sleep(twRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, twRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return nil, "", err
+				}
 				continue
 			}
 
@@ -718,23 +719,26 @@ func fetchTwMediaPage(ctx context.Context, d *Deps, cookiesFile, csrfToken, user
 					break
 				}
 				lastErr = fmt.Errorf("twitter status %d", staleCode)
-				narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] response: %s\n", sanitizeErrorBody(body))
+				narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", resp.StatusCode), "[twitter] response: %s\n", sanitizeErrorBody(body))
 				if resp.StatusCode == http.StatusTooManyRequests {
-					delay := twMaxRetryBackoff
-					if ra := resp.Header.Get("Retry-After"); ra != "" {
-						if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
-							delay = time.Duration(sec) * time.Second
-						}
+					delay, capped := retryAfterDelay(resp.Header.Get("Retry-After"), twMaxRetryBackoff)
+					if capped {
+						narratef(ctx, kindWarn, event.ReasonRetryAfterCapped, "", fmt.Sprintf("retry-after capped to %s", delay),
+							"[twitter] Retry-After exceeds %s cap, waiting %v...\n", maxRetryAfter, delay)
 					}
-					narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] rate limited (429), waiting %v...\n", delay)
-					time.Sleep(delay)
+					narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("waiting %s", delay), "[twitter] rate limited (429), waiting %v...\n", delay)
+					if err := sleepCtx(ctx, delay); err != nil {
+						return nil, "", err
+					}
 					continue
 				}
 				if resp.StatusCode >= 400 && resp.StatusCode < 500 && attempt == twMaxAttempts {
 					return nil, "", lastErr
 				}
 				if resp.StatusCode >= 500 && attempt < twMaxAttempts {
-					time.Sleep(twRetryBackoff << min(attempt-1, 3))
+					if err := sleepCtx(ctx, twRetryBackoff<<min(attempt-1, 3)); err != nil {
+						return nil, "", err
+					}
 					continue
 				}
 				return nil, "", lastErr
@@ -887,13 +891,12 @@ func fetchTwTweetByRestID(ctx context.Context, d *Deps, cookiesFile, csrfToken, 
 				}
 				lastErr = fmt.Errorf("twitter status %d", resp.StatusCode)
 				if resp.StatusCode == http.StatusTooManyRequests {
-					delay := twMaxRetryBackoff
-					if ra := resp.Header.Get("Retry-After"); ra != "" {
-						if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
-							delay = time.Duration(sec) * time.Second
-						}
+					delay, capped := retryAfterDelay(resp.Header.Get("Retry-After"), twMaxRetryBackoff)
+					if capped {
+						narratef(ctx, kindWarn, event.ReasonRetryAfterCapped, "", fmt.Sprintf("retry-after capped to %s", delay),
+							"[twitter] Retry-After exceeds %s cap, waiting %v...\n", maxRetryAfter, delay)
 					}
-					narratef(ctx, kindInfo, reasonInfo, "", "", "[twitter] rate limited (429), waiting %v...\n", delay)
+					narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("waiting %s", delay), "[twitter] rate limited (429), waiting %v...\n", delay)
 					if err := sleepCtx(ctx, delay); err != nil {
 						return twTweetResult{}, err
 					}
@@ -1255,7 +1258,7 @@ func DownloadTwitter(ctx context.Context, rawURL, outDir string, cookiesFile str
 		failMu.Lock()
 		failed[url] = err.Error()
 		failMu.Unlock()
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] twitter download failed: %s: %v\n", url, err)
+		narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("twitter download failed: %s", url), "[provenance] twitter download failed: %s: %v\n", url, err)
 	}
 
 	for _, p := range coll.Posts {

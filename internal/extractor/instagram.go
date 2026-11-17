@@ -358,7 +358,9 @@ func resolveIgUserID(ctx context.Context, d *Deps, cookiesFile, csrfToken, usern
 			if attempt == igMaxAttempts {
 				break
 			}
-			time.Sleep(igRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return "", err
+			}
 			continue
 		}
 
@@ -367,23 +369,26 @@ func resolveIgUserID(ctx context.Context, d *Deps, cookiesFile, csrfToken, usern
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("instagram status %d", resp.StatusCode)
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] response: %s\n", sanitizeErrorBody(body))
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", resp.StatusCode), "[instagram] response: %s\n", sanitizeErrorBody(body))
 			if resp.StatusCode == http.StatusTooManyRequests {
-				delay := igMaxRetryBackoff
-				if ra := resp.Header.Get("Retry-After"); ra != "" {
-					if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
-						delay = time.Duration(sec) * time.Second
-					}
+				delay, capped := retryAfterDelay(resp.Header.Get("Retry-After"), igMaxRetryBackoff)
+				if capped {
+					narratef(ctx, kindWarn, event.ReasonRetryAfterCapped, "", fmt.Sprintf("retry-after capped to %s", delay),
+						"[instagram] Retry-After exceeds %s cap, waiting %v...\n", maxRetryAfter, delay)
 				}
-				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited (429), waiting %v...\n", delay)
-				time.Sleep(delay)
+				narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("waiting %s", delay), "[instagram] rate limited (429), waiting %v...\n", delay)
+				if err := sleepCtx(ctx, delay); err != nil {
+					return "", err
+				}
 				continue
 			}
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 && attempt == igMaxAttempts {
 				break
 			}
 			if resp.StatusCode >= 500 && attempt < igMaxAttempts {
-				time.Sleep(igRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return "", err
+				}
 				continue
 			}
 			break
@@ -404,20 +409,20 @@ func resolveIgUserID(ctx context.Context, d *Deps, cookiesFile, csrfToken, usern
 			userID = result.Data.User.ID
 		}
 		if userID == "" {
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web_profile_info returned empty user id, response: %s\n", sanitizeErrorBody(string(respBody[:min(len(respBody), 512)])))
+			narratef(ctx, kindInfo, reasonInfo, "", "empty user id", "[instagram] web_profile_info returned empty user id, response: %s\n", sanitizeErrorBody(string(respBody[:min(len(respBody), 512)])))
 			lastErr = fmt.Errorf("instagram: user not found: %s", username)
 			break
 		}
 		return userID, nil
 	}
 
-	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] api lookup failed (%v), trying web scrape ...\n", lastErr)
+	narratef(ctx, kindInfo, reasonInfo, "", "api lookup failed, trying web scrape", "[instagram] api lookup failed (%v), trying web scrape ...\n", lastErr)
 
 	if userID, err := resolveIgUserIDFromWeb(ctx, d, cookiesFile, username); err == nil {
 		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] resolved user @%s -> %s via web scrape\n", username, userID)
 		return userID, nil
 	} else {
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web scrape failed: %v\n", err)
+		narratef(ctx, kindInfo, reasonInfo, "", "web scrape failed", "[instagram] web scrape failed: %v\n", err)
 	}
 
 	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] trying www api host ...\n")
@@ -426,7 +431,7 @@ func resolveIgUserID(ctx context.Context, d *Deps, cookiesFile, csrfToken, usern
 		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] resolved user @%s -> %s via www api\n", username, userID)
 		return userID, nil
 	} else {
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] www api failed: %v\n", err)
+		narratef(ctx, kindInfo, reasonInfo, "", "www api failed", "[instagram] www api failed: %v\n", err)
 	}
 
 	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] trying json endpoint ...\n")
@@ -435,7 +440,7 @@ func resolveIgUserID(ctx context.Context, d *Deps, cookiesFile, csrfToken, usern
 		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] resolved user @%s -> %s via json endpoint\n", username, userID)
 		return userID, nil
 	} else {
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] json endpoint failed: %v\n", err)
+		narratef(ctx, kindInfo, reasonInfo, "", "json endpoint failed", "[instagram] json endpoint failed: %v\n", err)
 	}
 
 	narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] trying users/search ...\n")
@@ -444,7 +449,7 @@ func resolveIgUserID(ctx context.Context, d *Deps, cookiesFile, csrfToken, usern
 		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] resolved user @%s -> %s via users/search\n", username, userID)
 		return userID, nil
 	} else {
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] users/search failed: %v\n", err)
+		narratef(ctx, kindInfo, reasonInfo, "", "users/search failed", "[instagram] users/search failed: %v\n", err)
 	}
 
 	return "", fmt.Errorf("resolve user id: all methods failed; api: %w", lastErr)
@@ -649,9 +654,9 @@ func resolveIgUserIDFromWeb(ctx context.Context, d *Deps, cookiesFile, username 
 	}
 
 	if strings.Contains(html, `"native_client_redesign"`) || strings.Contains(html, `"entry_data"`) {
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web scrape: page structure looks like profile but no ID patterns matched, preview:\n%s\n", sanitizeErrorBody(html[:min(len(html), 1024)]))
+		narratef(ctx, kindInfo, reasonInfo, "", "profile id patterns not matched", "[instagram] web scrape: page structure looks like profile but no ID patterns matched, preview:\n%s\n", sanitizeErrorBody(html[:min(len(html), 1024)]))
 	} else {
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] web scrape: page does not look like a profile page (possibly login/challenge wall), preview:\n%s\n", sanitizeErrorBody(html[:min(len(html), 1024)]))
+		narratef(ctx, kindInfo, reasonInfo, "", "not a profile page", "[instagram] web scrape: page does not look like a profile page (possibly login/challenge wall), preview:\n%s\n", sanitizeErrorBody(html[:min(len(html), 1024)]))
 	}
 
 	return "", fmt.Errorf("could not find user id in profile page html")
@@ -881,7 +886,7 @@ func fetchIgMediaPage(ctx context.Context, d *Deps, cookiesFile, csrfToken, user
 		if i == len(igAPIHosts)-1 || !igSessionRejected(err) {
 			return nil, "", err
 		}
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
+		narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("%s rejected the session, trying %s", base, igAPIHosts[i+1]), "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
 	}
 	return nil, "", lastErr
 }
@@ -920,7 +925,9 @@ func fetchIgMediaPageHost(ctx context.Context, d *Deps, cookiesFile, csrfToken, 
 			if attempt == igMaxAttempts {
 				return nil, "", fmt.Errorf("instagram request failed after %d attempts: %w", attempt, lastErr)
 			}
-			time.Sleep(igRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, "", err
+			}
 			continue
 		}
 
@@ -929,24 +936,27 @@ func fetchIgMediaPageHost(ctx context.Context, d *Deps, cookiesFile, csrfToken, 
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("instagram status %d", resp.StatusCode)
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] response: %s\n", sanitizeErrorBody(body))
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", resp.StatusCode), "[instagram] response: %s\n", sanitizeErrorBody(body))
 			igNoteLoginState(ctx, base, body)
 			if resp.StatusCode == http.StatusTooManyRequests {
-				delay := igMaxRetryBackoff
-				if ra := resp.Header.Get("Retry-After"); ra != "" {
-					if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
-						delay = time.Duration(sec) * time.Second
-					}
+				delay, capped := retryAfterDelay(resp.Header.Get("Retry-After"), igMaxRetryBackoff)
+				if capped {
+					narratef(ctx, kindWarn, event.ReasonRetryAfterCapped, "", fmt.Sprintf("retry-after capped to %s", delay),
+						"[instagram] Retry-After exceeds %s cap, waiting %v...\n", maxRetryAfter, delay)
 				}
-				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited (429), waiting %v...\n", delay)
-				time.Sleep(delay)
+				narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("waiting %s", delay), "[instagram] rate limited (429), waiting %v...\n", delay)
+				if err := sleepCtx(ctx, delay); err != nil {
+					return nil, "", err
+				}
 				continue
 			}
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 && attempt == igMaxAttempts {
 				return nil, "", lastErr
 			}
 			if resp.StatusCode >= 500 && attempt < igMaxAttempts {
-				time.Sleep(igRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return nil, "", err
+				}
 				continue
 			}
 			return nil, "", lastErr
@@ -963,7 +973,9 @@ func fetchIgMediaPageHost(ctx context.Context, d *Deps, cookiesFile, csrfToken, 
 			if attempt == igMaxAttempts {
 				return nil, "", lastErr
 			}
-			time.Sleep(igRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, "", err
+			}
 			continue
 		}
 		var result igFeedResponse
@@ -991,7 +1003,7 @@ func FetchAllIgPosts(ctx context.Context, d *Deps, cookiesFile, csrfToken, userI
 			}
 			return posts, nil
 		}
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] profile page fallback failed: %v\n", err)
+		narratef(ctx, kindInfo, reasonInfo, "", "profile page fallback failed", "[instagram] profile page fallback failed: %v\n", err)
 	}
 
 	var all []igFeedMedia
@@ -1039,13 +1051,13 @@ func fetchSingleIgPost(ctx context.Context, d *Deps, cookiesFile, csrfToken, sho
 		if i == len(igAPIHosts)-1 || !igSessionRejected(err) {
 			break
 		}
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
+		narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("%s rejected the session, trying %s", base, igAPIHosts[i+1]), "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
 	}
 	if post, err := fetchIgPostFromWeb(ctx, d, cookiesFile, shortcode); err == nil {
 		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] fetched post %s from the post page\n", shortcode)
 		return post, nil
 	} else {
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] post page fallback failed: %v\n", err)
+		narratef(ctx, kindInfo, reasonInfo, "", "post page fallback failed", "[instagram] post page fallback failed: %v\n", err)
 	}
 	return nil, lastErr
 }
@@ -1079,7 +1091,9 @@ func fetchSingleIgPostHost(ctx context.Context, d *Deps, cookiesFile, csrfToken 
 			if attempt == igMaxAttempts {
 				return nil, fmt.Errorf("instagram request failed after %d attempts: %w", attempt, lastErr)
 			}
-			time.Sleep(igRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, err
+			}
 			continue
 		}
 
@@ -1088,24 +1102,27 @@ func fetchSingleIgPostHost(ctx context.Context, d *Deps, cookiesFile, csrfToken 
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("instagram status %d", resp.StatusCode)
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] response: %s\n", sanitizeErrorBody(body))
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", resp.StatusCode), "[instagram] response: %s\n", sanitizeErrorBody(body))
 			igNoteLoginState(ctx, base, body)
 			if resp.StatusCode == http.StatusTooManyRequests {
-				delay := igMaxRetryBackoff
-				if ra := resp.Header.Get("Retry-After"); ra != "" {
-					if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
-						delay = time.Duration(sec) * time.Second
-					}
+				delay, capped := retryAfterDelay(resp.Header.Get("Retry-After"), igMaxRetryBackoff)
+				if capped {
+					narratef(ctx, kindWarn, event.ReasonRetryAfterCapped, "", fmt.Sprintf("retry-after capped to %s", delay),
+						"[instagram] Retry-After exceeds %s cap, waiting %v...\n", maxRetryAfter, delay)
 				}
-				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited (429), waiting %v...\n", delay)
-				time.Sleep(delay)
+				narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("waiting %s", delay), "[instagram] rate limited (429), waiting %v...\n", delay)
+				if err := sleepCtx(ctx, delay); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 && attempt == igMaxAttempts {
 				return nil, lastErr
 			}
 			if resp.StatusCode >= 500 && attempt < igMaxAttempts {
-				time.Sleep(igRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			return nil, lastErr
@@ -1136,7 +1153,7 @@ func fetchIgStories(ctx context.Context, d *Deps, cookiesFile, csrfToken, userID
 		if i == len(igAPIHosts)-1 || !igSessionRejected(err) {
 			return nil, err
 		}
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
+		narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("%s rejected the session, trying %s", base, igAPIHosts[i+1]), "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
 	}
 	return nil, lastErr
 }
@@ -1172,7 +1189,9 @@ func fetchIgStoriesHost(ctx context.Context, d *Deps, cookiesFile, csrfToken, us
 			if attempt == igMaxAttempts {
 				return nil, fmt.Errorf("instagram stories request failed after %d attempts: %w", attempt, lastErr)
 			}
-			time.Sleep(igRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, err
+			}
 			continue
 		}
 
@@ -1181,24 +1200,27 @@ func fetchIgStoriesHost(ctx context.Context, d *Deps, cookiesFile, csrfToken, us
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("instagram stories status %d", resp.StatusCode)
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] response: %s\n", sanitizeErrorBody(body))
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", resp.StatusCode), "[instagram] response: %s\n", sanitizeErrorBody(body))
 			igNoteLoginState(ctx, base, body)
 			if resp.StatusCode == http.StatusTooManyRequests {
-				delay := igMaxRetryBackoff
-				if ra := resp.Header.Get("Retry-After"); ra != "" {
-					if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
-						delay = time.Duration(sec) * time.Second
-					}
+				delay, capped := retryAfterDelay(resp.Header.Get("Retry-After"), igMaxRetryBackoff)
+				if capped {
+					narratef(ctx, kindWarn, event.ReasonRetryAfterCapped, "", fmt.Sprintf("retry-after capped to %s", delay),
+						"[instagram] Retry-After exceeds %s cap, waiting %v...\n", maxRetryAfter, delay)
 				}
-				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited (429), waiting %v...\n", delay)
-				time.Sleep(delay)
+				narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("waiting %s", delay), "[instagram] rate limited (429), waiting %v...\n", delay)
+				if err := sleepCtx(ctx, delay); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 && attempt == igMaxAttempts {
 				return nil, lastErr
 			}
 			if resp.StatusCode >= 500 && attempt < igMaxAttempts {
-				time.Sleep(igRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			return nil, lastErr
@@ -1295,7 +1317,7 @@ func fetchIgHighlightStories(ctx context.Context, d *Deps, cookiesFile, csrfToke
 		if i == len(igAPIHosts)-1 || !igSessionRejected(err) {
 			return nil, "", err
 		}
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
+		narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("%s rejected the session, trying %s", base, igAPIHosts[i+1]), "[instagram] %s rejected the session (%v), trying %s ...\n", base, err, igAPIHosts[i+1])
 	}
 	return nil, "", lastErr
 }
@@ -1332,7 +1354,9 @@ func fetchIgHighlightStoriesHost(ctx context.Context, d *Deps, cookiesFile, csrf
 			if attempt == igMaxAttempts {
 				return nil, "", fmt.Errorf("instagram highlight request failed after %d attempts: %w", attempt, lastErr)
 			}
-			time.Sleep(igRetryBackoff << min(attempt-1, 3))
+			if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+				return nil, "", err
+			}
 			continue
 		}
 
@@ -1341,24 +1365,27 @@ func fetchIgHighlightStoriesHost(ctx context.Context, d *Deps, cookiesFile, csrf
 			_ = resp.Body.Close()
 			body := string(preview)
 			lastErr = fmt.Errorf("instagram highlight status %d", resp.StatusCode)
-			narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] response: %s\n", sanitizeErrorBody(body))
+			narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("status %d", resp.StatusCode), "[instagram] response: %s\n", sanitizeErrorBody(body))
 			igNoteLoginState(ctx, base, body)
 			if resp.StatusCode == http.StatusTooManyRequests {
-				delay := igMaxRetryBackoff
-				if ra := resp.Header.Get("Retry-After"); ra != "" {
-					if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
-						delay = time.Duration(sec) * time.Second
-					}
+				delay, capped := retryAfterDelay(resp.Header.Get("Retry-After"), igMaxRetryBackoff)
+				if capped {
+					narratef(ctx, kindWarn, event.ReasonRetryAfterCapped, "", fmt.Sprintf("retry-after capped to %s", delay),
+						"[instagram] Retry-After exceeds %s cap, waiting %v...\n", maxRetryAfter, delay)
 				}
-				narratef(ctx, kindInfo, reasonInfo, "", "", "[instagram] rate limited (429), waiting %v...\n", delay)
-				time.Sleep(delay)
+				narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("waiting %s", delay), "[instagram] rate limited (429), waiting %v...\n", delay)
+				if err := sleepCtx(ctx, delay); err != nil {
+					return nil, "", err
+				}
 				continue
 			}
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 && attempt == igMaxAttempts {
 				return nil, "", lastErr
 			}
 			if resp.StatusCode >= 500 && attempt < igMaxAttempts {
-				time.Sleep(igRetryBackoff << min(attempt-1, 3))
+				if err := sleepCtx(ctx, igRetryBackoff<<min(attempt-1, 3)); err != nil {
+					return nil, "", err
+				}
 				continue
 			}
 			return nil, "", lastErr
@@ -1829,7 +1856,7 @@ func DownloadInstagram(ctx context.Context, rawURL, outDir string, cookiesFile s
 		failMu.Lock()
 		failed[id] = err.Error()
 		failMu.Unlock()
-		narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] instagram download failed: %s: %v\n", id, err)
+		narratef(ctx, kindInfo, reasonInfo, "", fmt.Sprintf("instagram download failed: %s", id), "[provenance] instagram download failed: %s: %v\n", id, err)
 	}
 
 	for _, p := range posts {
