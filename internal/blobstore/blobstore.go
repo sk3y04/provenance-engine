@@ -51,29 +51,35 @@ func (s *Store) Put(srcPath string) (string, error) {
 	}
 	defer func() { _ = src.Close() }()
 
-	tmp := dst + ".tmp"
-	dstf, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	// A unique temp file per attempt: concurrent Puts of the same content
+	// must never share (or delete) each other's in-progress file.
+	tmpf, err := os.CreateTemp(filepath.Dir(dst), hash+".tmp-*")
 	if err != nil {
-		if os.IsExist(err) {
-			if _, statErr := os.Stat(dst); statErr == nil {
-				return hash, ErrExists
-			}
-			_ = os.Remove(tmp)
-			dstf, err = os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
-		}
-		if err != nil {
-			return "", fmt.Errorf("create blob: %w", err)
-		}
+		return "", fmt.Errorf("create blob: %w", err)
 	}
+	tmp := tmpf.Name()
 
-	if _, err := io.Copy(dstf, src); err != nil {
-		_ = dstf.Close()
+	// Re-hash while copying so a source that changes between the initial
+	// hash and the copy can never store content under the wrong address.
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmpf, h), src); err != nil {
+		_ = tmpf.Close()
 		_ = os.Remove(tmp)
 		return "", fmt.Errorf("copy blob: %w", err)
 	}
-	_ = dstf.Close()
+	if err := tmpf.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("close blob: %w", err)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != hash {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("source changed during put: expected hash %s, copied content hashes to %s", hash, got)
+	}
 
+	// If a concurrent Put already stored the same hash, the rename replaces
+	// it with byte-identical content, which is harmless.
 	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
 		return "", fmt.Errorf("rename blob: %w", err)
 	}
 
@@ -114,13 +120,28 @@ func (s *Store) List() ([]string, error) {
 			continue
 		}
 		for _, sub := range subEntries {
-			if sub.IsDir() {
+			if sub.IsDir() || !isBlobName(sub.Name()) {
 				continue
 			}
 			hashes = append(hashes, sub.Name())
 		}
 	}
 	return hashes, nil
+}
+
+// isBlobName reports whether name is a lowercase sha256 hex digest, so List
+// (and the garbage collector built on it) ignores in-progress temp files and
+// other stray entries.
+func isBlobName(name string) bool {
+	if len(name) != 64 {
+		return false
+	}
+	for _, c := range name {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func fileHash(path string) (string, error) {

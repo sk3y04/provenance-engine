@@ -158,6 +158,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Blob store is safe under concurrent Puts**: parallel stores of identical
+  content shared one deterministic `.tmp` path, and the loser deleted the
+  winner's in-progress file — potentially renaming a partially written blob
+  into place under the wrong hash. Each attempt now uses a unique temp file,
+  re-hashes the content while copying (so a source mutated mid-put can never
+  be stored under a stale address), and `List` ignores temp/stray entries so
+  garbage collection cannot delete an in-progress write. Covered by a
+  concurrent-put race test and a List-filtering test.
 - **`encode --remove-original` verifies the output first**: an ffmpeg exit 0
   with a missing or empty output file is now reported as a failed encode, so
   the source is never deleted on a phantom success. Successful-encode tests
