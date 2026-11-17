@@ -22,6 +22,7 @@ type fakeRunner struct {
 	ffprobeOut string // stdout for ffprobe r_frame_rate
 	encodeErr  error  // returned for encoding runs (nil = success)
 	logText    string // written to the log/stderr writer for encoding runs
+	noOutput   bool   // exit 0 without writing the output file
 }
 
 type fakeCall struct {
@@ -45,6 +46,13 @@ func (f *fakeRunner) Run(_ context.Context, bin string, _ []string, stdout, stde
 	// encoding run: tee log text, then honor the configured error.
 	if f.logText != "" && stderr != nil {
 		_, _ = io.WriteString(stderr, f.logText)
+	}
+	if f.encodeErr == nil && len(args) > 0 && !f.noOutput {
+		// Mimic ffmpeg: a successful run leaves a non-empty output file at
+		// the final argument.
+		if err := os.WriteFile(args[len(args)-1], []byte("encoded"), 0o644); err != nil {
+			return err
+		}
 	}
 	return f.encodeErr
 }
@@ -255,6 +263,28 @@ func TestRunRemoveOriginalNotOnFailure(t *testing.T) {
 	}
 	if _, statErr := os.Stat(in); statErr != nil {
 		t.Fatalf("original %s must survive a failed encode: %v", in, statErr)
+	}
+}
+
+// TestRunRemoveOriginalRequiresOutput proves an ffmpeg exit 0 without a usable
+// output is a failure, so --remove-original never deletes the source on a
+// phantom success.
+func TestRunRemoveOriginalRequiresOutput(t *testing.T) {
+	stubBinaries(t)
+	dir := t.TempDir()
+	in := filepath.Join(dir, "a.mp4")
+	mkfile(t, dir, "a.mp4")
+
+	fake := &fakeRunner{probeOut: qsvAvailable(), ffprobeOut: "24", noOutput: true}
+	res, err := Run(context.Background(), Options{Dir: dir, Encoder: "qsv", Quality: 30, RemoveOriginal: true}, fake)
+	if err == nil {
+		t.Fatal("expected a failure when the output file is missing")
+	}
+	if res.Failed != 1 || res.Succeeded != 0 {
+		t.Fatalf("result = %#v, want 1 failed / 0 succeeded", res)
+	}
+	if _, statErr := os.Stat(in); statErr != nil {
+		t.Fatalf("original %s must survive a phantom success: %v", in, statErr)
 	}
 }
 

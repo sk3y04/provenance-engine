@@ -158,6 +158,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`encode --remove-original` verifies the output first**: an ffmpeg exit 0
+  with a missing or empty output file is now reported as a failed encode, so
+  the source is never deleted on a phantom success. Successful-encode tests
+  now exercise a faithful fake that writes the output file.
 - **Downloader resume edge cases**: a zero-byte `.part` left by an interrupted
   attempt no longer blocks every future download of the destination (`O_EXCL`
   became `O_TRUNC` for fresh starts). A 416 "range not satisfiable" response no

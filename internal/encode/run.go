@@ -266,6 +266,16 @@ func runOne(ctx context.Context, ffmpeg string, runner CommandRunner, enc Encode
 	if err := enc.Run(ctx, ffmpeg, runner, io.Discard, job, false); err != nil {
 		return fmt.Errorf("ffmpeg: %w", err)
 	}
+	// ffmpeg can exit 0 without a usable output. Never report success — and
+	// never let --remove-original delete the source — on a missing or empty
+	// file.
+	fi, err := os.Stat(job.Output)
+	if err != nil {
+		return fmt.Errorf("output missing after encode: %w", err)
+	}
+	if fi.Size() == 0 {
+		return fmt.Errorf("output is empty after encode: %s", job.Output)
+	}
 	return nil
 }
 
