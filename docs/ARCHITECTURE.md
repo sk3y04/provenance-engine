@@ -122,9 +122,9 @@ The resolved path preserves raw platform metadata (`json.RawMessage`) for downst
    - Videos: highest-bitrate variant from `video_info.variants[]`
    - GIFs: MP4 variant at original quality
 
-Query IDs are loaded from environment variables (`TWITTER_QUERY_*`) or hardcoded defaults. If a request returns a "query ID not found" error, the IDs are refreshed by scraping the X.com web client JS.
+Query IDs are discovered from the X web-client JS (env overrides `TWITTER_QUERY_*`); the single-post `TweetResultByRestId` id has no hard-coded fallback. Stale-query responses trigger one invalidate/refresh/retry. Profile timelines use `UserTweets`; single status URLs resolve through `TweetResultByRestId` (exactly one post); hashtag media search uses the authenticated `SearchTimeline` POST operation (`x:#tag` sources).
 
-Rate limiting: respects `Retry-After` headers on 429 responses. Uses `ratelimit.Manager` for preemptive throttling (2 req/s).
+Rate limiting: respects `Retry-After` headers on 429 responses (capped at 5 minutes). Uses `ratelimit.Manager` for preemptive throttling (2 req/s).
 
 ### Reddit extractor details
 
@@ -139,13 +139,15 @@ Rate limiting: 1 req/s.
 
 ### Instagram extractor details
 
-1. **URL parsing**: `ParseIgURL()` supports profile (`/username`), post (`/p/SHORTCODE`), and reel (`/reel/SHORTCODE`, `/reels/SHORTCODE`) URLs →
-2. **Username resolution**: `users/web_profile_info/?username=X` API endpoint →
-3. **Post fetching**: Single posts via `media/{media_id}/info/`, profiles via `feed/user/{user_id}/` with `max_id` cursor pagination (12 per page) →
+1. **URL parsing**: `ParseIgURL()` supports profile (`/username`), post (`/p/SHORTCODE`), reel (`/reel/SHORTCODE`, `/reels/SHORTCODE`), stories (`/stories/USERNAME`), and story highlight (`/stories/highlights/ID`) URLs →
+2. **Username resolution**: `users/web_profile_info/?username=X` API endpoint, with a multi-method cascade (web page scraping, `?__a=1&__d=1`, `users/search`) →
+3. **Post fetching**: Single posts via `media/{media_id}/info/`, profiles via `feed/user/{user_id}/` with `max_id` cursor pagination (12 per page), stories/highlights via `feed/reels_media/` →
 4. **Media extraction**: Based on `media_type`:
    - Type 1 (image): highest-resolution candidate from `image_versions2.candidates[]`
    - Type 2 (video): highest-resolution variant from `video_versions[]` (sorted by height, then width)
    - Type 8 (carousel): recurse into `carousel_media[]` for each slide
+
+When the private API hosts reject a browser session, profile and post fetches fall back to the data Instagram server-renders into the navigation response (embedded Relay feed / post media info). API hosts cascade (`i.instagram.com` → `www.instagram.com/api/v1`) on session rejection; cookies are filtered to applicable domains before sending.
 
 Shortcode-to-ID conversion uses base-64 encoding with Instagram's alphabet. The `sessionid` cookie is mandatory for all API requests; `csrftoken` cookie provides the `X-CSRFToken` header.
 
@@ -155,7 +157,10 @@ Rate limiting: 1 req/s, burst 2.
 
 ## Persistence Model
 
-All persistent state uses JSON files. No database.
+CLI-local state (sessions, watches, history, collections) uses JSON files with
+atomic writes. The archive vault's catalog can additionally live in PostgreSQL
+(`PROVENANCE_DATABASE_URL`, see `internal/catalog`); the filesystem vault
+(blobs + revision manifests) needs no database.
 
 | Data | Default Path | Env Override |
 |------|-------------|-------------|
@@ -185,7 +190,9 @@ Archiving consumes existing capture manifests (`.provenance/`), verifies SHA-256
 Sessions use **optimistic concurrency control**:
 - Each save increments `Version`.
 - Before writing, the on-disk JSON is read and its version compared.
-- If versions differ, `ErrConcurrentModification` is returned.
+- If versions differ, `ErrConcurrentModification` is returned; the store
+  reloads the disk state, **re-applies the pending mutation**, and retries, so
+  a conflict never silently drops a status transition.
 - Writes are atomic: data is written to `{name}.json.tmp`, then renamed to `{name}.json`.
 
 ### URL archive format
@@ -238,7 +245,11 @@ Pool.SubmitWithHooks(job, onSuccess, onFinalFailure)
 | `instagram.com`, `cdninstagram.com` | 1/s | 2 | API rate limits are strict |
 | default | 10/s | 10 | yt-dlp and generic hosts are more tolerant |
 
-Each extractor's HTTP client calls `limiter.Wait(ctx)` before making requests. Twitter additionally respects `Retry-After` headers on 429 responses.
+Each extractor's HTTP client calls `limiter.Wait(ctx)` before making requests.
+All native extractors respect `Retry-After` headers on 429 responses, capped at
+5 minutes by the shared `retryAfterDelay` helper (an over-cap value emits a
+`retry_after_capped` warning). Every retry and backoff wait is cancellable via
+`sleepCtx`, so a canceled operation stops instead of waiting out a delay.
 
 ---
 
@@ -246,9 +257,10 @@ Each extractor's HTTP client calls `limiter.Wait(ctx)` before making requests. T
 
 `internal/downloader/downloader.go` provides a resumable HTTP downloader:
 
-- **Resume**: Checks for an existing `.part` file; sends `Range: bytes={size}-` to resume. If the server doesn't support range requests, falls back to full download.
-- **Speed limit**: Token bucket limiting `SpeedLimit` bytes/sec.
+- **Resume**: Checks for an existing `.part` file; sends `Range: bytes={size}-` to resume. If the server doesn't support range requests, falls back to full download. A zero-byte `.part` never blocks a fresh start, and a 416 response recovers a complete `.part` into place when the server's `Content-Range` total confirms it (instead of deleting it).
+- **Speed limit**: `SpeedLimit` bytes/sec, enforced by a context-aware wait so cancellation aborts mid-throttle.
 - **Progress**: Reports progress via `ProgressReporter` interface (structured callbacks for TUI) or falls back to `schollz/progressbar` (CLI).
+- **SSRF guards**: private-network IP literals are refused up front, `SafeRedirect` blocks redirects into private ranges, and `NewDialer`'s dial control refuses private addresses at connect time (also used by the extractors' shared transport).
 - **TLS fingerprinting**: Optional uTLS transport (`internal/downloader/utls_transport.go`) mimics Chrome's TLS ClientHello to bypass CDNs that reject Go's default handshake. Uses `github.com/refraction-networking/utls`.
 
 ---
@@ -329,25 +341,25 @@ Public importable facade (`github.com/sk3y04/provenance-engine/engine`). Exposes
 `Config` struct with all user-configurable download options. JSON-serializable for session/watch/history persistence.
 
 ### `encode`
-Hardware-accelerated AV1 transcode. `Options` holds every `provenance encode` flag as a dedicated struct (kept separate from `config.Config` since the encoder has no download/session semantics). Resolves a hardware backend (Intel QuickSync `av1_qsv`, AMD AMF `av1_amf`, NVIDIA NVENC `av1_nvenc`, or `auto` probing `ffmpeg -encoders`), translates a canonical QSV `global_quality` scale (1..51) onto each backend's native flag (AMF `cq_quality`, NVENC `crf`), builds the ffmpeg invocation (Matroska container, audio/subtitle + metadata copy, per-device GOP/lookahead/b-frame flags), and fans the batch out over one `worker.Pool` per device. `Discover` probes available codecs, maps `--preset` per backend, and detects per-file fps via ffprobe.
+Hardware-accelerated AV1 transcode. `Options` holds every `provenance encode` flag as a dedicated struct (kept separate from `config.Config` since the encoder has no download/session semantics). Resolves a hardware backend (Intel QuickSync `av1_qsv`, AMD AMF `av1_amf`, NVIDIA NVENC `av1_nvenc`, or `auto` probing `ffmpeg -encoders`), translates a canonical QSV `global_quality` scale (1..51) onto each backend's native flag (AMF `cq_quality`, NVENC `crf`), builds the ffmpeg invocation (Matroska container, audio/subtitle + metadata copy, per-device GOP/lookahead/b-frame flags), and fans the batch out over one `worker.Pool` per device. `Discover` probes available codecs, maps `--preset` per backend, auto-detects vendor-matched render nodes, and detects per-file fps via ffprobe. Outputs land in place by default; `--remove-original` deletes a source only after its encode succeeds **and** the output is verified non-empty. Narration is transport-neutral via `Options.Events`.
 
 ### `dispatcher`
 URL classification, routing, batch dispatch, browser fallback orchestration, URL archives, link cache persistence, and the `Options`/`Reporter` types that glue the system together.
 
-### `extractor` 
-Five extractors: `ytdlp.go`, `twitter.go`, `reddit.go`, `instagram.go`, `browser.go`, plus `helpers.go`.
+### `extractor`
+Native and tool-backed extractors: `ytdlp.go`, `twitter.go` (+ `twitter_search.go` hashtag search, `twitter_source.go` URL classification, `twitter_single` support via `TweetResultByRestId`), `reddit.go`, `instagram.go` (profiles, posts, reels, stories, highlights, server-rendered page fallback), `album.go`, `browser.go`, plus `helpers.go`. `deps.go` owns the per-engine dependencies (HTTP client, query-ID cache, tool paths) and the shared concurrency-safe transport; `emit.go`/`events.go` provide the transport-neutral narration (`narrate`, `sleepCtx`, `retryAfterDelay`) and event-backed progress adapters.
 
 ### `downloader`
-Resumable HTTP client with uTLS transport (`utls_transport.go`). Computes SHA-256 hash during download, stored in `Client.LastHash` and `Client.LastPath` on success.
+Resumable HTTP client with uTLS transport (`utls_transport.go`), private-network SSRF guards (`NewDialer`, `SafeRedirect`), and magic-byte media sniffing (`sniff.go`). Computes SHA-256 during download; `Client.LastHash`/`LastPath` report the result on every completion path.
 
 ### `session`
-Named resumable session persistence with optimistic concurrency, atomic writes, and `Reporter` interface implementation.
+Named resumable session persistence with optimistic concurrency, atomic writes, conflict reload that re-applies pending transitions, and `Reporter` interface implementation.
 
 ### `watch`
-Recurring watch subscription persistence.
+Recurring watch subscription persistence. Runs record `last_run_at`, `last_run_duration`, and `last_run_status`; a run left `running` by a crash is recovered as `interrupted` before the next run starts.
 
 ### `history`
-Download history persistence (last 25 runs).
+Download history persistence (last 25 runs), shared by CLI grab, watch runs, and collection sync.
 
 ### `manifest`
 Scan result types (`Manifest`, `Item`, `Summary`), filter options, size/CSV parsing, human-readable display. Used internally for discovery, filtering, and TUI display. Also provides `CaptureManifest` and `CaptureItem` types for post-download provenance records with SHA-256 verification, plus `.provenance/` filesystem I/O.
@@ -359,7 +371,7 @@ Shared result types (`Source`, `Item`, `MediaAsset`, `TextContent`) that all ext
 Domain model for the opt-in durable vault: `ArchiveCollection`, `Source`, `Revision`, `Entity`, `Artifact`, `Document`, `Relation`. `IngestCaptureManifest` consumes capture manifests, verifies SHA-256, copies files to the content-addressed blob store, and builds immutable revision records.
 
 ### `blobstore`
-SHA-256 content-addressed filesystem storage. Files stored as `blobs/sha256/<first-2-hex>/<full-hex>`. Deduplication via hash collision  -  identical content is stored only once. Atomic writes via `.tmp` → rename.
+SHA-256 content-addressed filesystem storage. Files stored as `blobs/sha256/<first-2-hex>/<full-hex>`. Deduplication via content hash — identical content is stored only once. Concurrent-safe: each Put uses a unique temp file, re-hashes content while copying, and renames atomically; `List` ignores temp/stray entries so GC never deletes an in-progress write.
 
 ### `catalog`
 Persistence for archive collections. `CatalogStore` interface with JSON (filesystem) and PostgreSQL (`PgStore`) adapters. PostgreSQL adapter provides transactional revision inserts and GIN-indexed `tsvector` full-text search via `plainto_tsquery`/`ts_rank`/`ts_headline`. Schema managed by embedded SQL migration. Global store set via `SetStore()` and accessed via `Store()`.
@@ -368,6 +380,11 @@ Persistence for archive collections. `CatalogStore` interface with JSON (filesys
 Stable archive citations with multi-format output. `Reference` struct with `Markdown()`, `Plain()`, `ToJSON()` formatters, `FromEntity()` constructor. URI format: `provenance://<collection>@<revision>#<entity>`. Includes title, author, URL, capture date, and SHA-256 in formatted output.
 
 ### `collection`
+Named source subscriptions with incremental sync: seen-ID dedup, per-collection options, sync results, and optional capture recording for the vault.
+
+### `importers`
+Technical knowledge importers for the vault: `ImportGit` (shallow clone in its own process group, killed as a group on cancellation), `ImportPDF`, `ImportDocs` (bounded HTTP crawl), `ImportOpenAPI`, and `ImportWeb` (headless Chrome capture). Every importer takes the operation context; narration is event-driven with legacy CLI text preserved when no sink is set.
+
 ### `worker`
 Bounded goroutine pool with 3-retry exponential backoff and permanent-error semantics.
 
@@ -377,5 +394,26 @@ Per-domain rate limiter factory.
 ### `diagnose`
 Pattern-matches error strings to produce actionable hints.
 
-### `tui` 
-Bubble Tea terminal UI across 10 files. Full details in [`docs/TUI.md`](TUI.md).
+### `event`
+Presentation-neutral structured events (`Event`, `Kind`, `Stage`, `Counts`), the `Sink` contract, context-carried sinks (`WithSink`/`SinkFrom`), stable reason codes (`reasons.go`), and the bounded, panic-recovering `Notifier` so a slow or foreign sink can never stall or cancel extraction.
+
+### `engineerr`
+Internal categorized errors (validation, authentication_required, unsupported_source, rate_limited, temporary, canceled, external_tool, permanent). Cancellation is never re-categorized; the facade maps these kinds to its public `*engine.Error`.
+
+### `render`
+CLI event renderer: the only place terminal formatting of structured events lives.
+
+### `redact`
+Bounds and normalizes event `Detail`, strips cookie/authorization/bearer/token/session fragments, and drops URL query strings/fragments so events never carry secrets or raw platform bodies.
+
+### `workspace`
+Operation-scoped output tracking: records what existed before an operation and reports only files it created, excluding bookkeeping directories and `.part` partials; `IsolatedWorkspace` gives concurrent jobs separate subdirectories.
+
+### `capability`
+Side-effect-free probe for yt-dlp, ffmpeg, ffprobe, and Chrome (including go-ytdlp's versioned cache binaries). Never installs tools or mutates the filesystem; backs `engine.Capabilities` and `provenance doctor`.
+
+### `doctor`
+Read-only prerequisite checks (tools, cookies file, cache dir, archive database) with a plain-table report and non-zero exit on required-check failure.
+
+### `tui`
+Bubble Tea terminal UI. Consumes engine events through `teaSink` (no process-global stream mutation) and runs vault/sync/import operations on the model's root context. Full details in [`docs/TUI.md`](TUI.md).
