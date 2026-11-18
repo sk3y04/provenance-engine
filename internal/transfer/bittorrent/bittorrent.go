@@ -65,6 +65,12 @@ const (
 	pollInterval = 100 * time.Millisecond
 
 	defaultMetadataTimeout = 2 * time.Minute
+
+	// finalizeGrace is how long verified pieces may sit unfinished before the
+	// adapter reports a finalization failure instead of waiting. Promotion runs
+	// synchronously when a piece is marked complete, so this only absorbs the
+	// gap between that and the next poll.
+	finalizeGrace = 2 * time.Second
 )
 
 // Sentinel errors. Callers (and tests) can match them with errors.Is.
@@ -81,6 +87,11 @@ var (
 	// job verified. The attestation is dropped and the existing re-verify-and-
 	// repair path takes over; it is never captured as-is.
 	ErrStagedPayloadInvalid = errors.New("staged payload no longer matches the verified job")
+	// ErrStorageFailure means the storage backend refused a piece write. The
+	// library's default handler logs it and silently stops downloading, so the
+	// adapter records the first error and fails the transfer with it instead of
+	// leaving the caller to hit a timeout with no cause.
+	ErrStorageFailure = errors.New("torrent storage write failed")
 	// ErrStagingBusy means another Session owns the staging root. It is
 	// retryable: nothing in this job was read or written, and the caller can
 	// try again once the owner exits (or releases the root by closing its
@@ -535,6 +546,34 @@ type opened struct {
 	byPath      map[string]*at.File
 	staging     string
 	stagingRoot string
+
+	// errMu guards writeErr, which records the first storage write failure the
+	// library reports asynchronously. It is read from the completion poll loop
+	// and written from a library goroutine.
+	errMu    sync.Mutex
+	writeErr error
+}
+
+// noteStorageError records the first storage write failure. Installing this
+// handler replaces the library default, which logs and disables data download
+// without telling the caller: a failed write would otherwise look like a
+// transfer that never finishes.
+func (o *opened) noteStorageError(err error) {
+	if err == nil {
+		return
+	}
+	o.errMu.Lock()
+	if o.writeErr == nil {
+		o.writeErr = err
+	}
+	o.errMu.Unlock()
+}
+
+// storageError returns the recorded write failure, if any.
+func (o *opened) storageError() error {
+	o.errMu.Lock()
+	defer o.errMu.Unlock()
+	return o.writeErr
 }
 
 // Fetch downloads exactly the selected files and returns verified assets.
@@ -890,6 +929,9 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 		staging:     s.staging,
 		stagingRoot: stagingRoot,
 	}
+	// Chunk writes cannot happen before admission enables transfer, so the
+	// handler is installed before any write can be attempted.
+	t.SetOnWriteChunkError(o.noteStorageError)
 	return o, nil
 }
 
@@ -1037,9 +1079,29 @@ func (o *opened) hasRetainedData() bool {
 func (s *Session) waitComplete(ctx context.Context, o *opened, selected []validatedFile) error {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	var settledSince time.Time
 	for {
+		if err := o.storageError(); err != nil {
+			o.t.DisallowDataDownload()
+			return fmt.Errorf("%w: %v", ErrStorageFailure, err)
+		}
 		if o.allSelectedComplete(selected) {
 			return nil
+		}
+		if o.selectedPiecesSettled(selected) {
+			// Verified pieces that never reach their final names mean the
+			// storage layer failed to promote a part file. The library only logs
+			// that, so report it rather than wait for the transfer deadline.
+			if settledSince.IsZero() {
+				settledSince = time.Now()
+			} else if time.Since(settledSince) > finalizeGrace {
+				sf := selected[0]
+				_, ferr := o.finalizedPath(sf.rel)
+				return fmt.Errorf("%w: %s: pieces are complete but the file was never finalized: %v",
+					ErrNotFinalized, sf.rel, ferr)
+			}
+		} else {
+			settledSince = time.Time{}
 		}
 		s.report(o, selected)
 		select {
@@ -1057,6 +1119,23 @@ func (s *Session) waitComplete(ctx context.Context, o *opened, selected []valida
 // Pieces, not bytes, are the unit of verification: BytesCompleted can reach
 // the file length before the covering piece has been hashed.
 func (o *opened) allSelectedComplete(selected []validatedFile) bool {
+	if !o.selectedPiecesSettled(selected) {
+		return false
+	}
+	for _, sf := range selected {
+		if _, err := o.finalizedPath(sf.rel); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// selectedPiecesSettled reports whether every piece covering a selected file is
+// complete, hashed and not being re-marked. It deliberately says nothing about
+// finalization: a storage backend can hold verified pieces in part files it
+// never managed to promote, and that needs a different diagnosis than "still
+// downloading".
+func (o *opened) selectedPiecesSettled(selected []validatedFile) bool {
 	for _, sf := range selected {
 		if sf.file.BytesCompleted() != sf.file.Length() {
 			return false
@@ -1066,9 +1145,6 @@ func (o *opened) allSelectedComplete(selected []validatedFile) bool {
 			if !st.Complete || st.Marking || st.Hashing || st.QueuedForHash {
 				return false
 			}
-		}
-		if _, err := o.finalizedPath(sf.rel); err != nil {
-			return false
 		}
 	}
 	return true

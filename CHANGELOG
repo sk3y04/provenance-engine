@@ -5,7 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+### Fixed
+
+- **A failed piece write is now a diagnosable error, not a silent stall**: the
+  adapter installs `SetOnWriteChunkError` after admission and records the first
+  failure, so `Fetch` returns `ErrStorageFailure` with the cause instead of
+  inheriting the library default, which only logs and silently disables data
+  download. Previously such a job waited for the caller's deadline and reported
+  `ErrTransferTimeout` with no explanation.
+- **A failed part-file promotion is reported instead of waited out**: when every
+  covering piece is complete and idle but the final file never appears (the
+  library logs `error marking piece complete` and marks the piece complete
+  anyway), `Fetch` now fails with `ErrNotFinalized` — "pieces are complete but
+  the file was never finalized" — after a two-second grace, rather than sitting
+  until the transfer deadline.
 
 ### Added
 

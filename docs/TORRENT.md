@@ -180,9 +180,12 @@ Verified against the pinned `v1.62.0` source, and reproduced by
   priorities can be raised by other paths, so both `DisallowDataDownload` and
   `DisallowDataUpload` are set from creation.
 - The library's default file backend joins metainfo components with
-  `filepath.Join` and **does not sanitise them**; `storage.ToSafeFilePath` is
-  used only by the mmap backend. Confinement is therefore ours: validation runs
-  before storage exists, and every write path is symlink-checked at admission.
+  `filepath.Join`, rejects a result that escapes the torrent directory
+  (`isSubFilepath`, checked at storage open), but does not sanitise names and
+  does not look through symlinks; `storage.ToSafeFilePath` is used only by the
+  mmap backend. Confinement is therefore ours: validation runs before storage
+  exists, every write path is symlink-checked at admission, and the library's
+  own escape check is a second line rather than the first.
 
 **Limitations, stated rather than papered over:** the symlink check is a check,
 not an atomic guarantee — a process that can write inside the staging root while
@@ -482,6 +485,50 @@ Residual windows this slice does **not** close:
 - The job record holds the immutable selection; re-running with a different
   selection is refused (`ErrSelectionLocked`).
 
+### Corrupt retained data
+
+Corruption is detected at the piece, not at the file. A selected file that
+shares a piece with an unselected neighbour is the interesting case: damaging
+bytes anywhere in that piece invalidates it, so the file's length and the cached
+piece-completion record both still look fine while the bytes are not. The next
+run re-hashes every retained piece, marks the damaged piece incomplete, and
+re-fetches exactly that piece; the intact pieces are reused. Capture hashes the
+finalized file again, so damaged bytes never reach a capture item even if some
+earlier check were wrong.
+
+Measured behaviour (`TestSharedPieceCorruptionIsRepairedNotCaptured`): a 48 KiB
+selected file plus a 16 KiB neighbour at 32 KiB pieces, with four bytes damaged
+in the shared piece, repairs by reading at most two pieces from the peer —
+strictly less than the 64 KiB payload — and then reconciles to the same capture
+key, so the historical run manifest is neither duplicated nor rewritten.
+
+With no peer the attempt is bounded by the caller's context: it fails with
+`ErrTransferTimeout`, publishes no run manifest, leaves the payload state
+`pending` rather than `ready`, and leaves the historical capture record
+byte-identical (`TestUnrepairableCorruptionPublishesNothing`).
+
+### Storage failures are not silent
+
+Two library behaviours shape what the adapter can report:
+
+- A failed **chunk write** goes to `Torrent.onWriteChunkError`. The library's
+  default handler logs it and disables data download, so a caller sees a
+  transfer that simply never finishes. The adapter installs its own handler
+  (`SetOnWriteChunkError` after admission, before any write can happen),
+  records the first error, stops the transfer and fails with
+  `ErrStorageFailure` wrapping the cause.
+- A failed **part-file promotion** (`MarkComplete` → rename) is only logged
+  (`error marking piece complete`), and the piece is still marked complete in
+  memory. The observable state is: every covering piece complete and idle, but
+  the final file never appears. The adapter distinguishes this from "still
+  downloading" and reports `ErrNotFinalized` — "pieces are complete but the file
+  was never finalized" — after `finalizeGrace` (2 s), instead of waiting for the
+  transfer deadline.
+
+Both are tested with a storage double that fails writes / refuses to promote,
+which is a deterministic stand-in for a full disk or a read-only mount — not an
+OS error test. Removing the fault and retrying publishes exactly one capture.
+
 ## Limits
 
 | Knob | Default | Where |
@@ -533,6 +580,7 @@ tracker. Covered:
 | `ownership_test.go` | second session on the same root is busy, busy sessions write nothing, symlink/`.` spellings are the same owner, independent roots run concurrently, concurrent Fetch on one Session is serialized, closed sessions refuse work, ownership survives `--seed` |
 | `ownership_process_test.go` (real processes) | barrier: a competing process gets the busy error and writes nothing, then exactly one manifest after the owner exits; SIGKILL of the owner releases the lock and the job reconciles; a seeding owner stays exclusive and releases on cancel; different torrents in one root are excluded; independent roots proceed concurrently |
 | `status_test.go` | deterministic list order, projection of a recorded job, empty root creates nothing, unreadable records reported with a reason (corrupt JSON, unsupported format, mismatched file name), lookup by id/bare infohash/case-insensitive, path-like ids rejected before any filesystem access, missing root not created, v1 record readable and byte-identical afterwards, secrets never projected or echoed, unsafe record paths rejected, 300 atomic replacements observed only as complete old/new records |
+| `corruption_test.go` | shared-piece corruption with real persisted state (same length, completion DB untouched): repaired by re-fetching at most the damaged piece (measured bytes), captured hash matches the fixture, one run manifest, reconciled; no-peer attempt is bounded, publishes nothing and leaves the historical capture byte-identical; injected chunk-write failure → `ErrStorageFailure`; injected failed promotion → `ErrNotFinalized` after the grace, nothing published; cancellation during verification and during finalization publishes nothing, closes cleanly and hands ownership to the next run |
 | `inspect_test.go` | local `.torrent` inspected with a client-construction counter stuck at 0; magnet inspection resolves metadata while the seeder reports 0 payload bytes and 0 chunks written; no temp dir survives; inspection leaves an existing staging root byte-identical; rejection before storage open for unknown selection, path collision and symlinked payload path (storage spy count 0), and exactly one open on the admitted path; metadata timeout and cancellation clean up; v2/hybrid refused for inspect and fetch |
 | `ownership_process_test.go` → `TestInspectDoesNotNeedStagingOwnership` | a separate process inspects a magnet while another process owns the staging root, writes nothing there, and does not disturb ownership |
 | `status_process_test.go` (real CLI, real processes) | `torrent status` against a root owned by a seeding process returns promptly with the recorded capture, leaves the tree unchanged, and does not disturb ownership (a competing fetch is still busy); after `SIGKILL` of that owner, status reports the last recorded state as recorded while a lock file still exists, and a later fetch acquires the root and reconciles |
