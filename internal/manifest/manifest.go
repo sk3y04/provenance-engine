@@ -4,6 +4,7 @@ package manifest
 import (
 	"fmt"
 	"io"
+	"math"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -234,7 +235,17 @@ func ParseSize(s string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return int64(v * float64(mul)), nil
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("size %q must not be negative", s)
+	}
+	bytes := v * float64(mul)
+	if bytes > math.MaxInt64 {
+		return 0, fmt.Errorf("size %q is too large", s)
+	}
+	return int64(bytes), nil
 }
 
 func HumanSize(n int64) string {

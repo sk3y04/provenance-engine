@@ -21,6 +21,22 @@ func TestParseSize(t *testing.T) {
 	}
 }
 
+// TestParseSizeRejectsInvalidValues proves hostile or nonsensical sizes are
+// rejected instead of silently converting to a wrapped/negative byte count.
+func TestParseSizeRejectsInvalidValues(t *testing.T) {
+	for _, input := range []string{
+		"-5mb",
+		"nan",
+		"inf",
+		"1e30gb", // overflows int64
+		"10lightyears",
+	} {
+		if got, err := ParseSize(input); err == nil {
+			t.Errorf("ParseSize(%q) = %d, want an error", input, got)
+		}
+	}
+}
+
 func TestFilterItems(t *testing.T) {
 	items := []Item{
 		{URL: "https://x/a.mp4", Title: "bonus video", Filename: "a.mp4", Size: 100},

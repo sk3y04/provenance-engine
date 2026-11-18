@@ -164,6 +164,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Invalid `--min-size`/`--max-size` values are rejected**: `manifest.ParseSize`
+  silently converted `NaN`, `Inf`, negative values, and sizes that overflow
+  int64 into wrapped/negative byte counts, producing nonsensical filters. These
+  now return a clear error instead.
 - **Extractor routing uses exact domains, not substrings**: `dispatcher.Classify`
   and the platform URL parsers matched hosts with `strings.Contains`, so
   lookalikes (`instagram.com.evil.net`, `notx.com`, `x.com.evil.net`,
