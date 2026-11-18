@@ -672,6 +672,27 @@ func batchYtOpts(d *extractor.Deps, opts Options, archivePath string) extractor.
 	}
 }
 
+// splitBatchURLs routes batch URLs: native-extractor hosts (and URLs that
+// fail classification, so the error gets typed at the Dispatch boundary)
+// take the slow full-Dispatch path; everything else takes the yt-dlp fast
+// path. Order within each group is preserved.
+func splitBatchURLs(urls []string) (fast, slow []string) {
+	for _, u := range urls {
+		site, err := Classify(u)
+		if err != nil {
+			slow = append(slow, u)
+			continue
+		}
+		switch site {
+		case SiteTwitter, SiteReddit, SiteInstagram, SiteAlbum:
+			slow = append(slow, u)
+		default:
+			fast = append(fast, u)
+		}
+	}
+	return fast, slow
+}
+
 // BatchDispatch reads URLs (one per line, blanks/# comments allowed) from
 // `path` and downloads each in parallel using opts.Concurrency. It uses the
 // same fast path as the playlist crawler: each URL is sent straight to yt-dlp.
@@ -707,20 +728,7 @@ func BatchDispatch(ctx context.Context, path string, opts Options) error {
 	// Decide per URL: yt-dlp-friendly hosts (anything that classifies as
 	// SiteGeneric or SitePatreon) go straight to RunYtdlp in the worker pool.
 	// URLs with custom extractors still need the full Dispatch path.
-	var fast, slow []string
-	for _, u := range urls {
-		site, err := Classify(u)
-		if err != nil {
-			slow = append(slow, u)
-			continue
-		}
-		switch site {
-		case SiteTwitter, SiteReddit, SiteInstagram, SiteAlbum:
-			slow = append(slow, u)
-		default:
-			fast = append(fast, u)
-		}
-	}
+	fast, slow := splitBatchURLs(urls)
 
 	var firstErr error
 	if len(fast) > 0 {
