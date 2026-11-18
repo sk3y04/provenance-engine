@@ -2,6 +2,7 @@ package event
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -111,4 +112,62 @@ func TestNotifierCloseIdempotentAndDropsAfterClose(t *testing.T) {
 	n.Close()
 	n.Close()
 	n.Emit(context.Background(), Event{Kind: KindProgress})
+}
+
+// TestNotifierCloseTwiceWithBlockedSinkLeavesNoWaiters covers the shutdown
+// path engine.Download uses (an explicit Close plus a deferred one) against a
+// sink that violates the best-effort contract and blocks. Both Close calls
+// must return within the grace bound, and while the sink stays blocked only
+// the single delivery goroutine may remain — Close must not leave waiter
+// goroutines behind that accumulate across operations.
+func TestNotifierCloseTwiceWithBlockedSinkLeavesNoWaiters(t *testing.T) {
+	base := runtime.NumGoroutine()
+	entered := make(chan struct{}, 1)
+	block := make(chan struct{})
+	n := NewNotifier(Func(func(context.Context, Event) {
+		entered <- struct{}{}
+		<-block
+	}), 4)
+	n.Emit(context.Background(), Event{Kind: KindProgress})
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("delivery never started")
+	}
+
+	for i := 0; i < 2; i++ {
+		done := make(chan struct{})
+		go func() {
+			n.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(closeGrace + 2*time.Second):
+			t.Fatalf("Close %d stalled on a blocked sink", i)
+		}
+	}
+
+	// The sink is still blocked: only the delivery goroutine may remain.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := runtime.NumGoroutine()
+		if got <= base+1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Close left waiter goroutines behind: have %d, want <= %d", got, base+1)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Once the sink unblocks, delivery finishes and every goroutine exits.
+	close(block)
+	deadline = time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > base {
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines leaked after unblock: have %d, want <= %d", runtime.NumGoroutine(), base)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }

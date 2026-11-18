@@ -158,7 +158,7 @@ type Notifier struct {
 	ch   chan Event
 	quit chan struct{}
 	once sync.Once
-	wg   sync.WaitGroup
+	done chan struct{} // closed when the delivery goroutine exits
 }
 
 // NewNotifier starts a notifier around sink. A nil sink becomes Nop. A
@@ -174,14 +174,14 @@ func NewNotifier(sink Sink, buffer int) *Notifier {
 		sink: sink,
 		ch:   make(chan Event, buffer),
 		quit: make(chan struct{}),
+		done: make(chan struct{}),
 	}
-	n.wg.Add(1)
 	go n.run()
 	return n
 }
 
 func (n *Notifier) run() {
-	defer n.wg.Done()
+	defer close(n.done)
 	for {
 		select {
 		case <-n.quit:
@@ -229,16 +229,14 @@ const closeGrace = time.Second
 
 // Close stops delivery and drains queued events. It is safe to call multiple
 // times and safe to call concurrently with Emit. Delivery is bounded by
-// closeGrace so a slow or blocked sink cannot stall the caller.
+// closeGrace so a slow or blocked sink cannot stall the caller. Close waits on
+// the delivery goroutine's done channel directly; it never spawns waiter
+// goroutines, so a permanently blocked sink cannot accumulate them across
+// repeated Close calls.
 func (n *Notifier) Close() {
 	n.once.Do(func() { close(n.quit) })
-	done := make(chan struct{})
-	go func() {
-		n.wg.Wait()
-		close(done)
-	}()
 	select {
-	case <-done:
+	case <-n.done:
 	case <-time.After(closeGrace):
 	}
 }
