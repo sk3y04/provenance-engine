@@ -1,6 +1,10 @@
 package manifest
 
-import "testing"
+import (
+	"math"
+	"strconv"
+	"testing"
+)
 
 func TestParseSize(t *testing.T) {
 	cases := map[string]int64{
@@ -24,16 +28,39 @@ func TestParseSize(t *testing.T) {
 // TestParseSizeRejectsInvalidValues proves hostile or nonsensical sizes are
 // rejected instead of silently converting to a wrapped/negative byte count.
 func TestParseSizeRejectsInvalidValues(t *testing.T) {
+	// Boundary strings are computed, never hand-typed: 2^63 is exactly the
+	// first unrepresentable int64, and float64(math.MaxInt64) rounds up to
+	// it, so a strict ">" guard lets it through and int64(bytes) wraps.
+	two63 := strconv.FormatUint(1<<63, 10)
 	for _, input := range []string{
 		"-5mb",
 		"nan",
 		"inf",
 		"1e30gb", // overflows int64
 		"10lightyears",
+		two63,
+		two63 + "b",
+		strconv.FormatInt(1<<33, 10) + "gb", // 2^33 GiB = 2^63 bytes
+		strconv.FormatInt(1<<53, 10) + "kb", // 2^53 KiB = 2^63 bytes
 	} {
 		if got, err := ParseSize(input); err == nil {
 			t.Errorf("ParseSize(%q) = %d, want an error", input, got)
 		}
+	}
+}
+
+// TestParseSizeAcceptsLargestRepresentable pins the largest float64 below
+// 2^63 so the overflow guard does not over-reject valid sizes.
+func TestParseSizeAcceptsLargestRepresentable(t *testing.T) {
+	// float64 spacing just below 2^63 is 1024, so 2^63-1024 is the largest
+	// representable value that still fits in int64.
+	maxRepresentable := int64(math.MaxInt64) - 1023
+	got, err := ParseSize(strconv.FormatInt(maxRepresentable, 10))
+	if err != nil {
+		t.Fatalf("ParseSize largest representable: %v", err)
+	}
+	if got != maxRepresentable {
+		t.Fatalf("ParseSize = %d, want %d", got, maxRepresentable)
 	}
 }
 

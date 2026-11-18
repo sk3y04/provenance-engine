@@ -242,7 +242,10 @@ func ParseSize(s string) (int64, error) {
 		return 0, fmt.Errorf("size %q must not be negative", s)
 	}
 	bytes := v * float64(mul)
-	if bytes > math.MaxInt64 {
+	// float64(math.MaxInt64) rounds up to 2^63, so the guard must reject
+	// equality too: 2^63 itself is not a valid int64 and int64(bytes) would
+	// wrap to a negative size. The largest accepted float64 is 2^63-1024.
+	if bytes >= 1<<63 {
 		return 0, fmt.Errorf("size %q is too large", s)
 	}
 	return int64(bytes), nil
