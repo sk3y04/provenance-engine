@@ -34,6 +34,7 @@ import (
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 	"github.com/sk3y04/provenance-engine/internal/session"
 	"github.com/sk3y04/provenance-engine/internal/tui"
+	"github.com/sk3y04/provenance-engine/internal/version"
 	"github.com/sk3y04/provenance-engine/internal/watch"
 )
 
@@ -105,7 +106,7 @@ func main() {
 
 	root := &cobra.Command{
 		Use:     "provenance",
-		Version: "0.8.0",
+		Version: version.Version,
 		Short:   "provenance - universal media collector, source archive, and knowledge vault",
 		Long: `provenance is a single-binary tool for collecting, preserving, searching, and citing
 digital content — media, social posts, documentation, Git repos, and more.

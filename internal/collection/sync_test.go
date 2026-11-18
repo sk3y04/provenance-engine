@@ -10,6 +10,7 @@ import (
 	"github.com/sk3y04/provenance-engine/internal/config"
 	"github.com/sk3y04/provenance-engine/internal/dispatcher"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/version"
 )
 
 func TestPartitionNewItemsSkipsSeenHashtagPosts(t *testing.T) {
@@ -200,6 +201,30 @@ func TestSyncDryRunDoesNotMarkSeen(t *testing.T) {
 	}
 	if len(c.SeenIDs) != 0 {
 		t.Fatalf("dry-run marked items seen: %v", c.SeenIDs)
+	}
+}
+
+func TestRecordCaptureStampsCurrentVersion(t *testing.T) {
+	dir := t.TempDir()
+	c := Collection{
+		Name:    "feed",
+		URL:     "https://example.com/feed",
+		Site:    "generic",
+		Options: config.Config{OutputDir: dir},
+	}
+	if err := recordCapture(c, "sess-test", map[string]manifest.Item{}); err != nil {
+		t.Fatalf("recordCapture: %v", err)
+	}
+	runs, err := manifest.ListRunManifests(dir)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("run manifests = %v (err=%v), want exactly 1", runs, err)
+	}
+	cm, err := manifest.ReadCaptureManifest(runs[0])
+	if err != nil {
+		t.Fatalf("read capture manifest: %v", err)
+	}
+	if cm.ToolVersion != version.Version {
+		t.Errorf("capture ToolVersion = %q, want %q", cm.ToolVersion, version.Version)
 	}
 }
 

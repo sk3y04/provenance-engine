@@ -14,6 +14,7 @@ import (
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/ratelimit"
 	"github.com/sk3y04/provenance-engine/internal/session"
+	"github.com/sk3y04/provenance-engine/internal/version"
 )
 
 type SyncOptions struct {
@@ -217,7 +218,7 @@ func recordCapture(c Collection, sessName string, urlToItem map[string]manifest.
 		DownloadedAt: time.Now().UTC(),
 		OutputDir:    c.Options.OutputDir,
 		Tool:         "provenance",
-		ToolVersion:  "0.7.0",
+		ToolVersion:  version.Version,
 		Options:      config.CaptureOptionsFromConfig(c.Options),
 	}
 

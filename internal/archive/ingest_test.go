@@ -11,6 +11,7 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/blobstore"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/version"
 )
 
 // writeCaptureFixture builds an output dir containing the given files
@@ -56,6 +57,32 @@ func ingestOpts(t *testing.T) IngestOptions {
 		CollectionName: "test",
 		Source:         Source{Kind: SourceCollection, Reference: "test"},
 		Tool:           "provenance",
+	}
+}
+
+// TestIngestStampsToolVersion: revisions must carry the running tool version
+// even when the caller leaves ToolVersion empty (CLI and TUI do), and an
+// explicit caller-provided version must be preserved.
+func TestIngestStampsToolVersion(t *testing.T) {
+	cm, _ := writeCaptureFixture(t, map[string]string{"a.jpg": "x"})
+
+	opts := ingestOpts(t)
+	rev, err := IngestCaptureManifest(blobstore.New(opts.VaultRoot), opts, cm)
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if rev.ToolVersion != version.Version {
+		t.Errorf("ToolVersion = %q, want default %q", rev.ToolVersion, version.Version)
+	}
+
+	opts2 := ingestOpts(t)
+	opts2.ToolVersion = "custom-1.2"
+	rev2, err := IngestCaptureManifest(blobstore.New(opts2.VaultRoot), opts2, cm)
+	if err != nil {
+		t.Fatalf("ingest explicit: %v", err)
+	}
+	if rev2.ToolVersion != "custom-1.2" {
+		t.Errorf("ToolVersion = %q, want explicit custom-1.2", rev2.ToolVersion)
 	}
 }
 

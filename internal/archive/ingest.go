@@ -14,6 +14,7 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/blobstore"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/version"
 )
 
 type IngestOptions struct {
@@ -26,11 +27,15 @@ type IngestOptions struct {
 
 func IngestCaptureManifest(bs *blobstore.Store, opts IngestOptions, cm *manifest.CaptureManifest) (*Revision, error) {
 	outputDir := cm.OutputDir
+	toolVersion := opts.ToolVersion
+	if toolVersion == "" {
+		toolVersion = version.Version
+	}
 	rev := &Revision{
 		CapturedAt:  time.Now().UTC(),
 		Source:      opts.Source,
 		Tool:        opts.Tool,
-		ToolVersion: opts.ToolVersion,
+		ToolVersion: toolVersion,
 	}
 
 	artMap := make(map[string]Artifact)
