@@ -86,9 +86,12 @@ tag (then `go mod tidy` is safe again).
 - The CHANGELOG already consumed `0.1.0` through `0.6.1` and the CLI reports
   `0.7.0`, so the first engine release is **`v0.7.0`**, continuing the existing
   sequence rather than restarting at `v0.1.0`.
-- The CLI's `--version` string is hardcoded (`0.8.0` in `cmd/provenance/main.go`)
-  and is kept in step with each release tag; alternatively inject the version
-  via `-ldflags`.
+- The CLI's `--version` comes from `internal/version.Version` (default
+  `0.8.0`). Release builds stamp it via `-ldflags -X …version.Version=<tag
+  without the leading v>` — both `.github/workflows/release.yml` and `make
+  release-dry-run` do this, and `make build` stamps `git describe` output.
+  Bump the default in `internal/version/version.go` in step with each release
+  tag so unstamp builds still report the right release.
 - The rename from `github.com/sk3y04/provenance` is a breaking import-path
   change; it is recorded in `CHANGELOG` and `docs/MIGRATION.md` and must be
   called out in the release notes.

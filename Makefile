@@ -3,6 +3,10 @@
 # Version stamped into release artifact names. Falls back to "dev" outside a
 # tagged checkout; the release workflow passes the pushed tag.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# Binary version stamp: the same value without the leading "v", injected into
+# internal/version so `provenance --version` matches the release tag.
+RELEASE_VERSION := $(patsubst v%,%,$(VERSION))
+LDFLAGS := -X github.com/sk3y04/provenance-engine/internal/version.Version=$(RELEASE_VERSION)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 DIST := dist
 
@@ -19,7 +23,7 @@ fmt:
 	gofmt -l .
 
 build:
-	go build -o provenance ./cmd/provenance/
+	go build -ldflags "$(LDFLAGS)" -o provenance ./cmd/provenance/
 
 # Compile the standalone external-consumer module that imports the public
 # engine facade. It resolves the parent module through the repository go.work,
@@ -38,7 +42,7 @@ release-dry-run:
 		ext=""; [ "$$os" = "windows" ] && ext=".exe"; \
 		out="$(DIST)/provenance_$(VERSION)_$${os}_$${arch}$$ext"; \
 		echo "building $$out"; \
-		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -o "$$out" ./cmd/provenance || exit 1; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" -o "$$out" ./cmd/provenance || exit 1; \
 	done
 	@cd $(DIST) && (sha256sum * > checksums.txt 2>/dev/null || shasum -a 256 * > checksums.txt)
 	@echo "release artifacts written to $(DIST)/"

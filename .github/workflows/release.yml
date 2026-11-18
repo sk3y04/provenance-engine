@@ -68,7 +68,9 @@ jobs:
             [[ "${goos}" == "windows" ]] && ext=".exe"
             out="dist/provenance_${VERSION}_${goos}_${goarch}${ext}"
             echo "building ${out}"
-            GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -o "${out}" ./cmd/provenance
+            GOOS="${goos}" GOARCH="${goarch}" go build -trimpath \
+              -ldflags "-X github.com/sk3y04/provenance-engine/internal/version.Version=${VERSION#v}" \
+              -o "${out}" ./cmd/provenance
           done
           (cd dist && sha256sum * > checksums.txt)
           ls -l dist
