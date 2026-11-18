@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Selective BitTorrent fetch (`provenance torrent`)**: new
+  `internal/transfer/bittorrent` adapter around `github.com/anacrolix/torrent`
+  pinned at `v1.62.0` (MPL-2.0; chosen because it is the first stable tag with
+  the bencode depth-limit fix for GHSA-2wrx-84qj-4pcg). `torrent inspect` lists
+  the files in a v1 magnet or local `.torrent`; `torrent fetch --select PATH`
+  downloads only those files, re-verifies retained pieces on resume, and writes
+  a capture manifest through the existing `internal/manifest` path so
+  `manifest verify` and `archive import` work unchanged. Metainfo paths are
+  treated as hostile (traversal, absolute, separators, reserved device names,
+  colliding and symlinked paths reject the whole torrent); no whole-torrent
+  download flag exists; uploads while fetching are enabled and seeding after
+  completion is opt-in via `--seed`. Adds no RPC, aria2 compatibility, UI, or
+  archive schema change. See `docs/TORRENT.md`.
+
 - **Encode is transport-neutral (`encode.Options.Events`)**: the encode batch
   now narrates through the shared event system — a start stage, one config
   info line, one `item_done` per file (failures carry the error), a terminal

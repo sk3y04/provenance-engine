@@ -43,6 +43,8 @@ func TestShouldSkipAutoInstall(t *testing.T) {
 		{[]string{"archive", "import-web"}, true},
 		{[]string{"grab"}, false},
 		{[]string{"scan"}, false},
+		{[]string{"torrent", "inspect"}, true},
+		{[]string{"torrent", "fetch"}, true},
 		{[]string{"archive", "url"}, false},
 		{[]string{"collect", "sync"}, false},
 		{[]string{"watch", "run"}, false},

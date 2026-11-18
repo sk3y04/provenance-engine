@@ -1,0 +1,209 @@
+# Selective BitTorrent
+
+Status: first slice. Magnet / `.torrent` input, explicit file selection, verified
+capture into the existing manifest path. No UI, no RPC, no aria2 compatibility,
+no queueing, no Soulseek.
+
+## Why a native adapter
+
+`aria2` and `transmission` demonstrate the behaviour worth having — selective
+download and resumable state — but the engine already owns manifest writing,
+SHA-256 verification and the archive handoff. Shelling out would duplicate those
+paths and add a second source of truth for "what was downloaded". The adapter in
+`internal/transfer/bittorrent` therefore implements the *behaviour* in original
+Go code on top of a library that provides the peer protocol.
+
+It is not a compatibility layer: no RPC surface, no `.aria2` control files, no
+session import/export, no CLI flags copied from aria2.
+
+## Pinned dependency
+
+| Item | Value |
+|------|-------|
+| Module | `github.com/anacrolix/torrent` |
+| Version | `v1.62.0` (tagged 2026-11-10) |
+| Licence | MPL-2.0 |
+| Pin site | `go.mod` require block (direct) |
+
+`v1.63.0` was tagged one day before this slice was written and was not chosen: a
+pin should be a version that has seen some use. `v1.61.0` and earlier are **not
+acceptable** — see the advisory below.
+
+### Security advisory review
+
+[GHSA-2wrx-84qj-4pcg](https://github.com/anacrolix/torrent/security/advisories/GHSA-2wrx-84qj-4pcg)
+/ GO-2026-6894: the bencode decoder had no nesting-depth limit, so a crafted
+`.torrent` or peer-supplied metadata could overflow the stack (unrecoverable
+`fatal error`, not a panic) or burn CPU quadratically in the v2 file-tree
+parser.
+
+- Affected: all versions before `v1.61.1-0.20260911233437-76452a2c8a2f`.
+- Fixed by commit `76452a2c8a2f` (`bencode` depth guard).
+- Verified in the pinned source: `bencode.DefaultMaxDepth = 64` and the
+  `d.depth > maxDepth` check in `bencode/decode.go`.
+
+Consequence for this slice: metainfo is only ever parsed by the library's
+limited decoder, and we additionally cap local `.torrent` files at 16 MiB before
+parsing. No user-supplied bencode reaches an unbounded decoder.
+
+The advisory only covers what was reported. It is not a statement that the
+library is free of other defects; the adapter therefore treats every byte from
+metainfo as hostile regardless (see Safety model).
+
+### Transitive dependency and licence census
+
+The compile graph of `internal/transfer/bittorrent` adds 78 modules (measured
+with `go list -deps`). Licence classes found by reading each module's
+`LICENSE`/`COPYING` file:
+
+| Licence | Modules |
+|---------|---------|
+| MIT | 40 |
+| BSD (2/3-clause) | 16 |
+| Apache-2.0 | 10 |
+| MPL-2.0 | 8 (all `anacrolix/*`, including `torrent`, `dht/v2`, `log`, `sync`, `upnp`) |
+| ISC | 3 |
+| **No licence file in the module** | 1 (`github.com/go-llsqlite/adapter`) |
+
+No GPL, LGPL or AGPL module is in the graph, so the engine stays MIT.
+
+MPL-2.0 is file-level copyleft: it applies to modified MPL files, not to the
+surrounding work. This slice does not modify or vendor any MPL file. Shipping a
+binary that statically links MPL code does, however, require including the
+licence text and notices with the distribution. The repository has no
+`THIRD_PARTY_NOTICES` file today; adding one is a release follow-up, not part of
+this slice.
+
+`github.com/go-llsqlite/adapter` ships no licence file at all. It is a thin
+adapter used by the library's cgo sqlite piece-completion backend
+(`storage/sqlite-piece-completion.go`, build tag `cgo && !nosqlite`). Its author's
+other modules are ISC, but that is an inference, not a licence. Either add a
+notices file that records the omission, or build with `-tags nosqlite` (bolt
+completion, pure Go) before distributing binaries.
+
+### Measured cost
+
+| Build | Binary size |
+|-------|-------------|
+| Before this slice | ~28 MB |
+| Default (cgo, sqlite completion) | ~53 MB |
+| `CGO_ENABLED=0` (bolt completion) | ~50 MB |
+| `-tags nosqlite` | ~49 MB |
+
+The growth is the torrent, DHT, uTP, WebRTC and observability dependency trees.
+It is accepted for this slice because selective fetch is a distinct capability,
+not a replacement for `grab`; if binary size becomes a constraint, that is a
+packaging decision (separate build tag or a plugin boundary), not something the
+adapter can remove.
+
+## What the slice does
+
+1. `torrent inspect SOURCE` resolves metadata and lists files.
+2. `torrent fetch SOURCE --select PATH...` downloads only those files.
+3. Selected files are captured through `internal/manifest`, so
+   `manifest verify` and `archive import` work unchanged.
+
+Sources: a v1 magnet (`urn:btih`) or a local `.torrent` file. v2-only magnets
+(`urn:btmh`) are rejected: selection and capture here are defined over v1 file
+offsets.
+
+## Safety model
+
+- **Hostile paths.** Torrent name and every file path component are validated
+  against traversal (`.`, `..`), absolute paths, path separators, NUL bytes,
+  invalid UTF-8, Windows drive letters, reserved device names (`CON`, `LPT1`),
+  trailing dot/space, over-long components, and duplicate/colliding paths. A
+  single bad component rejects the whole torrent — never a silent rename.
+- **Validated before storage opens.** A `.torrent` file is parsed and validated
+  before it is handed to the library, so no directory is created first.
+- **Symlinks.** Existing symlinks inside staging are rejected on the write path,
+  and the final read for hashing re-resolves the path and requires it to stay
+  inside staging.
+- **Selection is explicit.** No flag downloads a whole torrent. An unknown path
+  is an error, and the CLI refuses to fetch without `--select`.
+- **Only verified selected files are captured.** Every piece covering a selected
+  file must be in the library's completed-and-idle state, the file must exist
+  under its final name with the metainfo length, and the bytes are hashed again
+  by Provenance before the capture item is written.
+- **No secrets in records.** The stored source reference is a magnet carrying
+  only the infohash; trackers (which can contain passkeys) and local paths do not
+  reach job records, capture items, or terminal output.
+- **No remote surface.** No listener for control, no API, no RPC. The client
+  only speaks the peer protocol.
+
+## Pieces, files and selection
+
+BitTorrent pieces are fixed-size and do not respect file boundaries, so a
+selected file can share a piece with a neighbour. Fetching the selection can
+therefore write bytes of unselected files. That is expected; what matters is
+that only selected, complete, verified files enter the capture and the vault.
+The integration test asserts exactly that: a 3-file fixture with 16 KiB pieces
+where piece 0 spans `a.bin` and part of `b.bin`; selecting `b.bin` writes
+`a.bin` too, and the capture contains one item.
+
+## Resume and restart
+
+- The exact metainfo is persisted once at
+  `.provenance/torrent/<infohash>.torrent` and reused on later runs, so a restart
+  needs no peer to begin verifying (asserted by a test that shuts the seeder
+  down).
+- Retained pieces are re-hashed (`VerifyData`) before more data is requested:
+  verified bytes are reused, corrupted bytes are re-fetched rather than captured.
+- Library part files (`.part`) are left alone on interruption; the next run
+  completes and finalizes them.
+- The job record (`.provenance/torrent/bt-<infohash>.job.json`) holds the
+  immutable selection, backend, staging reference and infohash. Re-running with a
+  different selection is refused.
+
+## Limits
+
+| Knob | Default | Where |
+|------|---------|-------|
+| Selected bytes | unlimited | `--max-bytes` |
+| Overall time | unlimited | `--timeout` |
+| Metadata wait | 2 minutes | fixed default (`Config.MetadataTimeout`) |
+| Peers per torrent | library default (50) | CLI sets 40 (`MaxPeers`) |
+| Metainfo file size | 16 MiB | fixed cap |
+
+Disk usage follows the selection plus shared edge pieces; there is no quota
+enforcement yet.
+
+## Out of scope (deliberately)
+
+- Durable multi-job queue, backend resume references, crash-boundary
+  reconciliation (`PR 2` in the plan).
+- Seeding policy beyond opt-in `--seed`.
+- Web seeds (disabled), WebTorrent (disabled), v2-only torrents.
+- HTTP API, event stream, TUI integration.
+- aria2 RPC, session import/export, `.aria2` checkpoints.
+- Soulseek / slskd.
+- Archive schema changes: the capture manifest and vault types are untouched.
+
+## Tests
+
+`internal/transfer/bittorrent` runs a local in-process seeder over loopback with
+DHT, PEX, trackers, webseeds and uTP disabled — CI never contacts a public
+tracker. Covered:
+
+| Test | Proves |
+|------|--------|
+| `TestFetchCapturesOnlySelectedFiles` | magnet join, metadata listing, exact selection, one capture item, `manifest verify`, `archive ingest` |
+| `TestListReturnsMetadataWithoutCapturing` | metadata-only listing persists metainfo and writes no capture |
+| `TestInterruptedFetchResumesAndReusesVerifiedBytes` | interruption leaves `.part`, resume reads less than the whole file, then a restart with **no peer** captures with `BytesRead == 0` |
+| `TestCorruptedRetainedDataIsRepaired` | local corruption is detected by re-hash, re-fetched, and never captured |
+| `TestFetchFromLocalTorrentFile` | `.torrent` input path |
+| `TestSelectionIsRequiredAndExact` | no whole-torrent download, unknown path is an error |
+| `TestSelectionSizeLimitRejectsBeforeDownload` | `--max-bytes` before payload |
+| `TestJobSelectionCannotChangeMidJob` | immutable selection, order-insensitive retry |
+| `TestHostileMetainfoPathsRejected` | traversal, empty component, drive letter, hostile torrent name |
+| `TestStagingSymlinkRejected` | symlinked staging directory |
+| path/job unit tests | component validation, containment, peer parsing, kind mapping |
+
+## Follow-ups
+
+1. Add `THIRD_PARTY_NOTICES` (MPL texts, the missing `go-llsqlite/adapter`
+   licence) or ship with `-tags nosqlite`; decide before the first binary
+   release that includes this slice.
+2. Durable job queue, retry/reconcile, and status commands (plan PR 2).
+3. Optional per-job bandwidth cap, needed before fetching large public swarms.
+4. Verify behaviour against a real swarm with a private tracker, outside CI.

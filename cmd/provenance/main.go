@@ -147,6 +147,7 @@ CLI mode - fast one-shot commands for scripts and automation:
   provenance watch      add|run      Recurring download subscriptions
   provenance install                 Pre-install yt-dlp + ffmpeg
   provenance encode                  Transcode local videos to hardware-accelerated AV1
+  provenance torrent    inspect|fetch Selective BitTorrent fetch into staging
   provenance tui                     Interactive terminal UI
   provenance completion              Generate shell completions
 
@@ -172,6 +173,7 @@ search. No runtime dependencies beyond yt-dlp + ffmpeg.`,
 	root.AddCommand(searchCmd())
 	root.AddCommand(tuiCmd())
 	root.AddCommand(encodeCmd())
+	root.AddCommand(torrentCmd())
 	root.AddCommand(completionCmd())
 
 	root.PersistentFlags().StringVar(&flagChromePath, "chrome-path", "", "Path to Chrome/Chromium executable (for browser fallback and import-web)")
@@ -230,6 +232,10 @@ func shouldSkipAutoInstall(cmd *cobra.Command) bool {
 	// Archive ingest works on already-captured content (or uses its own
 	// transports: git, HTTP, Chrome); only `archive url` extracts media.
 	if strings.HasPrefix(path, "provenance archive") && cmd.Name() != "url" {
+		return true
+	}
+	// Torrent transfers never touch yt-dlp.
+	if strings.HasPrefix(path, "provenance torrent") {
 		return true
 	}
 	switch path {

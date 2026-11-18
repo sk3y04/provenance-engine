@@ -103,6 +103,7 @@ Deep dive: [`docs/EXTRACTORS.md`](docs/EXTRACTORS.md)
 | [`docs/TUI.md`](docs/TUI.md) | Terminal UI — views, key bindings, state model |
 | [`docs/SESSIONS.md`](docs/SESSIONS.md) | Session lifecycle, resume, optimistic concurrency |
 | [`docs/WATCHES.md`](docs/WATCHES.md) | Recurring download subscriptions |
+| [`docs/TORRENT.md`](docs/TORRENT.md) | Selective BitTorrent — pinned library, advisory review, safety model, resume |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Architecture, data flow, design decisions, package reference |
 | [`TREEVIEW.md`](TREEVIEW.md) | File-level reference — every source file |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build, test, conventions |

@@ -58,6 +58,9 @@ provenance
 ├── install                           Pre-install yt-dlp + ffmpeg
 ├── tui                              Launch interactive terminal UI
 ├── encode [flags]                   Transcode local videos to AV1 (hardware-accelerated)
+├── torrent                          Selective BitTorrent fetch into staging
+│   ├── inspect <SOURCE>             List files without downloading payload
+│   └── fetch <SOURCE> --select PATH Download only the selected files
 └── completion <bash|zsh|fish|powershell>
 ```
 
@@ -403,6 +406,57 @@ provenance archive collection wallpapers --collection visual-refs --vault ~/Vaul
 # → verifies SHA-256, copies to blob store, creates immutable revision
 # → "archived revision abc123... (226 entities)"
 ```
+
+---
+
+## `provenance torrent`
+
+Selective BitTorrent fetch. A source is a v1 magnet link (`urn:btih`) or a local `.torrent` file. There is no "download everything" mode: `fetch` requires at least one `--select` path, and an unknown path is an error rather than a silent whole-torrent download.
+
+Downloads are verified against the torrent's piece hashes, then written to a capture manifest in the same format `collect sync --record` produces, so `manifest verify` and `archive import` work on the result unchanged:
+
+```bash
+provenance torrent inspect "magnet:?xt=urn:btih:..."      # list selectable paths
+provenance torrent fetch "magnet:?xt=urn:btih:..." \
+  --select "release/track.flac" --select "release/cover.jpg" \
+  -o ./downloads/release --max-bytes 2GB --timeout 30m
+provenance manifest verify ./downloads/release            # 2 ok, 0 failed, 0 missing
+provenance archive import ./downloads/release --collection music --vault ~/Vault
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `-o`, `--output` | string | `./downloads` | Staging root for this job |
+| `--select` | string (repeatable) | *(required for fetch)* | Exact file path from `inspect`; commas also accepted |
+| `--peer` | string (repeatable) | - | Explicit `host:port` peer, for private swarms |
+| `--max-bytes` | size | `0` (no limit) | Reject a selection larger than this before downloading |
+| `--timeout` | duration | `0` (no limit) | Overall deadline for the fetch |
+| `--seed` | bool | `false` | Keep seeding after capture until interrupted |
+| `--json` | bool | `false` | Machine-readable output for `inspect` and `fetch` |
+
+### Staging layout
+
+```
+<staging>/
+  <torrent name>/<path>            ← downloaded files (final names only)
+  .provenance/runs/<ts>.json       ← capture manifest (shared format)
+  .provenance/items/<id>.json      ← per-file capture item
+  .provenance/torrent/<infohash>.torrent   ← exact metainfo, persisted once
+  .provenance/torrent/bt-<infohash>.job.json ← job record (immutable selection)
+  .torrent.db                      ← library piece-completion database (not captured)
+```
+
+### Behaviour notes
+
+- **Selection is not a guarantee about disk contents.** BitTorrent pieces can span file boundaries, so fetching one file may write neighbouring bytes (a shared edge piece). Only the selected, complete, hash-verified files are captured.
+- **Resume.** A second run in the same staging root re-verifies retained pieces before requesting more, so verified bytes are reused and corrupted retained data is re-fetched instead of captured. Persisting the metainfo means a restart needs no peer to begin verifying.
+- **Selection is immutable per job.** Re-running with a different `--select` set is refused (`ErrSelectionLocked`); use a new staging root.
+- **Uploads while fetching** are enabled (normal reciprocity). Continued seeding after completion is opt-in via `--seed`.
+- **No network surface.** The adapter opens no listener for other tools, exposes no RPC, and has no aria2-compatible interface.
+- Paths from metainfo are treated as hostile: traversal, absolute paths, separators, reserved device names, and symlinks inside staging reject the whole torrent.
+- Torrent fetches never invoke yt-dlp.
+
+See [TORRENT.md](TORRENT.md) for the pinned library version, the security advisory review, and the dependency/licence position.
 
 ---
 
