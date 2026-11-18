@@ -204,7 +204,7 @@ search. No runtime dependencies beyond yt-dlp + ffmpeg.`,
 
 func shouldSkipAutoInstall(cmd *cobra.Command) bool {
 	switch cmd.Name() {
-	case "help", "install", "doctor", "history", "status", "sessions", "tui", "completion", "manifest", "search":
+	case "help", "install", "doctor", "history", "status", "sessions", "tui", "completion", "manifest", "search", "cite", "diff":
 		return true
 	}
 	path := cmd.CommandPath()
@@ -212,6 +212,11 @@ func shouldSkipAutoInstall(cmd *cobra.Command) bool {
 		return true
 	}
 	if strings.HasPrefix(path, "provenance vault") && cmd.Name() != "init" {
+		return true
+	}
+	// Archive ingest works on already-captured content (or uses its own
+	// transports: git, HTTP, Chrome); only `archive url` extracts media.
+	if strings.HasPrefix(path, "provenance archive") && cmd.Name() != "url" {
 		return true
 	}
 	switch path {
