@@ -124,7 +124,7 @@ func runYtdlpInternal(ctx context.Context, d *Deps, rawURL string, opts YtdlpOpt
 		if err := EnsureInstalled(ctx); err != nil {
 			return "", classifyYtdlpError(rawURL, err, "")
 		}
-	} else if !d.Tools.Available(capability.ToolYtdlp) {
+	} else if !d.ToolAvailable(capability.ToolYtdlp) {
 		return "", engineerr.Newf(engineerr.ExternalTool, "yt-dlp", rawURL, "yt-dlp is not available")
 	}
 
@@ -135,7 +135,8 @@ func runYtdlpInternal(ctx context.Context, d *Deps, rawURL string, opts YtdlpOpt
 		opts.Progress = newEventProgress(ctx, opts.Events)
 	}
 
-	ffmpeg := d.FfmpegPath != ""
+	ffmpegPath := d.FfmpegLocation()
+	ffmpeg := ffmpegPath != ""
 	if !ffmpeg {
 		narratef(ctx, kindWarn, event.ReasonFfmpegMissing, rawURL,
 			"ffmpeg not found on PATH; falling back to single-file downloads",
@@ -180,7 +181,7 @@ func runYtdlpInternal(ctx context.Context, d *Deps, rawURL string, opts YtdlpOpt
 	}
 
 	if ffmpeg {
-		cmd = cmd.FFmpegLocation(d.FfmpegPath)
+		cmd = cmd.FFmpegLocation(ffmpegPath)
 	}
 
 	if opts.CookiesFile != "" {
@@ -468,7 +469,7 @@ func ensureYtdlpForScan(ctx context.Context, d *Deps, rawURL string) error {
 		}
 		return nil
 	}
-	if !d.Tools.Available(capability.ToolYtdlp) {
+	if !d.ToolAvailable(capability.ToolYtdlp) {
 		return engineerr.Newf(engineerr.ExternalTool, "yt-dlp", rawURL, "yt-dlp is not available")
 	}
 	return nil

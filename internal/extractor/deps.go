@@ -17,8 +17,15 @@ import (
 // a concurrency-safe shared service used only when no engine-owned Deps is
 // supplied (the CLI path).
 type Deps struct {
-	HTTPClient  *http.Client
-	QueryIDs    *QueryIDCache
+	HTTPClient *http.Client
+	QueryIDs   *QueryIDCache
+
+	// mu guards Tools and the resolved tool paths: Capabilities may re-probe
+	// while operations read the report. Once a Deps is shared across
+	// goroutines, read the report through ToolAvailable and FfmpegLocation,
+	// never through the fields directly. AutoInstall is set before the Deps
+	// is published and is immutable afterwards.
+	mu          sync.RWMutex
 	Tools       capability.Set
 	FfmpegPath  string
 	FFprobePath string
@@ -41,17 +48,39 @@ func NewDeps() *Deps {
 }
 
 // Probe refreshes the tool report for this engine and copies the resolved paths
-// onto the Deps. It never installs a tool.
+// onto the Deps. It never installs a tool. It is safe to call concurrently with
+// operations reading the report through ToolAvailable and FfmpegLocation.
 func (d *Deps) Probe(chromePath string) capability.Set {
-	d.Tools = capability.Probe(context.Background(), chromePath)
-	d.FfmpegPath = d.Tools.Path(capability.ToolFfmpeg)
-	d.FFprobePath = d.Tools.Path(capability.ToolFFprobe)
-	if chromePath == "" {
-		d.ChromePath = d.Tools.Path(capability.ToolChrome)
-	} else {
-		d.ChromePath = chromePath
+	set := capability.Probe(context.Background(), chromePath)
+	ffmpeg := set.Path(capability.ToolFfmpeg)
+	ffprobe := set.Path(capability.ToolFFprobe)
+	chrome := chromePath
+	if chrome == "" {
+		chrome = set.Path(capability.ToolChrome)
 	}
-	return d.Tools
+	d.mu.Lock()
+	d.Tools = set
+	d.FfmpegPath = ffmpeg
+	d.FFprobePath = ffprobe
+	d.ChromePath = chrome
+	d.mu.Unlock()
+	return set
+}
+
+// ToolAvailable reports whether the named tool was reachable at the last
+// probe. It is safe to call concurrently with Probe.
+func (d *Deps) ToolAvailable(name string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.Tools.Available(name)
+}
+
+// FfmpegLocation returns the ffmpeg path resolved by the last probe, or ""
+// when ffmpeg is not reachable. It is safe to call concurrently with Probe.
+func (d *Deps) FfmpegLocation() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.FfmpegPath
 }
 
 // Default returns the package-level shared dependencies used by the CLI path.
