@@ -1034,6 +1034,10 @@ func FetchAllIgPosts(ctx context.Context, d *Deps, cookiesFile, csrfToken, userI
 		if nextCursor == "" {
 			break
 		}
+		if nextCursor == cursor {
+			narratef(ctx, kindInfo, event.ReasonDuplicateCursor, "", "", "[instagram] repeated cursor detected, stopping pagination\n")
+			break
+		}
 		cursor = nextCursor
 	}
 	return all, nil

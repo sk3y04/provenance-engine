@@ -797,6 +797,10 @@ func FetchAllTwTweets(ctx context.Context, d *Deps, cookiesFile, csrfToken, user
 		if nextCursor == "" {
 			break
 		}
+		if nextCursor == cursor {
+			narratef(ctx, kindInfo, event.ReasonDuplicateCursor, "", "", "[twitter] repeated cursor detected, stopping pagination\n")
+			break
+		}
 		cursor = nextCursor
 	}
 	return all, nil
