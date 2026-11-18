@@ -60,7 +60,8 @@ provenance
 ├── encode [flags]                   Transcode local videos to AV1 (hardware-accelerated)
 ├── torrent                          Selective BitTorrent fetch into staging
 │   ├── inspect <SOURCE>             List files without downloading payload
-│   └── fetch <SOURCE> --select PATH Download only the selected files
+│   ├── fetch <SOURCE> --select PATH Download only the selected files
+│   └── status [JOB_ID]              Recorded job state (read-only, no lock)
 └── completion <bash|zsh|fish|powershell>
 ```
 
@@ -432,7 +433,68 @@ provenance archive import ./downloads/release --collection music --vault ~/Vault
 | `--max-bytes` | size | `0` (no limit) | Reject a selection larger than this before downloading |
 | `--timeout` | duration | `0` (no limit) | Overall deadline for the fetch |
 | `--seed` | bool | `false` | Keep seeding after capture until interrupted |
-| `--json` | bool | `false` | Machine-readable output for `inspect` and `fetch` |
+| `--json` | bool | `false` | Machine-readable output for `inspect`, `fetch` and `status` |
+
+### `torrent status`
+
+Read-only view of the job records in a staging root. Works while another process owns the root, and after a crash. It never takes the writer lock, opens the piece database, starts a client, reads payload bytes, creates directories, or rewrites old records.
+
+```bash
+provenance torrent status -o ./downloads/release           # every recorded job
+provenance torrent status -o ./downloads/release bt-<infohash>
+provenance torrent status -o ./downloads/release --json
+```
+
+```
+[provenance] 1 job(s) in /home/you/downloads/release
+[provenance] recorded state from each job's last update; not a liveness check
+
+bt-94158d67ef6b15e5e8c80798996ff59369721f72  payload=ready capture=committed seeding=seeding
+  infohash   94158d67ef6b15e5e8c80798996ff59369721f72
+  files      fixture/c.bin
+  updated    2026-11-18T14:44:56Z (recorded)
+  manifest   .provenance/runs/2026-11-18T144456Z.json
+```
+
+With a job id the fields are shown one per line, including `payload verified …`, `capture committed …`, `manifest`, `capture key`, and the on-disk `record format`.
+
+**Everything is recorded state**, not a probe: `seeding` can be stale, `updated_at` is the last record change rather than a heartbeat, and a leftover lock file is ignored. Status reads one file per job and reports the capture manifest path as recorded — it does not check that the manifest still exists or is intact.
+
+`--json` (list form; one job is emitted as a single object):
+
+```json
+{
+  "staging_root": "/home/you/downloads/release",
+  "jobs": [
+    {
+      "job_id": "bt-94158d67ef6b15e5e8c80798996ff59369721f72",
+      "backend": "bittorrent",
+      "info_hash": "94158d67ef6b15e5e8c80798996ff59369721f72",
+      "staging_ref": "fixture",
+      "selection": ["fixture/c.bin"],
+      "created_at": "2026-11-18T14:40:02Z",
+      "updated_at": "2026-11-18T14:44:56Z",
+      "recorded_state": { "payload": "ready", "capture": "committed", "seeding": "seeding" },
+      "payload": { "verified_at": "2026-11-18T14:44:55Z", "files": 1 },
+      "capture": {
+        "committed_at": "2026-11-18T14:44:56Z",
+        "manifest": ".provenance/runs/2026-11-18T144456Z.json",
+        "capture_key": "…64 hex…"
+      },
+      "record_format": "provenance/torrent-job+2"
+    }
+  ]
+}
+```
+
+`jobs` is sorted by job id and is `[]` when the root has no jobs. A record that cannot be read appears in `"unreadable": [{"file": …, "reason": …}]` instead of being dropped; the document stays valid JSON, a warning goes to stderr, and the command exits 1 because the listing is incomplete. Records are validated on read: unsafe paths in a record, a mismatched file name, or an unsupported `format` make it unreadable rather than trusted. Status output never includes the magnet source, metainfo, tracker URLs, credentials or passkeys.
+
+| Case | Exit code |
+|------|-----------|
+| jobs listed, or root empty, or job found | 0 |
+| root missing / not a directory | 1 |
+| job id missing (`torrent job not found`) or malformed (`invalid torrent job id`) | 1 |
+| any record unreadable (listing incomplete) | 1 |
 
 ### Staging layout
 

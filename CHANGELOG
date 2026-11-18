@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`provenance torrent status` for humans and scripts**: lists the job records
+  in a staging root (sorted by job id) or shows one job by validated identity
+  (`bt-<40 hex>` or the bare infohash, never treated as a path). `--json` emits
+  the list as `{staging_root, jobs[], unreadable[]}` and a single job as one
+  object. Every field is *recorded* state: the JSON uses `recorded_state` and
+  the human output labels each value as recorded, because a record can say
+  `seeding` long after the process that was seeding died. Status never infers
+  liveness from timestamps, a leftover lock file, or the persisted seeding
+  value. It reads job records only — no `Session`, no staging lock, no
+  `.torrent.db`, no client, no payload hashing, no directory creation, and no
+  rewrite of a v1 record (which is reported with the format it actually has on
+  disk). Records are validated on read with the writer's rules (identity,
+  infohash shape, confined metainfo/data paths, safe staging reference), and a
+  mismatched file name or unsupported `format` makes a record unreadable rather
+  than trusted. An unreadable record is listed with a reason and makes the
+  command exit 1 while stdout stays valid JSON; diagnostics never go to JSON
+  stdout. Output never includes magnets, metainfo, tracker URLs, credentials or
+  passkeys. See `docs/TORRENT.md` ("Read-only status") for what a record proves
+  and the per-file, non-global consistency guarantee.
 - **Exclusive staging ownership for torrent jobs**: a `bittorrent.Session` now
   takes an exclusive lock on its staging root (`<root>/.provenance/torrent/
   staging.lock`) for its whole lifetime, enforced inside the backend so callers
@@ -217,6 +236,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A torrent fetch that does not seed no longer leaves a stale `seeding`
+  claim**: adopting an already-committed capture (the normal recovery path
+  after a killed `--seed` process) wrote nothing to the seeding state, so the
+  job record kept saying `seeding` from the dead run. Such a fetch now records
+  `stopped` before returning, and the fetch report prints the state as it is at
+  exit rather than as it was at commit. Status surfaces the recorded value
+  either way; this only stops a false claim from being persisted.
 - **Revision IDs from user input are path-safe**: `archive.ReadRevision` joined
   its `id` argument straight into the vault path, so `vault revision diff`
   accepted ids like `../../../tmp/evil` and read a `manifest.json` from outside

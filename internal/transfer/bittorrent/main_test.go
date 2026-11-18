@@ -37,7 +37,13 @@ func TestMain(m *testing.M) {
 	if os.Getenv(helperEnv) == "1" {
 		os.Exit(runHelper())
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	// The CLI built for the status acceptance tests lives outside the test
+	// temp dirs so it survives between tests; remove it once.
+	if cliBuildDir != "" {
+		_ = os.RemoveAll(cliBuildDir)
+	}
+	os.Exit(code)
 }
 
 // runHelper executes one child-process scenario:

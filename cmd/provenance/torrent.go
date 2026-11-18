@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -75,6 +76,30 @@ authorized to download.`,
 	fetch.Flags().BoolVar(&flagTorrentJSON, "json", false, "Emit the capture result as JSON")
 	cmd.AddCommand(fetch)
 
+	status := &cobra.Command{
+		Use:   "status [JOB_ID]",
+		Short: "Show the recorded state of torrent jobs (read-only)",
+		Long: `Report what the job records in a staging root say, without touching the
+network, the payload, or the writer.
+
+With no argument every recorded job is listed in job-id order. With a job id
+("bt-<infohash>" or the bare infohash) only that job is shown.
+
+All output is recorded state: the values the last writer of that record stored,
+from the last time the record changed. It is not a liveness check — a job can
+say "seeding" after the process that was seeding died, and a stale lock file
+means nothing here. Status reads the job record only; it does not take the
+staging lock, open the piece database, start a client, verify payload hashes,
+create directories, or rewrite old records, so it works while another process
+owns the root.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runTorrentStatus(args, os.Stdout)
+		},
+	}
+	status.Flags().BoolVar(&flagTorrentJSON, "json", false, "Emit recorded job state as JSON")
+	cmd.AddCommand(status)
+
 	return cmd
 }
 
@@ -115,9 +140,7 @@ func runTorrentInspect(ctx context.Context, source string) error {
 		return err
 	}
 	if flagTorrentJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(info)
+		return writeTorrentJSON(os.Stdout, info)
 	}
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] infohash %s\n", info.InfoHash)
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] %s — %d file(s), %s total\n",
@@ -151,9 +174,7 @@ func runTorrentFetch(ctx context.Context, source string) error {
 		return err
 	}
 	if flagTorrentJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(cap)
+		return writeTorrentJSON(os.Stdout, cap)
 	}
 	for _, w := range cap.Warnings {
 		_, _ = fmt.Fprintf(os.Stderr, "[provenance] warning: %s\n", w)
@@ -172,6 +193,117 @@ func runTorrentFetch(ctx context.Context, source string) error {
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] verify with: provenance manifest verify %s\n", cap.StagingDir)
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] archive with: provenance archive import %s --collection NAME\n", cap.StagingDir)
 	return nil
+}
+
+// writeTorrentJSON renders one value as indented JSON on w. It is the single
+// JSON path for the torrent commands, so `--json` output stays consistent.
+func writeTorrentJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+// runTorrentStatus reports recorded job state. It is read-only: no Session, no
+// staging lock, no client, no payload reads.
+func runTorrentStatus(args []string, stdout io.Writer) error {
+	if len(args) == 1 {
+		status, err := bittorrent.ReadJobStatus(flagTorrentOut, args[0])
+		if err != nil {
+			return err
+		}
+		if flagTorrentJSON {
+			return writeTorrentJSON(stdout, status)
+		}
+		printJobStatus(stdout, status)
+		return nil
+	}
+
+	listing, err := bittorrent.ListJobs(flagTorrentOut)
+	if err != nil {
+		return err
+	}
+	if flagTorrentJSON {
+		if err := writeTorrentJSON(stdout, listing); err != nil {
+			return err
+		}
+	} else {
+		printJobListing(stdout, listing)
+	}
+	// Diagnostics go to stderr, never into the JSON document.
+	for _, bad := range listing.Unreadable {
+		_, _ = fmt.Fprintf(os.Stderr, "[provenance] warning: unreadable job record %s: %s\n", bad.File, bad.Reason)
+	}
+	if n := len(listing.Unreadable); n > 0 {
+		return fmt.Errorf("%d job record(s) in %s could not be read; the listing is incomplete", n, listing.StagingRoot)
+	}
+	return nil
+}
+
+// printJobListing renders one line per job plus the few fields that make a job
+// identifiable, without dumping the record.
+func printJobListing(w io.Writer, listing bittorrent.JobListing) {
+	if len(listing.Jobs) == 0 {
+		_, _ = fmt.Fprintf(w, "[provenance] no torrent jobs recorded in %s\n", listing.StagingRoot)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "[provenance] %d job(s) in %s\n", len(listing.Jobs), listing.StagingRoot)
+	_, _ = fmt.Fprintf(w, "[provenance] recorded state from each job's last update; not a liveness check\n")
+	for _, job := range listing.Jobs {
+		_, _ = fmt.Fprintf(w, "\n%s  payload=%s capture=%s seeding=%s\n",
+			job.JobID, job.RecordedState.Payload, job.RecordedState.Capture, job.RecordedState.Seeding)
+		_, _ = fmt.Fprintf(w, "  infohash   %s\n", job.InfoHash)
+		if len(job.Selection) > 0 {
+			_, _ = fmt.Fprintf(w, "  files      %s\n", strings.Join(job.Selection, ", "))
+		}
+		_, _ = fmt.Fprintf(w, "  updated    %s (recorded)\n", formatRecordedTime(job.UpdatedAt))
+		if job.Capture != nil && job.Capture.Manifest != "" {
+			_, _ = fmt.Fprintf(w, "  manifest   %s\n", job.Capture.Manifest)
+		}
+	}
+}
+
+// printJobStatus renders one job as labelled fields.
+func printJobStatus(w io.Writer, job bittorrent.JobStatus) {
+	_, _ = fmt.Fprintf(w, "job            %s\n", job.JobID)
+	_, _ = fmt.Fprintf(w, "backend        %s\n", job.Backend)
+	_, _ = fmt.Fprintf(w, "infohash       %s\n", job.InfoHash)
+	if job.StagingRef != "" {
+		_, _ = fmt.Fprintf(w, "staging ref    %s\n", job.StagingRef)
+	}
+	if len(job.Selection) > 0 {
+		_, _ = fmt.Fprintf(w, "selection      %s\n", strings.Join(job.Selection, ", "))
+	}
+	_, _ = fmt.Fprintf(w, "created        %s (recorded)\n", formatRecordedTime(job.CreatedAt))
+	_, _ = fmt.Fprintf(w, "updated        %s (recorded)\n", formatRecordedTime(job.UpdatedAt))
+	_, _ = fmt.Fprintf(w, "recorded state payload=%s capture=%s seeding=%s\n",
+		job.RecordedState.Payload, job.RecordedState.Capture, job.RecordedState.Seeding)
+	_, _ = fmt.Fprintf(w, "               last job update; this is not a liveness check\n")
+	if job.Payload != nil {
+		_, _ = fmt.Fprintf(w, "payload        verified %s, %d file(s) (recorded)\n",
+			formatRecordedTime(job.Payload.VerifiedAt), job.Payload.Files)
+	}
+	if job.Capture != nil {
+		_, _ = fmt.Fprintf(w, "capture        committed %s (recorded)\n", formatRecordedTime(job.Capture.CommittedAt))
+		if job.Capture.Manifest != "" {
+			_, _ = fmt.Fprintf(w, "manifest       %s\n", job.Capture.Manifest)
+		}
+		if job.Capture.CaptureKey != "" {
+			_, _ = fmt.Fprintf(w, "capture key    %s\n", job.Capture.CaptureKey)
+		}
+		if job.Capture.Reconciled {
+			_, _ = fmt.Fprintf(w, "reconciled     yes (adopted from an existing manifest)\n")
+		}
+	}
+	_, _ = fmt.Fprintf(w, "record format  %s\n", job.RecordFormat)
+}
+
+// formatRecordedTime renders a recorded timestamp, or "unknown" when the record
+// carries none. It never implies freshness.
+func formatRecordedTime(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // normalizeCLISelection splits comma-separated values as well as repeated

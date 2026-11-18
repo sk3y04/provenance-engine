@@ -115,6 +115,19 @@ type jobRecord struct {
 	Capture    *captureRecord `json:"capture,omitempty"`
 	CreatedAt  time.Time      `json:"created_at"`
 	UpdatedAt  time.Time      `json:"updated_at"`
+
+	// fileFormat is the format string as found on disk, before any in-memory
+	// upgrade. Status reports it so a v1 record is not misreported as v2. It is
+	// never serialised.
+	fileFormat string
+}
+
+// formatLabel is the on-disk format of the record, for read-only reporting.
+func (j *jobRecord) formatLabel() string {
+	if j.fileFormat != "" {
+		return j.fileFormat
+	}
+	return j.Format
 }
 
 // jobID derives a stable identifier from the infohash alone, so a restart of
@@ -188,6 +201,13 @@ func (s *Session) loadOrCreateJob(src source, want []string) (*jobRecord, error)
 // staging root. The record's paths are treated like any other untrusted input:
 // they must stay inside the job root.
 func (s *Session) validateJob(job *jobRecord, want metainfo.Hash) error {
+	return validateJobRecord(s.staging, job, want)
+}
+
+// validateJobRecord is the Session-free form of the same validation, so a
+// read-only caller (torrent status) can check a record without constructing a
+// Session. It only fills defaults in memory and never touches the filesystem.
+func validateJobRecord(staging string, job *jobRecord, want metainfo.Hash) error {
 	if job.InfoHash != want.HexString() {
 		return fmt.Errorf("job record %s describes torrent %s, not %s", job.JobID, job.InfoHash, want.HexString())
 	}
@@ -197,7 +217,7 @@ func (s *Session) validateJob(job *jobRecord, want metainfo.Hash) error {
 	if job.Resume.MetainfoPath == "" {
 		job.Resume.MetainfoPath = metainfoRel(job.InfoHash)
 	}
-	if _, err := joinWithin(s.staging, job.Resume.MetainfoPath); err != nil {
+	if _, err := joinWithin(staging, job.Resume.MetainfoPath); err != nil {
 		return err
 	}
 	if job.Resume.MetainfoPath != metainfoRel(job.InfoHash) {
@@ -207,7 +227,7 @@ func (s *Session) validateJob(job *jobRecord, want metainfo.Hash) error {
 	if job.Resume.DataDir == "" {
 		job.Resume.DataDir = "."
 	}
-	if _, err := joinWithin(s.staging, job.Resume.DataDir); err != nil {
+	if _, err := joinWithin(staging, job.Resume.DataDir); err != nil {
 		return err
 	}
 	if job.State.Payload == "" {
@@ -234,6 +254,7 @@ func readJob(path string) (*jobRecord, error) {
 	if err := json.Unmarshal(data, &job); err != nil {
 		return nil, fmt.Errorf("read job record: %w", err)
 	}
+	job.fileFormat = job.Format
 	switch job.Format {
 	case JobFormatVersion:
 	case jobFormatV1, "":

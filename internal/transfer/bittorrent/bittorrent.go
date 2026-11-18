@@ -540,7 +540,11 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 		key := captureKey(job.JobID, job.Payload.Assets)
 		if path, ok := s.findCommittedCapture(key); ok {
 			if verr := s.verifyStagedAssets(job.Payload.Assets); verr == nil {
-				return s.adoptCapture(job, key, path, 0, warnings)
+				cap, cerr := s.adoptCapture(job, key, path, 0, warnings)
+				if cerr != nil {
+					return Capture{}, cerr
+				}
+				return s.clearStaleSeeding(job, cap)
 			} else {
 				warnings = append(warnings, verr.Error())
 				if err := s.markPayloadPending(job); err != nil {
@@ -553,7 +557,11 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 	// 2. Payload verified on an earlier run: capture from staging only.
 	if job.State.Payload == PayloadReady && job.Payload != nil && len(job.Payload.Assets) > 0 {
 		if verr := s.verifyStagedAssets(job.Payload.Assets); verr == nil {
-			return s.captureStaged(job, 0, warnings)
+			cap, cerr := s.captureStaged(job, 0, warnings)
+			if cerr != nil {
+				return Capture{}, cerr
+			}
+			return s.clearStaleSeeding(job, cap)
 		} else {
 			// The attestation is stale. Report it, drop back to unverified and
 			// let the normal resume path re-verify and repair.
@@ -652,7 +660,26 @@ func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRe
 		if err := s.markSeeding(job, SeedingStopped); err != nil {
 			return cap, err
 		}
+		// Report the state as it is when the command returns, not as it was
+		// when the capture was committed.
+		cap.State = job.State
 	}
+	return s.clearStaleSeeding(job, cap)
+}
+
+// clearStaleSeeding records that this run is not seeding. An abruptly killed
+// --seed run leaves "seeding" in the record, and a later run that adopts the
+// capture without seeding must not persist a claim that is already false when
+// it is written. KeepSeeding runs record their own transitions.
+func (s *Session) clearStaleSeeding(job *jobRecord, cap Capture) (Capture, error) {
+	if s.cfg.KeepSeeding || job.State.Seeding == SeedingStopped {
+		cap.State = job.State
+		return cap, nil
+	}
+	if err := s.markSeeding(job, SeedingStopped); err != nil {
+		return cap, err
+	}
+	cap.State = job.State
 	return cap, nil
 }
 

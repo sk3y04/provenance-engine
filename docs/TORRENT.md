@@ -202,6 +202,79 @@ before the run manifest, so a reader that runs mid-capture can see item files
 that are not part of a published capture yet. That is pre-existing behavior;
 this slice only prevents two writers from interleaving.
 
+## Read-only status
+
+`provenance torrent status` answers "what does the local record say about this
+job?" without joining anything. It is safe to run against a root that another
+process owns, from a script, or after a crash.
+
+### What it reads
+
+Only the job records in `<root>/.provenance/torrent/*.job.json`, with the same
+decoder and validation the writer uses (`readJob` + `validateJobRecord`). It
+does **not**:
+
+- construct a `Session` or take the staging lock (so it never waits for, or
+  joins, a running job);
+- open `.torrent.db`, start a client, or contact peers;
+- hash or read payload bytes;
+- create directories, repair records, or rewrite a v1 record.
+
+A v1 record is decoded through the in-memory upgrade path and reported with the
+format it actually has on disk (`provenance/torrent-job+1`), so status does not
+pretend the file was migrated.
+
+### Recorded is not live
+
+Every value is what the last writer of that record stored, as of the record's
+`updated_at`. Nothing here is observed:
+
+- a job can record `seeding` long after the process that was seeding died; the
+  record stays that way until some run writes again (a later fetch that does not
+  seed records `stopped`);
+- a lock file on disk means nothing to status — the lock is an OS lock, not the
+  presence of a file, and status does not look for one;
+- `updated_at` is the last time the record changed, not a heartbeat.
+
+The human output says so on every job, and the JSON uses a `recorded_state`
+object rather than a bare state, so a consumer cannot mistake it for a probe.
+
+### Consistency
+
+Each record is published by atomic rename (unique temp file in the same
+directory, then `rename`), so a reader that opens one record sees either the
+complete old version or the complete new one. `TestReadDuringAtomicReplacement`
+replaces a record 300 times while a reader projects it and asserts every
+observation is one of the two complete versions.
+
+There is **no** snapshot across files: status reads the job record and reports
+the capture manifest path *as recorded*. It does not stat or re-verify the
+manifest, because the record and the manifest are separate files that a writer
+may replace at different times, and the two could disagree for a window. A
+globally consistent view of "record plus manifest" is not offered and is not
+claimed.
+
+### Failure modes
+
+| Situation | Behavior |
+|-----------|----------|
+| `--output` does not exist | error, exit 1; status never creates the root |
+| root exists, no jobs | `no torrent jobs recorded`, exit 0 |
+| requested id missing | `torrent job not found`, exit 1 |
+| requested id is not an identity | `invalid torrent job id`, exit 1 (validated as `bt-<40 hex>` or the bare infohash, never used as a path) |
+| a record fails to decode, has an unsupported format, or is filed under the wrong name | listed under `unreadable` with a reason; JSON stays valid; a stderr warning names the file; the command exits 1 because the listing is incomplete |
+
+### What a record can and cannot prove
+
+| Proved by the record | Not proved by the record |
+|----------------------|--------------------------|
+| identity: job id, infohash, backend | that the process is alive |
+| the immutable selection | that the payload files still match their hashes |
+| the last recorded payload, capture and seeding states | that the capture manifest still exists or is intact |
+| the capture idempotency key and manifest path the writer recorded | that a peer, tracker or swarm is reachable |
+
+Anything beyond that is `archive verify` (vault integrity) or a fresh fetch.
+
 ## Job state and crash recovery
 
 A job is a durable local record at
@@ -352,6 +425,8 @@ tracker. Covered:
 | `job_test.go` | key stability, v1→v2 upgrade, immutable selection, record path confinement, source sanitisation |
 | `ownership_test.go` | second session on the same root is busy, busy sessions write nothing, symlink/`.` spellings are the same owner, independent roots run concurrently, concurrent Fetch on one Session is serialized, closed sessions refuse work, ownership survives `--seed` |
 | `ownership_process_test.go` (real processes) | barrier: a competing process gets the busy error and writes nothing, then exactly one manifest after the owner exits; SIGKILL of the owner releases the lock and the job reconciles; a seeding owner stays exclusive and releases on cancel; different torrents in one root are excluded; independent roots proceed concurrently |
+| `status_test.go` | deterministic list order, projection of a recorded job, empty root creates nothing, unreadable records reported with a reason (corrupt JSON, unsupported format, mismatched file name), lookup by id/bare infohash/case-insensitive, path-like ids rejected before any filesystem access, missing root not created, v1 record readable and byte-identical afterwards, secrets never projected or echoed, unsafe record paths rejected, 300 atomic replacements observed only as complete old/new records |
+| `status_process_test.go` (real CLI, real processes) | `torrent status` against a root owned by a seeding process returns promptly with the recorded capture, leaves the tree unchanged, and does not disturb ownership (a competing fetch is still busy); after `SIGKILL` of that owner, status reports the last recorded state as recorded while a lock file still exists, and a later fetch acquires the root and reconciles |
 | path unit tests | component validation, containment, peer parsing, kind mapping |
 
 ## Follow-ups
