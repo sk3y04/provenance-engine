@@ -174,7 +174,14 @@ piece-layer retrieval, but the pinned library does not implement a client for
 them on this path (`setInfoBytesLocked(…, nil)`). The limitation is therefore in
 the current integration, not in the protocol: Provenance does not obtain the v2
 piece hashes it would need for a v2-only magnet fetch, and that case stays
-inspection-only until proven otherwise. A magnet-originated hybrid therefore has **no** piece layers,
+inspection-only until proven otherwise.
+
+That last claim was tested and partly overturned in a bounded spike: v1.62.0 does
+implement BEP 52 hash request/receive/validation, and `Torrent.Metainfo()`
+serialises the acquired hashes into top-level piece layers, so a v2-only magnet
+can be verified and restarted. What blocks the case today is Provenance's own
+missing-layer admission rule, not the library. See `docs/findings-v2-magnet.md`
+for refs, measurements and the GO conditions. No production behaviour changed. A magnet-originated hybrid therefore has **no** piece layers,
 which is fine because its info dictionary carries v1 piece hashes and the library
 prefers those for verification (`Piece.Storage` takes `v1HashBytes` first). A
 v2-only magnet has no v1 fallback, so `Fetch` fails with
