@@ -202,6 +202,19 @@ search. No runtime dependencies beyond yt-dlp + ffmpeg.`,
 	}
 }
 
+// parseRepeatInterval validates a --every value. time.NewTicker panics on
+// non-positive durations, so zero and negative intervals are rejected here.
+func parseRepeatInterval(s string) (time.Duration, error) {
+	dur, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --every duration: %w", err)
+	}
+	if dur <= 0 {
+		return 0, fmt.Errorf("invalid --every duration %q: must be positive", s)
+	}
+	return dur, nil
+}
+
 func shouldSkipAutoInstall(cmd *cobra.Command) bool {
 	switch cmd.Name() {
 	case "help", "install", "doctor", "history", "status", "sessions", "tui", "completion", "manifest", "search", "cite", "diff":
@@ -869,6 +882,12 @@ func watchCmd() *cobra.Command {
 				}
 				var firstErr error
 				for _, sub := range subs {
+					if err := cmd.Context().Err(); err != nil {
+						if firstErr == nil {
+							firstErr = err
+						}
+						break
+					}
 					fmt.Fprintf(os.Stderr, "[provenance] watch %q: %s\n", sub.Name, sub.URL)
 					// A previous run that died mid-flight left "running" behind;
 					// record it as interrupted before the new run starts.
@@ -901,9 +920,9 @@ func watchCmd() *cobra.Command {
 				return firstErr
 			}
 			if flagWatchEvery != "" {
-				dur, err := time.ParseDuration(flagWatchEvery)
+				dur, err := parseRepeatInterval(flagWatchEvery)
 				if err != nil {
-					return fmt.Errorf("invalid --every duration: %w", err)
+					return err
 				}
 				fmt.Fprintf(os.Stderr, "[provenance] scheduling watch run every %s\n", dur)
 				if err := doRun(); err != nil {
@@ -1058,9 +1077,9 @@ func collectCmd() *cobra.Command {
 				return collection.SyncAll(cmd.Context(), opts)
 			}
 			if flagEvery != "" {
-				dur, err := time.ParseDuration(flagEvery)
+				dur, err := parseRepeatInterval(flagEvery)
 				if err != nil {
-					return fmt.Errorf("invalid --every duration: %w", err)
+					return err
 				}
 				fmt.Fprintf(os.Stderr, "[provenance] scheduling sync every %s\n", dur)
 				if err := doSync(); err != nil {

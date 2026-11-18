@@ -2,9 +2,23 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
+
+// TestParseRepeatInterval: --every feeds time.NewTicker, which panics on
+// non-positive durations; zero/negative intervals must be rejected up front.
+func TestParseRepeatInterval(t *testing.T) {
+	if d, err := parseRepeatInterval("30m"); err != nil || d != 30*time.Minute {
+		t.Errorf("parseRepeatInterval(30m) = %v, %v", d, err)
+	}
+	for _, bad := range []string{"0s", "-5s", "-1h", "garbage", ""} {
+		if _, err := parseRepeatInterval(bad); err == nil {
+			t.Errorf("parseRepeatInterval(%q) accepted, want error", bad)
+		}
+	}
+}
 
 // TestShouldSkipAutoInstall: offline vault/metadata operations must not
 // trigger a yt-dlp/ffmpeg auto-install (which hits the network on a fresh
