@@ -224,7 +224,15 @@ func recordCapture(c Collection, sessName string, urlToItem map[string]manifest.
 
 	runPath := manifest.RunPath(c.Options.OutputDir)
 
-	for _, item := range urlToItem {
+	// Persist items in a stable order so capture manifests are reproducible
+	// across runs (map iteration order is random).
+	urls := make([]string, 0, len(urlToItem))
+	for u := range urlToItem {
+		urls = append(urls, u)
+	}
+	sort.Strings(urls)
+	for _, u := range urls {
+		item := urlToItem[u]
 		dest := item.Destination
 		if dest == "" {
 			dest = filepath.Join(c.Options.OutputDir, item.Filename)
@@ -305,8 +313,12 @@ func printDryRun(name string, result *SyncResult, urls []string) {
 }
 
 func trim(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n-1] + "\u2026"
+	if n <= 1 {
+		return string(r[:n])
+	}
+	return string(r[:n-1]) + "…"
 }
