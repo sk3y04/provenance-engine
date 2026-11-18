@@ -15,6 +15,7 @@ import (
 	at "github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
+	"github.com/anacrolix/torrent/storage"
 	"golang.org/x/time/rate"
 
 	"github.com/sk3y04/provenance-engine/internal/manifest"
@@ -149,6 +150,20 @@ func testConfig(t *testing.T, staging string, peers ...string) Config {
 	}
 }
 
+// newTestSessionWithStorage is newTestSession with an injected storage
+// implementation, so a test can observe whether payload storage was opened.
+func newTestSessionWithStorage(t *testing.T, staging string, impl storage.ClientImpl, peers ...string) *Session {
+	t.Helper()
+	cfg := testConfig(t, staging, peers...)
+	cfg.storage = impl
+	sess, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+	return sess
+}
+
 func newTestSession(t *testing.T, staging string, peers ...string) *Session {
 	t.Helper()
 	sess, err := New(testConfig(t, staging, peers...))
@@ -244,6 +259,19 @@ func manifestsWithKey(t *testing.T, staging, key string) []*manifest.CaptureMani
 		}
 	}
 	return out
+}
+
+// inspectForTest resolves metadata through the read-only path, with discovery
+// off and loopback peers, so no test ever contacts a public tracker.
+func inspectForTest(t *testing.T, src string, peers ...string) (Info, error) {
+	t.Helper()
+	ctx, cancel := waitCtx(t)
+	defer cancel()
+	return Inspect(ctx, src, InspectConfig{
+		Peers:                peers,
+		DisablePeerDiscovery: true,
+		MetadataTimeout:      30 * time.Second,
+	})
 }
 
 // waitCtx returns a context bounded well under the package defaults so a

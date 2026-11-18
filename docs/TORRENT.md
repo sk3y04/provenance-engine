@@ -98,14 +98,99 @@ adapter can remove.
 
 ## What the slice does
 
-1. `torrent inspect SOURCE` resolves metadata and lists files.
-2. `torrent fetch SOURCE --select PATH...` downloads only those files.
+1. `torrent inspect SOURCE` resolves metadata and lists files, without a job:
+   no staging lock, no payload storage, no writes.
+2. `torrent fetch SOURCE --select PATH...` downloads only those files, and only
+   after the layout and the selection have passed admission.
 3. Selected files are captured through `internal/manifest`, so
    `manifest verify` and `archive import` work unchanged.
 
-Sources: a v1 magnet (`urn:btih`) or a local `.torrent` file. v2-only magnets
-(`urn:btmh`) are rejected: selection and capture here are defined over v1 file
-offsets.
+Sources: a v1 magnet (`urn:btih`) or a local `.torrent` file. v2-only and hybrid
+metainfo are rejected explicitly (`ErrUnsupportedIdentity`), as are v2 magnets
+(`urn:btmh`): selection and capture here are defined over v1 file offsets and
+v1 piece hashes, and persisting a second identity would change job IDs and
+capture keys.
+
+## Metadata first: inspection and admission
+
+The order below is the contract this slice implements, and the tests assert each
+step rather than the end state alone.
+
+### Inspection
+
+| Step | Local `.torrent` | Magnet |
+|------|------------------|--------|
+| Source parse | `metainfo.LoadFromFile` + size cap | `metainfo.ParseMagnetUri`, v1 only |
+| Client | **none** — no listener, no temp dir | temp client under a private temp dir |
+| Storage | never opened | deferred (`AddTorrentOpts.DeferStorageOpen`) |
+| Transfer | n/a | `DisallowDataDownload` + `DisallowDataUpload` from creation |
+| Identity | `requireV1Identity` before any path use | infohash must match, then `requireV1Identity` |
+| Layout | `validateInfoPaths` on the parsed info | `validateInfoPaths` on the received info |
+| Cleanup | n/a | client closed, temp dir removed on success, error, timeout and cancellation |
+
+An inspection client uses an in-memory piece completion and a private data
+directory, so nothing is created in a staging root — or anywhere else that
+survives the call.
+
+### Fetch admission
+
+1. **Metadata arrives** with storage deferred and both data directions
+   disallowed (`AddTorrentOpts` at creation, plus explicit `Disallow*` calls for
+   a torrent the client already knew).
+2. **Identity**: source infohash matches the metadata infohash; `requireV1Identity`
+   rejects v2-only and hybrid info.
+3. **Layout**: every file path component is validated, duplicate paths are
+   rejected, and for a `.torrent` file this happened before the library saw it.
+4. **Selection**: every requested path must exist exactly; the size limit is
+   checked before any transfer.
+5. **Staging paths**: every path this job could write through (all files, not
+   only selected ones, because a piece can span files) is checked for an
+   existing symlink.
+6. **Storage opens** (`Torrent.OpenStorage`) — the first point at which a payload
+   directory, part file or verified piece can exist.
+7. **Selection is applied** (selected files `Download`, everything else
+   `PiecePriorityNone`).
+8. **Transfer is enabled** (`AllowDataDownload`, `AllowDataUpload`).
+9. **Verification**: retained pieces are re-hashed, then completion requires
+   every covering piece to be complete and idle and the file to exist finalized
+   with the metainfo length.
+10. **Capture**: bytes are re-hashed into the capture items and the run manifest.
+
+A rejected layout or selection therefore never opens payload storage; the tests
+assert that with a storage spy (`spyStorage`) rather than by looking for files
+afterwards.
+
+### What the library does and does not guarantee
+
+Verified against the pinned `v1.62.0` source, and reproduced by
+`TestClientConstructionCreatesDataDir` and the inspection tests:
+
+- `storage.NewFile(dir)` — the default storage a client builds — calls
+  `pieceCompletionForDir`, which does `MkdirAll(dir)` and opens
+  `<dir>/.torrent.db` **inside `at.NewClient`**. Client construction therefore
+  touches the data directory independently of `DeferStorageOpen` and of
+  `OpenStorage`. That is why inspection never points a client at a staging root,
+  and what `torrent fetch` inherits (the DB is created when the session starts,
+  not when storage opens).
+- `Torrent.setInfo` opens payload storage the moment metainfo arrives *unless*
+  `deferStorageOpen` is set. `DeferStorageOpen` lives on `AddTorrentOpts`, not on
+  `ClientConfig`, so the adapter builds a `TorrentSpec` to set it; `AddMagnet`
+  alone cannot.
+- New files start at `PiecePriorityNone`, but that is not relied on as the gate:
+  priorities can be raised by other paths, so both `DisallowDataDownload` and
+  `DisallowDataUpload` are set from creation.
+- The library's default file backend joins metainfo components with
+  `filepath.Join` and **does not sanitise them**; `storage.ToSafeFilePath` is
+  used only by the mmap backend. Confinement is therefore ours: validation runs
+  before storage exists, and every write path is symlink-checked at admission.
+
+**Limitations, stated rather than papered over:** the symlink check is a check,
+not an atomic guarantee — a process that can write inside the staging root while
+a fetch runs could swap a component between the check and the library's write.
+The staging lock is what keeps a second *provenance* process out; it cannot stop
+an unrelated process. Payload writes are also not individually re-validated by
+the library, so a `.part`/final rename performed by the library is trusted to
+the extent that the paths were validated beforehand.
 
 ## Safety model
 
@@ -115,10 +200,16 @@ offsets.
   trailing dot/space, over-long components, and duplicate/colliding paths. A
   single bad component rejects the whole torrent — never a silent rename.
 - **Validated before storage opens.** A `.torrent` file is parsed and validated
-  before it is handed to the library, so no directory is created first.
-- **Symlinks.** Existing symlinks inside staging are rejected on the write path,
-  and the final read for hashing re-resolves the path and requires it to stay
-  inside staging.
+  before it is handed to the library, and every payload storage open is deferred
+  until the layout, the selection and the staging paths have passed admission, so
+  a rejected torrent creates no payload directory, part file or completed piece.
+  The staging root itself and the client's piece-completion database are created
+  when a fetch session starts, before the source is even parsed, because the
+  session owns them; only payload storage is gated.
+- **Symlinks.** Existing symlinks anywhere on a path the job could write through
+  are rejected before storage opens (including unselected neighbours of a shared
+  piece), and the final read for hashing re-resolves the path and requires it to
+  stay inside staging.
 - **Selection is explicit.** No flag downloads a whole torrent. An unknown path
   is an error, and the CLI refuses to fetch without `--select`.
 - **Only verified selected files are captured.** Every piece covering a selected
@@ -195,8 +286,10 @@ already published and readable at that point.
 
 ### Readers are not locked
 
-Ownership excludes other writers, not readers. `archive import` and
-`manifest verify` do not take the lock, so they can run while a job is active.
+Ownership excludes other writers, not readers. `archive import`,
+`manifest verify`, `torrent status` and `torrent inspect` do not take the lock,
+so they can run while a job is active. Inspection builds no `Session` at all
+(see "Metadata first" above), so it cannot contend, queue or leave a lock file.
 The visibility point is unchanged (see the next section): items are written
 before the run manifest, so a reader that runs mid-capture can see item files
 that are not part of a published capture yet. That is pre-existing behavior;
@@ -440,6 +533,8 @@ tracker. Covered:
 | `ownership_test.go` | second session on the same root is busy, busy sessions write nothing, symlink/`.` spellings are the same owner, independent roots run concurrently, concurrent Fetch on one Session is serialized, closed sessions refuse work, ownership survives `--seed` |
 | `ownership_process_test.go` (real processes) | barrier: a competing process gets the busy error and writes nothing, then exactly one manifest after the owner exits; SIGKILL of the owner releases the lock and the job reconciles; a seeding owner stays exclusive and releases on cancel; different torrents in one root are excluded; independent roots proceed concurrently |
 | `status_test.go` | deterministic list order, projection of a recorded job, empty root creates nothing, unreadable records reported with a reason (corrupt JSON, unsupported format, mismatched file name), lookup by id/bare infohash/case-insensitive, path-like ids rejected before any filesystem access, missing root not created, v1 record readable and byte-identical afterwards, secrets never projected or echoed, unsafe record paths rejected, 300 atomic replacements observed only as complete old/new records |
+| `inspect_test.go` | local `.torrent` inspected with a client-construction counter stuck at 0; magnet inspection resolves metadata while the seeder reports 0 payload bytes and 0 chunks written; no temp dir survives; inspection leaves an existing staging root byte-identical; rejection before storage open for unknown selection, path collision and symlinked payload path (storage spy count 0), and exactly one open on the admitted path; metadata timeout and cancellation clean up; v2/hybrid refused for inspect and fetch |
+| `ownership_process_test.go` → `TestInspectDoesNotNeedStagingOwnership` | a separate process inspects a magnet while another process owns the staging root, writes nothing there, and does not disturb ownership |
 | `status_process_test.go` (real CLI, real processes) | `torrent status` against a root owned by a seeding process returns promptly with the recorded capture, leaves the tree unchanged, and does not disturb ownership (a competing fetch is still busy); after `SIGKILL` of that owner, status reports the last recorded state as recorded while a lock file still exists, and a later fetch acquires the root and reconciles |
 | path unit tests | component validation, containment, peer parsing, kind mapping |
 

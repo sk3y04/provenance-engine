@@ -329,3 +329,55 @@ func TestOwnershipScopeAcrossSpellingsAndRoots(t *testing.T) {
 		t.Fatalf("retry after release exit = %d", code)
 	}
 }
+
+// TestInspectDoesNotNeedStagingOwnership is the process-level counterpart of the
+// metadata-first slice: a separate process resolves metadata for a magnet while
+// another process owns the staging root, without a Session, a lock, or any write
+// to that root.
+func TestInspectDoesNotNeedStagingOwnership(t *testing.T) {
+	content := patterned(9000, 'i')
+	s := newSeeder(t, "fixture", 16*1024, map[string][]byte{"i.bin": content})
+	staging := t.TempDir()
+
+	owner := startChild(t, map[string]string{
+		helperOp:      "hold",
+		helperStaging: staging,
+		helperGate:    "stdin",
+	})
+	owner.expectLine("READY", 60*time.Second)
+	before := snapshotTree(t, staging)
+
+	inspector := startChild(t, map[string]string{
+		helperOp:     "inspect",
+		helperSource: s.magnet(),
+		helperPeer:   s.peer(),
+	})
+	line, seen := inspector.expectLine("OK ", 60*time.Second)
+	if code := inspector.wait(60 * time.Second); code != 0 {
+		t.Fatalf("inspector exit = %d, output:\n%s", code, seen)
+	}
+	if fields(line)["files"] != "1" {
+		t.Errorf("inspect reported %q, want 1 file", line)
+	}
+	if diff := diffSnapshots(before, snapshotTree(t, staging)); diff != "" {
+		t.Errorf("inspection changed the owned staging root:\n%s", diff)
+	}
+
+	// The owner is still the owner: it was never queued behind the inspector.
+	competitor := startChild(t, map[string]string{
+		helperOp:      "fetch",
+		helperStaging: staging,
+		helperSource:  s.magnet(),
+		helperSelect:  "fixture/i.bin",
+		helperPeer:    s.peer(),
+	})
+	competitor.expectLine("BUSY", 60*time.Second)
+	if code := competitor.wait(60 * time.Second); code != helperExitBusy {
+		t.Fatalf("competitor exit = %d, want busy", code)
+	}
+
+	owner.release()
+	if code := owner.wait(60 * time.Second); code != 0 {
+		t.Fatalf("owner exit = %d", code)
+	}
+}

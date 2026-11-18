@@ -48,9 +48,11 @@ func TestMain(m *testing.M) {
 
 // runHelper executes one child-process scenario:
 //
-//	op=hold   take ownership, print READY, wait for stdin EOF (or a signal)
-//	op=fetch  take ownership, print READY, then Fetch the selection
-//	op=list   take ownership, print READY, then List the source
+//	op=hold     take ownership, print READY, wait for stdin EOF (or a signal)
+//	op=fetch    take ownership, print READY, then Fetch the selection
+//	op=list     take ownership, print READY, then Inspect the source, which must
+//	            not need the lock this process already holds
+//	op=inspect  build no Session at all and Inspect the source
 //
 // It prints READY only after New() returned, so the parent's barrier means
 // "this process owns the staging root".
@@ -66,6 +68,29 @@ func runHelper() int {
 	}
 	if os.Getenv(helperSeed) == "1" {
 		cfg.KeepSeeding = true
+	}
+
+	source := os.Getenv(helperSource)
+	var selection []string
+	for _, s := range strings.Split(os.Getenv(helperSelect), ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			selection = append(selection, s)
+		}
+	}
+
+	// op=inspect models the CLI: no Session, no staging root, no lock.
+	if os.Getenv(helperOp) == "inspect" {
+		info, ierr := Inspect(context.Background(), source, InspectConfig{
+			Peers:                cfg.Peers,
+			DisablePeerDiscovery: true,
+			MetadataTimeout:      30 * time.Second,
+		})
+		if ierr != nil {
+			fmt.Printf("ERR %v\n", ierr)
+			return helperExitErr
+		}
+		fmt.Printf("OK files=%d name=%s\n", len(info.Files), info.Name)
+		return 0
 	}
 
 	sess, err := New(cfg)
@@ -90,14 +115,6 @@ func runHelper() int {
 		gated = true
 	}
 
-	source := os.Getenv(helperSource)
-	var selection []string
-	for _, s := range strings.Split(os.Getenv(helperSelect), ",") {
-		if s = strings.TrimSpace(s); s != "" {
-			selection = append(selection, s)
-		}
-	}
-
 	switch os.Getenv(helperOp) {
 	case "hold":
 		// A gated hold already ended at stdin EOF; an ungated hold waits for a
@@ -106,7 +123,12 @@ func runHelper() int {
 			<-ctx.Done()
 		}
 	case "list":
-		info, lerr := sess.List(ctx, source)
+		// The session holds the root; inspection must not need it.
+		info, lerr := Inspect(ctx, source, InspectConfig{
+			Peers:                cfg.Peers,
+			DisablePeerDiscovery: true,
+			MetadataTimeout:      30 * time.Second,
+		})
 		if lerr != nil {
 			fmt.Printf("ERR %v\n", lerr)
 			_ = sess.Close()

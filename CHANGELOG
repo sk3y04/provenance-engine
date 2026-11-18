@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Metadata-first admission for torrent fetches**: payload storage is now
+  opened only after the layout, the requested selection and the staging paths
+  have passed admission. The torrent is created with
+  `AddTorrentOpts.DeferStorageOpen` and both `DisallowDataDownload` and
+  `DisallowDataUpload`, so metainfo arrival cannot create a payload directory,
+  a part file or a verified piece; `Torrent.OpenStorage` runs after validation,
+  the selection is applied, and only then is transfer enabled. Every write path
+  (all files, not just selected ones, because a piece can span files) is now
+  symlink-checked before storage exists. Verified against the pinned
+  `anacrolix/torrent v1.62.0`: `DeferStorageOpen` lives on `AddTorrentOpts`
+  rather than `ClientConfig`, the default file backend does not sanitise
+  metainfo paths, and `at.NewClient` creates `<DataDir>/.torrent.db` eagerly at
+  construction — which is why inspection never builds a client over a staging
+  root. See `docs/TORRENT.md` ("Metadata first") for the full order and the
+  stated limits.
+- **`torrent inspect` is genuinely read-only**: a local `.torrent` is parsed in
+  memory with no client at all, and a magnet is resolved through a short-lived
+  client with an in-memory piece completion, a private temporary data directory,
+  deferred storage and payload transfer disabled — so inspecting creates no
+  payload directory, piece-completion database, job record, persisted metainfo
+  or lock, and can run while a fetch owns the same staging root. The client and
+  its temporary directory are removed on success, error, timeout and
+  cancellation. `-o` is no longer used by `inspect`; `--timeout` now bounds the
+  metadata wait.
+- **Unsupported torrent identities are rejected explicitly**: v2-only and hybrid
+  (v1+v2) metainfo fail with `ErrUnsupportedIdentity` for both inspect and fetch,
+  and `urn:btmh` magnets stay refused, with no v2/hybrid persistence, job-ID or
+  capture-key change.
+- **`provenance torrent status` for humans and scripts**:
 - **`provenance torrent status` for humans and scripts**: lists the job records
   in a staging root (sorted by job id) or shows one job by validated identity
   (`bt-<40 hex>` or the bare infohash, never treated as a path). `--json` emits

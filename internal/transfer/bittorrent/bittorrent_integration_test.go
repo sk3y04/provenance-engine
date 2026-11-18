@@ -41,9 +41,9 @@ func TestFetchCapturesOnlySelectedFiles(t *testing.T) {
 	ctx, cancel := waitCtx(t)
 	defer cancel()
 
-	info, err := sess.List(ctx, s.magnet())
+	info, err := inspectForTest(t, s.magnet(), s.peer())
 	if err != nil {
-		t.Fatalf("list: %v", err)
+		t.Fatalf("inspect: %v", err)
 	}
 	if info.InfoHash != s.infohash() {
 		t.Errorf("infohash = %s, want %s", info.InfoHash, s.infohash())
@@ -144,27 +144,36 @@ func TestFetchCapturesOnlySelectedFiles(t *testing.T) {
 	}
 }
 
-// TestListReturnsMetadataWithoutCapturing: metadata-only listing must not move
-// payload into the vault or write a capture record.
-func TestListReturnsMetadataWithoutCapturing(t *testing.T) {
+// TestInspectLeavesStagingUntouched: inspection is metadata-only and job-free.
+// It must not take the staging lock, materialise the layout, open payload
+// storage, create a piece-completion database, persist metainfo, or write a
+// capture — even when handed a staging directory that a fetch would use.
+func TestInspectLeavesStagingUntouched(t *testing.T) {
 	s := newSeeder(t, "fixture", 16*1024, map[string][]byte{"a.bin": patterned(4000, 'x')})
 	staging := t.TempDir()
-	sess := newTestSession(t, staging, s.peer())
-	ctx, cancel := waitCtx(t)
-	defer cancel()
+	before := snapshotTree(t, staging)
 
-	info, err := sess.List(ctx, s.magnet())
+	info, err := inspectForTest(t, s.magnet(), s.peer())
 	if err != nil {
-		t.Fatalf("list: %v", err)
+		t.Fatalf("inspect: %v", err)
 	}
 	if len(info.Files) != 1 || info.Files[0].Length != 4000 {
 		t.Fatalf("info = %+v", info)
 	}
-	if runs, err := manifest.ListRunManifests(staging); err == nil && len(runs) != 0 {
-		t.Errorf("list wrote %d capture manifests, want 0", len(runs))
+	if diff := diffSnapshots(before, snapshotTree(t, staging)); diff != "" {
+		t.Errorf("inspection changed the staging tree:\n%s", diff)
 	}
-	if _, err := os.Stat(filepath.Join(staging, torrentStateDir, s.infohash()+".torrent")); err != nil {
-		t.Errorf("exact metainfo was not persisted: %v", err)
+	if runs, err := manifest.ListRunManifests(staging); err == nil && len(runs) != 0 {
+		t.Errorf("inspect wrote %d capture manifests, want 0", len(runs))
+	}
+	if _, err := os.Stat(filepath.Join(staging, torrentStateDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("inspect created the torrent state dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, ".torrent.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("inspect created a piece-completion database: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "fixture")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("inspect created a payload directory: %v", err)
 	}
 }
 
@@ -479,9 +488,9 @@ func TestHostileMetainfoPathsRejected(t *testing.T) {
 		if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		// Listing is refused too: nobody should learn a path we will not use.
-		if _, err := sess.List(ctx, path); !errors.Is(err, ErrUnsafePath) {
-			t.Errorf("List(%v/%v) = %v, want ErrUnsafePath", tc.name, tc.path, err)
+		// Inspection is refused too: nobody should learn a path we will not use.
+		if _, err := inspectForTest(t, path); !errors.Is(err, ErrUnsafePath) {
+			t.Errorf("Inspect(%v/%v) = %v, want ErrUnsafePath", tc.name, tc.path, err)
 		}
 		if _, err := sess.Fetch(ctx, path, []string{"fixture/evil.bin"}); !errors.Is(err, ErrUnsafePath) {
 			t.Errorf("Fetch(%v/%v) = %v, want ErrUnsafePath", tc.name, tc.path, err)

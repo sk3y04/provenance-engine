@@ -18,6 +18,12 @@
 //     instead of being sanitised into a different path.
 //   - Writes and reads are constrained to the staging root, including
 //     symbolic links that already exist inside it.
+//   - Metadata arrives before any payload moves: a torrent is added with its
+//     storage deferred and both data directions disabled, and payload storage is
+//     opened only after the layout, the selection and the staging paths have
+//     passed admission. A rejected torrent therefore never creates a payload
+//     directory, part file or completed piece. Inspection (see Inspect) goes
+//     further and never builds a session, a lock or a staging write at all.
 //   - Only selected files whose covering pieces are hash-verified complete are
 //     ever captured. Adjacent bytes from a shared edge piece may reach the
 //     disk; they are not captured.
@@ -34,6 +40,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +48,7 @@ import (
 
 	at "github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
+	"github.com/anacrolix/torrent/storage"
 
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 	"github.com/sk3y04/provenance-engine/internal/filelock"
@@ -126,6 +134,11 @@ type Config struct {
 
 	// OnUpdate, when non-nil, receives throttled aggregate progress.
 	OnUpdate func(Update)
+
+	// storage, when non-nil, replaces the library's default file storage. It
+	// exists so tests can prove that a rejected job never opened payload
+	// storage; production leaves it nil.
+	storage storage.ClientImpl
 }
 
 // Update is one progress sample.
@@ -348,6 +361,14 @@ func newClient(staging string, cfg Config) (*at.Client, error) {
 	// so the staging root is the client's data directory. That also keeps the
 	// piece-completion database and .part files inside the job's root.
 	cc.DataDir = staging
+	// Note: ClientConfig has no DeferStorageOpen switch (that lives on
+	// AddTorrentOpts, applied per torrent in open). The default file storage
+	// this config implies still creates <DataDir> and <DataDir>/.torrent.db
+	// eagerly here, at client construction — which is why inspection never
+	// builds a client over a staging root.
+	if cfg.storage != nil {
+		cc.DefaultStorage = cfg.storage
+	}
 	cc.Seed = cfg.KeepSeeding
 	cc.ListenPort = 0
 	cc.NoDefaultPortForwarding = true
@@ -453,6 +474,59 @@ func parseSource(raw string) (source, error) {
 }
 
 // opened is one torrent with metadata available and paths validated.
+// applyAdmissionOpts closes the window between "torrent exists" and "layout has
+// been checked": storage is deferred, and no piece data moves in either
+// direction, from the moment the torrent is created. The explicit
+// Disallow*Data* calls afterwards are belt and braces for a torrent the client
+// already knew, where AddTorrentOpts no longer applies.
+func applyAdmissionOpts(spec *at.TorrentSpec) {
+	spec.DeferStorageOpen = true
+	spec.DisallowDataDownload = true
+	spec.DisallowDataUpload = true
+}
+
+// openPayload opens payload storage. It is called only after the layout and the
+// requested selection have passed admission, so a rejected job never creates a
+// payload directory, part file or completed piece.
+func (o *opened) openPayload(ctx context.Context) error {
+	if err := o.t.OpenStorage(ctx, nil); err != nil {
+		return fmt.Errorf("open payload storage: %w", err)
+	}
+	return nil
+}
+
+// validateStagingPaths rejects a symlink anywhere on a path this job could
+// write through, including files that are not selected: a piece can span files,
+// so an unselected neighbour is still a write target.
+//
+// The check covers what exists at admission time. Two limits are documented
+// rather than papered over: the window between this check and the library's
+// first write is not atomic (another process able to write inside the staging
+// root could swap a component), and the library itself refuses nothing — its
+// file backend joins metainfo components directly, and storage.ToSafeFilePath
+// is only used by the mmap backend.
+func (o *opened) validateStagingPaths() error {
+	rels := make([]string, 0, len(o.byPath))
+	for rel := range o.byPath {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	for _, rel := range rels {
+		if err := checkNoSymlink(o.staging, rel); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// enableTransfer lifts the admission gate once priorities describe the selected
+// files. Uploads stay enabled during the transfer: reciprocity is what keeps
+// some peers willing to send.
+func (o *opened) enableTransfer() {
+	o.t.AllowDataDownload()
+	o.t.AllowDataUpload()
+}
+
 type opened struct {
 	t           *at.Torrent
 	src         source
@@ -461,28 +535,6 @@ type opened struct {
 	byPath      map[string]*at.File
 	staging     string
 	stagingRoot string
-}
-
-// List resolves metadata for a source and returns the file list without
-// downloading payload. Run individually, it fetches nothing; a torrent whose
-// peers start sending immediately may still leave a piece on disk.
-func (s *Session) List(ctx context.Context, rawSource string) (Info, error) {
-	s.runMu.Lock()
-	defer s.runMu.Unlock()
-	if err := s.checkOpen(); err != nil {
-		return Info{}, err
-	}
-	src, err := parseSource(rawSource)
-	if err != nil {
-		return Info{}, err
-	}
-	metaCtx, cancel := context.WithTimeout(ctx, s.cfg.MetadataTimeout)
-	defer cancel()
-	o, err := s.open(metaCtx, src, true)
-	if err != nil {
-		return Info{}, err
-	}
-	return o.info, nil
 }
 
 // Fetch downloads exactly the selected files and returns verified assets.
@@ -580,7 +632,7 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 // the verified payload, and commits the capture.
 func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRecord, warnings []string) (Capture, error) {
 	metaCtx, cancelMeta := context.WithTimeout(ctx, s.cfg.MetadataTimeout)
-	o, err := s.open(metaCtx, src, false)
+	o, err := s.open(metaCtx, src)
 	cancelMeta()
 	if err != nil {
 		return Capture{}, err
@@ -603,6 +655,20 @@ func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRe
 		}
 	}
 
+	// Every path this job could write through must be free of symlinks before
+	// storage exists: the library's file backend joins metainfo components with
+	// filepath.Join and does not sanitise them, so a symlink sitting in staging
+	// would redirect a write outside the root.
+	if err := o.validateStagingPaths(); err != nil {
+		return Capture{}, err
+	}
+	// Admission is complete: the layout is valid, every requested path exists,
+	// the selection is within limits, and staging has no symlink on any path we
+	// are about to write through. Only now is payload storage opened.
+	if err := o.openPayload(ctx); err != nil {
+		return Capture{}, err
+	}
+
 	selectedFiles := make(map[*at.File]struct{}, len(selected))
 	for _, sf := range selected {
 		selectedFiles[sf.file] = struct{}{}
@@ -614,6 +680,7 @@ func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRe
 		}
 		f.SetPriority(at.PiecePriorityNone)
 	}
+	o.enableTransfer()
 
 	// Verify retained bytes before asking for more: a resumed job must not
 	// re-download pieces already on disk, and corrupted retained data must be
@@ -709,7 +776,7 @@ func (s *Session) captureStaged(job *jobRecord, bytesRead int64, warnings []stri
 
 // open adds the torrent, waits for metadata, persists the exact metainfo once,
 // and validates every path in it.
-func (s *Session) open(ctx context.Context, src source, listOnly bool) (*opened, error) {
+func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 	miPath := s.metainfoPath(src.infoHash)
 
 	var t *at.Torrent
@@ -718,30 +785,41 @@ func (s *Session) open(ctx context.Context, src source, listOnly bool) (*opened,
 		// Reuse the metainfo we saved on a previous run. This is what makes a
 		// restart independent of metadata availability, and it means a resume
 		// needs no peer at all to start verifying.
-		t, err = s.client.AddTorrent(persisted)
+		spec := at.TorrentSpecFromMetaInfo(persisted)
+		applyAdmissionOpts(spec)
+		t, _, err = s.client.AddTorrentSpec(spec)
 		if err != nil {
 			return nil, fmt.Errorf("add persisted torrent: %w", err)
 		}
 	} else {
 		switch src.kind {
 		case "magnet":
-			t, err = s.client.AddMagnet(src.magnet)
+			spec, serr := at.TorrentSpecFromMagnetUri(src.magnet)
+			if serr != nil {
+				return nil, errors.New("add magnet: " + sanitizeSourceText(serr.Error(), src.magnet))
+			}
+			applyAdmissionOpts(spec)
+			t, _, err = s.client.AddTorrentSpec(spec)
 			if err != nil {
-				return nil, fmt.Errorf("add magnet: %w", err)
+				return nil, errors.New("add magnet: " + sanitizeSourceText(err.Error(), src.magnet))
 			}
 		case "file":
 			mi, lerr := metainfo.LoadFromFile(src.path)
 			if lerr != nil {
 				return nil, fmt.Errorf("load %s: %w", filepath.Base(src.path), lerr)
 			}
-			// Refuse a hostile metainfo before the library opens storage for
-			// it: this way no directory or file is created first.
+			// Refuse a hostile or unsupported metainfo before the library
+			// touches it at all: nothing is created first.
 			if info, ierr := mi.UnmarshalInfo(); ierr != nil {
 				return nil, fmt.Errorf("parse info of %s: %w", filepath.Base(src.path), ierr)
+			} else if ierr := requireV1Identity(&info); ierr != nil {
+				return nil, fmt.Errorf("%s: %w", filepath.Base(src.path), ierr)
 			} else if _, verr := validateInfoPaths(&info); verr != nil {
 				return nil, verr
 			}
-			t, err = s.client.AddTorrent(mi)
+			spec := at.TorrentSpecFromMetaInfo(mi)
+			applyAdmissionOpts(spec)
+			t, _, err = s.client.AddTorrentSpec(spec)
 			if err != nil {
 				return nil, fmt.Errorf("add torrent: %w", err)
 			}
@@ -749,6 +827,13 @@ func (s *Session) open(ctx context.Context, src source, listOnly bool) (*opened,
 			return nil, fmt.Errorf("%w: unknown source kind %q", ErrUnsupportedSource, src.kind)
 		}
 	}
+	// Admission gate. Until the layout and the requested selection have been
+	// validated, this torrent may exchange metadata but must not move payload in
+	// either direction. Together with DeferStorageOpen this means metainfo
+	// arrival cannot create a directory, a part file or a completed piece.
+	t.DisallowDataDownload()
+	t.DisallowDataUpload()
+
 	// Explicit peers are useful in both branches: a magnet needs them for
 	// metadata, and a resumed job needs them for any missing pieces.
 	if len(s.peers) > 0 {
@@ -770,6 +855,12 @@ func (s *Session) open(ctx context.Context, src source, listOnly bool) (*opened,
 	info := t.Info()
 	if info == nil {
 		return nil, errors.New("torrent reported no info after metadata")
+	}
+	// Refresh metadata can arrive from a peer as a v2/hybrid dictionary even
+	// when the magnet named a v1 infohash; identity is checked before any
+	// layout is used.
+	if err := requireV1Identity(info); err != nil {
+		return nil, err
 	}
 	name := info.BestName()
 	files, byPath, err := validatedFiles(t, info, name)
@@ -798,11 +889,6 @@ func (s *Session) open(ctx context.Context, src source, listOnly bool) (*opened,
 		byPath:      byPath,
 		staging:     s.staging,
 		stagingRoot: stagingRoot,
-	}
-	if listOnly {
-		for _, f := range o.files {
-			f.SetPriority(at.PiecePriorityNone)
-		}
 	}
 	return o, nil
 }

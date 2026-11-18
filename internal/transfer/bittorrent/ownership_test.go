@@ -198,7 +198,7 @@ func TestClosedSessionRejectsWork(t *testing.T) {
 		!strings.Contains(err.Error(), "closed") {
 		t.Fatalf("Fetch after Close = %v, want a closed-session error", err)
 	}
-	if _, err := sess.List(ctx, s.magnet()); err == nil || !strings.Contains(err.Error(), "closed") {
+	if _, err := sess.Fetch(ctx, s.magnet(), []string{"fixture/a.bin"}); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("List after Close = %v, want a closed-session error", err)
 	}
 	// Double Close is safe and keeps the root available.

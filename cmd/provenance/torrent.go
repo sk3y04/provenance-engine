@@ -47,7 +47,7 @@ private swarm. The client does not seed after completion unless --seed is set,
 and it is never exposed to a remote endpoint. Only grab content you are
 authorized to download.`,
 	}
-	cmd.PersistentFlags().StringVarP(&flagTorrentOut, "output", "o", "./downloads", "Staging directory for this job")
+	cmd.PersistentFlags().StringVarP(&flagTorrentOut, "output", "o", "./downloads", "Staging directory for fetch and status (inspect does not use it)")
 	cmd.PersistentFlags().StringArrayVar(&flagTorrentPeer, "peer", nil, "Explicit peer address host:port (repeatable, for private swarms)")
 	cmd.PersistentFlags().StringVar(&flagTorrentMaxBytes, "max-bytes", "", "Reject a selection larger than this, e.g. 4GB")
 	cmd.PersistentFlags().DurationVar(&flagTorrentTimeout, "timeout", 0, "Overall transfer deadline, e.g. 30m (default: no limit)")
@@ -56,9 +56,19 @@ authorized to download.`,
 	inspect := &cobra.Command{
 		Use:   "inspect SOURCE",
 		Short: "List the files in a magnet or .torrent without downloading payload",
-		Args:  cobra.ExactArgs(1),
+		Long: `Read a torrent's file layout without downloading payload.
+
+A local .torrent is parsed in memory: no client is built, nothing is dialled, and
+no temporary directory is created. A magnet is resolved through a short-lived
+client that is bounded by --timeout (metadata only, payload transfer disabled)
+and closed before the command returns.
+
+Inspection is job-free: it does not use -o, does not take the staging lock, does
+not create payload directories, a piece-completion database or a job record, and
+does not persist metainfo. It can run while a fetch owns the same staging root.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runTorrentInspect(cmd.Context(), args[0])
+			return runTorrentInspect(cmd.Context(), args[0], os.Stdout)
 		},
 	}
 	inspect.Flags().BoolVar(&flagTorrentJSON, "json", false, "Emit the file list as JSON")
@@ -124,29 +134,26 @@ func parseMaxBytes() (int64, error) {
 	return n, nil
 }
 
-func runTorrentInspect(ctx context.Context, source string) error {
-	maxBytes, err := parseMaxBytes()
-	if err != nil {
-		return err
-	}
-	sess, err := bittorrent.New(torrentConfig(maxBytes, nil))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = sess.Close() }()
-
-	info, err := sess.List(ctx, source)
+func runTorrentInspect(ctx context.Context, source string, stdout io.Writer) error {
+	// Inspection is metadata-only: it takes no staging lock, writes nothing to
+	// the staging root, and opens no payload storage, so -o is not used here.
+	// A local .torrent is parsed in memory; a magnet gets a temporary client
+	// that is closed before this returns.
+	info, err := bittorrent.Inspect(ctx, source, bittorrent.InspectConfig{
+		Peers:           flagTorrentPeer,
+		MetadataTimeout: flagTorrentTimeout,
+	})
 	if err != nil {
 		return err
 	}
 	if flagTorrentJSON {
-		return writeTorrentJSON(os.Stdout, info)
+		return writeTorrentJSON(stdout, info)
 	}
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] infohash %s\n", info.InfoHash)
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] %s — %d file(s), %s total\n",
 		info.Name, len(info.Files), manifest.HumanSize(info.TotalLength))
 	for i, f := range info.Files {
-		_, _ = fmt.Fprintf(os.Stdout, "%2d. %10s  %s\n", i+1, manifest.HumanSize(f.Length), f.Path)
+		_, _ = fmt.Fprintf(stdout, "%2d. %10s  %s\n", i+1, manifest.HumanSize(f.Length), f.Path)
 	}
 	_, _ = fmt.Fprintln(os.Stderr, "\n[provenance] pass one of these paths to: provenance torrent fetch SOURCE --select PATH")
 	return nil

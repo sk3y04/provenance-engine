@@ -417,7 +417,7 @@ Selective BitTorrent fetch. A source is a v1 magnet link (`urn:btih`) or a local
 Downloads are verified against the torrent's piece hashes, then written to a capture manifest in the same format `collect sync --record` produces, so `manifest verify` and `archive import` work on the result unchanged:
 
 ```bash
-provenance torrent inspect "magnet:?xt=urn:btih:..."      # list selectable paths
+provenance torrent inspect "magnet:?xt=urn:btih:..."      # list selectable paths (metadata only)
 provenance torrent fetch "magnet:?xt=urn:btih:..." \
   --select "release/track.flac" --select "release/cover.jpg" \
   -o ./downloads/release --max-bytes 2GB --timeout 30m
@@ -427,13 +427,24 @@ provenance archive import ./downloads/release --collection music --vault ~/Vault
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-o`, `--output` | string | `./downloads` | Staging root for this job |
+| `-o`, `--output` | string | `./downloads` | Staging root for `fetch` and `status`; `inspect` does not use it |
 | `--select` | string (repeatable) | *(required for fetch)* | Exact file path from `inspect`; commas also accepted |
 | `--peer` | string (repeatable) | - | Explicit `host:port` peer, for private swarms |
 | `--max-bytes` | size | `0` (no limit) | Reject a selection larger than this before downloading |
 | `--timeout` | duration | `0` (no limit) | Overall deadline for the fetch |
 | `--seed` | bool | `false` | Keep seeding after capture until interrupted |
 | `--json` | bool | `false` | Machine-readable output for `inspect`, `fetch` and `status` |
+
+### `torrent inspect`
+
+Metadata only, and job-free: it takes no staging lock, creates no payload directory, piece-completion database or job record, and persists no metainfo.
+
+- A local `.torrent` is parsed in memory — no client is constructed, nothing is dialled, no temporary directory is created.
+- A magnet is resolved through a short-lived client bounded by `--timeout` (default two minutes), with payload storage deferred and both data directions disabled, so no piece is requested or served. The client and its private temporary directory are closed and removed on success, error, timeout and cancellation.
+- v2-only and hybrid metainfo are refused with `unsupported torrent identity`, and `urn:btmh` magnets with `unsupported torrent source`. Only v1 torrents are accepted, because selection and capture are defined over v1 file offsets.
+- `--peer` and `--timeout` apply; `-o`, `--max-bytes` and `--seed` do not.
+
+Inspection can run while a fetch owns the same staging root.
 
 ### `torrent status`
 
@@ -524,7 +535,7 @@ Records are validated on read: unsafe paths in a record, a mismatched file name,
 - **Selection is not a guarantee about disk contents.** BitTorrent pieces can span file boundaries, so fetching one file may write neighbouring bytes (a shared edge piece). Only the selected, complete, hash-verified files are captured.
 - **Resume.** A second run in the same staging root re-verifies retained pieces before requesting more, so verified bytes are reused and corrupted retained data is re-fetched instead of captured. Persisting the metainfo means a restart needs no peer to begin verifying.
 - **Durable job state.** Each torrent gets a job record with separate payload, capture and seeding states. A capture failure can be retried from the verified staged bytes without contacting the swarm (reported as `payload=ready capture=pending`), and a restart after a capture was committed recognises the existing capture by its idempotency key instead of recording a duplicate (`existing capture reconciled`). The state line is printed after every fetch and included in `--json`.
-- **One owner per staging root.** A staging root is owned exclusively by one process for as long as its command runs, including while `--seed` continues serving after the capture is committed. A second `torrent fetch` or `torrent inspect` against the same root—through any spelling of the path—fails with `staging root is busy … retry after it exits` and writes nothing. Different `--output` roots run concurrently. The lock is released when the command exits, and by the kernel if the process is killed.
+- **One owner per staging root.** A staging root is owned exclusively by one process for as long as its `fetch` runs, including while `--seed` continues serving after the capture is committed. A second `torrent fetch` against the same root—through any spelling of the path—fails with `staging root is busy … retry after it exits` and writes nothing. `torrent inspect` and `torrent status` do not take the lock, so both work while a fetch owns the root. Different `--output` roots run concurrently. The lock is released when the command exits, and by the kernel if the process is killed.
 - **Selection is immutable per job.** Re-running with a different `--select` set is refused (`ErrSelectionLocked`); use a new staging root.
 - **Uploads while fetching** are enabled (normal reciprocity). Continued seeding after completion is opt-in via `--seed`.
 - **No network surface.** The adapter opens no listener for other tools, exposes no RPC, and has no aria2-compatible interface.
