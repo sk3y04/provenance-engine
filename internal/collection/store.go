@@ -4,6 +4,7 @@
 package collection
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 	"github.com/sk3y04/provenance-engine/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/filelock"
 )
 
 var storeMu sync.Mutex
@@ -47,6 +49,11 @@ type Store struct {
 func Add(name, rawURL, site string, opts config.Config) error {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	lk, err := lockStore()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
 
 	if err := validName(name); err != nil {
 		return err
@@ -123,6 +130,11 @@ func Get(name string) (Collection, error) {
 func Remove(name string) error {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	lk, err := lockStore()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
 
 	if err := validName(name); err != nil {
 		return err
@@ -138,6 +150,11 @@ func Remove(name string) error {
 func AddSeen(name string, ids ...string) error {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	lk, err := lockStore()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
 
 	if err := validName(name); err != nil {
 		return err
@@ -164,6 +181,11 @@ func AddSeen(name string, ids ...string) error {
 func RecordSync(name string, result SyncResult) error {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	lk, err := lockStore()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
 
 	if err := validName(name); err != nil {
 		return err
@@ -183,6 +205,16 @@ func RecordSync(name string, result SyncResult) error {
 	c.UpdatedAt = now
 	s.Collections[name] = c
 	return save(s)
+}
+
+// lockStore serializes read-modify-write cycles across processes; storeMu
+// only covers goroutines within this process.
+func lockStore() (*filelock.Lock, error) {
+	path, err := storePath()
+	if err != nil {
+		return nil, err
+	}
+	return filelock.Acquire(context.Background(), path)
 }
 
 func storePath() (string, error) {

@@ -2,6 +2,7 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 	"github.com/sk3y04/provenance-engine/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/filelock"
 )
 
 const maxSaveRetries = 3
@@ -113,7 +115,10 @@ func OpenOrCreate(name string, opts config.Config) (*Session, error) {
 		s.mu.Lock()
 		s.Options = opts
 		s.UpdatedAt = time.Now()
-		err = s.saveLocked()
+		err = s.saveWithRetryLocked(func() {
+			s.Options = opts
+			s.UpdatedAt = time.Now()
+		})
 		s.mu.Unlock()
 		return s, err
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -175,19 +180,22 @@ func (s *Session) AddURLs(urls []string, source string) (int, error) {
 	}
 	if added > 0 {
 		s.UpdatedAt = time.Now()
-		return added, s.saveLocked()
+		return added, s.saveWithRetryLocked(func() {
+			for _, raw := range urls {
+				s.addURLLocked(raw, source)
+			}
+			s.UpdatedAt = time.Now()
+		})
 	}
 	return 0, nil
 }
 
 func (s *Session) Queue(url, source string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.addURLLocked(url, source) {
-		if err := s.saveLocked(); err != nil {
-			fmt.Fprintf(os.Stderr, "[provenance] session save warning: %v\n", err)
-		}
+		_ = s.saveWithRetryLocked(func() { s.addURLLocked(url, source) })
 	}
-	s.mu.Unlock()
 }
 
 func (s *Session) Start(url string) {
@@ -317,29 +325,35 @@ func (s *Session) transition(url string, status Status, lastError string, countA
 		s.UpdatedAt = e.UpdatedAt
 	}
 	apply()
-	s.saveWithRetryLocked(apply)
+	_ = s.saveWithRetryLocked(apply)
 }
 
 // saveWithRetryLocked saves, and on a concurrent-modification conflict reloads
 // the disk state and re-applies apply before retrying, so the pending mutation
-// is never silently dropped by the reload.
-func (s *Session) saveWithRetryLocked(apply func()) {
+// is never silently dropped by the reload. It returns nil on success and the
+// last error when retries are exhausted (warnings are printed as they happen).
+func (s *Session) saveWithRetryLocked(apply func()) error {
+	var lastErr error
 	for retry := 0; retry < maxSaveRetries; retry++ {
 		err := s.saveLocked()
 		if err == nil {
-			return
+			return nil
 		}
+		lastErr = err
 		if !errors.Is(err, ErrConcurrentModification) {
 			fmt.Fprintf(os.Stderr, "[provenance] session save warning: %v\n", err)
-			return
+			return err
 		}
 		if err := s.reloadFromDiskLocked(); err != nil {
 			fmt.Fprintf(os.Stderr, "[provenance] session reload warning: %v\n", err)
-			return
+			return err
 		}
-		apply()
+		if apply != nil {
+			apply()
+		}
 	}
 	fmt.Fprintf(os.Stderr, "[provenance] session save: max retries exceeded (concurrent modification)\n")
+	return lastErr
 }
 
 func (s *Session) reloadFromDiskLocked() error {
@@ -394,6 +408,13 @@ func (s *Session) saveLocked() error {
 		}
 		s.path = path
 	}
+	// Serialize the version-check-and-write cycle across processes; the
+	// in-process mutex alone cannot prevent lost updates between CLIs.
+	lk, err := filelock.Acquire(context.Background(), s.path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
 	if s.Version > 0 {
 		data, err := os.ReadFile(s.path)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {

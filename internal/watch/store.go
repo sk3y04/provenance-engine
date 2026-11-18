@@ -2,6 +2,7 @@
 package watch
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 	"github.com/sk3y04/provenance-engine/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/filelock"
 )
 
 var storeMu sync.Mutex
@@ -36,7 +38,12 @@ type Store struct {
 func Add(name, rawURL string, opts config.Config) error {
 	storeMu.Lock()
 	defer storeMu.Unlock()
-	name, err := safeName(name)
+	lk, err := lockStore()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
+	name, err = safeName(name)
 	if err != nil {
 		return err
 	}
@@ -59,6 +66,11 @@ func Add(name, rawURL string, opts config.Config) error {
 func List() ([]Subscription, error) {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	lk, err := lockStore()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = lk.Release() }()
 	s, err := load()
 	if err != nil {
 		return nil, err
@@ -74,7 +86,12 @@ func List() ([]Subscription, error) {
 func Get(name string) (Subscription, error) {
 	storeMu.Lock()
 	defer storeMu.Unlock()
-	name, err := safeName(name)
+	lk, err := lockStore()
+	if err != nil {
+		return Subscription{}, err
+	}
+	defer func() { _ = lk.Release() }()
+	name, err = safeName(name)
 	if err != nil {
 		return Subscription{}, err
 	}
@@ -92,7 +109,12 @@ func Get(name string) (Subscription, error) {
 func Remove(name string) error {
 	storeMu.Lock()
 	defer storeMu.Unlock()
-	name, err := safeName(name)
+	lk, err := lockStore()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
+	name, err = safeName(name)
 	if err != nil {
 		return err
 	}
@@ -107,7 +129,12 @@ func Remove(name string) error {
 func MarkRun(name string) error {
 	storeMu.Lock()
 	defer storeMu.Unlock()
-	name, err := safeName(name)
+	lk, err := lockStore()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
+	name, err = safeName(name)
 	if err != nil {
 		return err
 	}
@@ -129,7 +156,12 @@ func MarkRun(name string) error {
 func MarkRunWithStatus(name string, duration time.Duration, status string) error {
 	storeMu.Lock()
 	defer storeMu.Unlock()
-	name, err := safeName(name)
+	lk, err := lockStore()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
+	name, err = safeName(name)
 	if err != nil {
 		return err
 	}
@@ -157,7 +189,12 @@ func MarkRunWithStatus(name string, duration time.Duration, status string) error
 func MarkInterruptedIfRunning(name string) (bool, error) {
 	storeMu.Lock()
 	defer storeMu.Unlock()
-	name, err := safeName(name)
+	lk, err := lockStore()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = lk.Release() }()
+	name, err = safeName(name)
 	if err != nil {
 		return false, err
 	}
@@ -210,6 +247,16 @@ func save(s Store) error {
 		return err
 	}
 	return atomicfile.WriteFile(path, data, 0o600)
+}
+
+// lockStore serializes read-modify-write cycles across processes; storeMu
+// only covers goroutines within this process.
+func lockStore() (*filelock.Lock, error) {
+	path, err := storePath()
+	if err != nil {
+		return nil, err
+	}
+	return filelock.Acquire(context.Background(), path)
 }
 
 func storePath() (string, error) {

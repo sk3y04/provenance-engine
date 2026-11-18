@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/user"
@@ -10,6 +11,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
+	"github.com/sk3y04/provenance-engine/internal/filelock"
 )
 
 // ---------------------------------------------------------------------------
@@ -113,6 +115,12 @@ func (cs *configStore) saveLocked() {
 		return
 	}
 	// Unique temp file + rename: concurrent writers never share a temp path.
+	// The cross-process lock serializes config read-modify-write cycles.
+	lk, err := filelock.Acquire(context.Background(), cs.path)
+	if err != nil {
+		return
+	}
+	defer func() { _ = lk.Release() }()
 	_ = atomicfile.WriteFile(cs.path, data, 0o600)
 }
 

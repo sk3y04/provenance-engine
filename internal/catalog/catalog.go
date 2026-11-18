@@ -3,6 +3,7 @@
 package catalog
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/archive"
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
+	"github.com/sk3y04/provenance-engine/internal/filelock"
 )
 
 var mu sync.Mutex
@@ -37,6 +39,11 @@ func LoadCollections(vaultRoot string) ([]archive.ArchiveCollection, error) {
 func SaveCollections(vaultRoot string, cols []archive.ArchiveCollection) error {
 	mu.Lock()
 	defer mu.Unlock()
+	lk, err := filelock.Acquire(context.Background(), filepath.Join(vaultRoot, "collections.json"))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
 
 	path := filepath.Join(vaultRoot, "collections.json")
 	data, err := json.MarshalIndent(cols, "", "  ")
@@ -52,6 +59,11 @@ func SaveCollections(vaultRoot string, cols []archive.ArchiveCollection) error {
 func UpsertCollection(vaultRoot string, col archive.ArchiveCollection) error {
 	mu.Lock()
 	defer mu.Unlock()
+	lk, err := filelock.Acquire(context.Background(), filepath.Join(vaultRoot, "collections.json"))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
 	cols, err := loadLocked(vaultRoot)
 	if err != nil {
 		return err

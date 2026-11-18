@@ -2,6 +2,7 @@
 package history
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 	"github.com/sk3y04/provenance-engine/internal/config"
+	"github.com/sk3y04/provenance-engine/internal/filelock"
 )
 
 var storeMu sync.Mutex
@@ -53,6 +55,11 @@ type Store struct {
 func List() ([]Run, error) {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	lk, err := lockStore()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = lk.Release() }()
 	s, err := load()
 	if err != nil {
 		return nil, err
@@ -69,6 +76,11 @@ func Add(run Run) (Run, error) {
 func AddWithLimit(run Run, limit int) (Run, error) {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	lk, err := lockStore()
+	if err != nil {
+		return Run{}, err
+	}
+	defer func() { _ = lk.Release() }()
 	if limit <= 0 {
 		limit = DefaultLimit
 	}
@@ -95,6 +107,11 @@ func AddWithLimit(run Run, limit int) (Run, error) {
 func Get(id string) (Run, error) {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	lk, err := lockStore()
+	if err != nil {
+		return Run{}, err
+	}
+	defer func() { _ = lk.Release() }()
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return Run{}, fmt.Errorf("history id cannot be empty")
@@ -114,6 +131,11 @@ func Get(id string) (Run, error) {
 func Delete(id string) error {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	lk, err := lockStore()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("history id cannot be empty")
@@ -135,6 +157,11 @@ func Delete(id string) error {
 func Clear() error {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	lk, err := lockStore()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
 	path, err := storePath()
 	if err != nil {
 		return err
@@ -224,6 +251,16 @@ func save(s Store) error {
 		return err
 	}
 	return atomicfile.WriteFile(path, data, 0o600)
+}
+
+// lockStore serializes read-modify-write cycles across processes; storeMu
+// only covers goroutines within this process.
+func lockStore() (*filelock.Lock, error) {
+	path, err := storePath()
+	if err != nil {
+		return nil, err
+	}
+	return filelock.Acquire(context.Background(), path)
 }
 
 func storePath() (string, error) {

@@ -1,7 +1,11 @@
 package collection
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/sk3y04/provenance-engine/internal/config"
@@ -102,6 +106,60 @@ func TestCollectionInvalidNames(t *testing.T) {
 		if err := Add(name, "https://example.com", "generic", config.Config{}); err == nil {
 			t.Errorf("expected error for name %q", name)
 		}
+	}
+}
+
+// TestCrossProcessAddSeenNoLostUpdates spawns real child processes that each
+// record seen IDs into the same collection store. Without cross-process
+// locking the load-modify-save cycles overwrite each other and IDs vanish.
+func TestCrossProcessAddSeenNoLostUpdates(t *testing.T) {
+	if os.Getenv("PROVENANCE_TEST_HELPER") == "1" {
+		// Child: record 20 unique IDs, then exit.
+		for i := 0; i < 20; i++ {
+			if err := AddSeen("shared", fmt.Sprintf("id-%s-%d", os.Getenv("PROVENANCE_TEST_CHILD"), i)); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
+		os.Exit(0)
+	}
+
+	file := filepath.Join(t.TempDir(), "collections.json")
+	t.Setenv("PROVENANCE_COLLECTION_FILE", file)
+	if err := Add("shared", "https://example.com/feed", "generic", config.Config{}); err != nil {
+		t.Fatal(err)
+	}
+
+	const children = 4
+	var wg sync.WaitGroup
+	errs := make(chan error, children)
+	for c := 0; c < children; c++ {
+		wg.Add(1)
+		go func(c int) {
+			defer wg.Done()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestCrossProcessAddSeenNoLostUpdates$")
+			cmd.Env = append(os.Environ(),
+				"PROVENANCE_TEST_HELPER=1",
+				fmt.Sprintf("PROVENANCE_TEST_CHILD=%d", c),
+				"PROVENANCE_COLLECTION_FILE="+file,
+			)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				errs <- fmt.Errorf("child %d: %v\n%s", c, err, out)
+			}
+		}(c)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	col, err := Get("shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(col.SeenIDs) != children*20 {
+		t.Fatalf("SeenIDs = %d, want %d (lost updates across processes)", len(col.SeenIDs), children*20)
 	}
 }
 

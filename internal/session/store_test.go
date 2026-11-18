@@ -3,8 +3,10 @@ package session
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/sk3y04/provenance-engine/internal/config"
@@ -123,5 +125,45 @@ func TestInvalidSessionNames(t *testing.T) {
 		if _, err := OpenOrCreate(name, config.Config{}); err == nil {
 			t.Fatalf("OpenOrCreate(%q) succeeded, want error", name)
 		}
+	}
+}
+
+// TestConcurrentInstancesDoNotLoseUpdates simulates two processes (separate
+// Session instances, separate in-process mutexes) writing the same session
+// file concurrently. Every queued URL must survive: the cross-process file
+// lock serializes the version-check-and-write cycle so no update is lost.
+func TestConcurrentInstancesDoNotLoseUpdates(t *testing.T) {
+	t.Setenv("PROVENANCE_SESSION_DIR", t.TempDir())
+
+	a, err := OpenOrCreate("shared", config.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := OpenOrCreate("shared", config.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 40
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			a.Queue(fmt.Sprintf("https://a.example/%d", i), "test")
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			b.Queue(fmt.Sprintf("https://b.example/%d", i), "test")
+		}(i)
+	}
+	wg.Wait()
+
+	final, err := Load("shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final.Entries) != 2*n {
+		t.Fatalf("entries = %d, want %d (lost updates under concurrency)", len(final.Entries), 2*n)
 	}
 }
