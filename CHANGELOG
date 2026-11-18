@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stdout. Output never includes magnets, metainfo, tracker URLs, credentials or
   passkeys. See `docs/TORRENT.md` ("Read-only status") for what a record proves
   and the per-file, non-global consistency guarantee.
+- **Status hardening**: `staging_root` is resolved through symlinks, so two
+  spellings of one root produce identical output; record files are opened with
+  `Lstat` and must be regular files, so a symlink planted in the staging tree is
+  an unreadable record rather than a read outside the root; the list document
+  carries `complete` (the in-band form of the exit code, for scripts that only
+  parse stdout); and `payload.assets` exposes the recorded per-file digests
+  (path, length, SHA-256) as attested, without re-hashing anything.
 - **Exclusive staging ownership for torrent jobs**: a `bittorrent.Session` now
   takes an exclusive lock on its staging root (`<root>/.provenance/torrent/
   staging.lock`) for its whole lifetime, enforced inside the backend so callers

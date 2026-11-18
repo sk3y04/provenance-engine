@@ -247,12 +247,25 @@ complete old version or the complete new one. `TestReadDuringAtomicReplacement`
 replaces a record 300 times while a reader projects it and asserts every
 observation is one of the two complete versions.
 
-There is **no** snapshot across files: status reads the job record and reports
-the capture manifest path *as recorded*. It does not stat or re-verify the
-manifest, because the record and the manifest are separate files that a writer
-may replace at different times, and the two could disagree for a window. A
-globally consistent view of "record plus manifest" is not offered and is not
-claimed.
+Across records there is **no** snapshot, and the exposure is bounded rather than
+zero: ownership admits one writer per root, and that writer touches its own
+record only, so a listing can mix at most "the record of the job in flight" with
+"every other record, which is quiescent". With no job in flight a listing is
+internally consistent in practice. Status does not claim more than that, and it
+does not retry: retrying would add cost for a window it cannot close without
+the writer lock it is designed not to take. `complete` reports whether every
+record was readable, not whether the set was globally consistent.
+
+Status also does not stat or re-verify the capture manifest: the record and the
+manifest are separate files that a writer may replace at different times, so
+"record plus manifest" is deliberately not presented as one atomic fact.
+Re-establishing that truth is `manifest verify` (per capture) and `archive
+verify` (per vault), not status.
+
+`staging_root` is resolved through symlinks, so `./staging`, an absolute path,
+and a symlinked spelling all report the same root. Record files are opened with
+`Lstat` and must be regular files: a symlink planted in the staging tree is an
+unreadable record, not a window into something outside the root.
 
 ### Failure modes
 
@@ -262,7 +275,7 @@ claimed.
 | root exists, no jobs | `no torrent jobs recorded`, exit 0 |
 | requested id missing | `torrent job not found`, exit 1 |
 | requested id is not an identity | `invalid torrent job id`, exit 1 (validated as `bt-<40 hex>` or the bare infohash, never used as a path) |
-| a record fails to decode, has an unsupported format, or is filed under the wrong name | listed under `unreadable` with a reason; JSON stays valid; a stderr warning names the file; the command exits 1 because the listing is incomplete |
+| a record fails to decode, has an unsupported format, is filed under the wrong name, or is not a regular file (symlink) | listed under `unreadable` with a reason; JSON stays valid and `complete` is `false`; a stderr warning names the file; the command exits 1 because the listing is incomplete |
 
 ### What a record can and cannot prove
 
@@ -271,6 +284,7 @@ claimed.
 | identity: job id, infohash, backend | that the process is alive |
 | the immutable selection | that the payload files still match their hashes |
 | the last recorded payload, capture and seeding states | that the capture manifest still exists or is intact |
+| the recorded per-file digests (`payload.assets`) | that the payload bytes still match them |
 | the capture idempotency key and manifest path the writer recorded | that a peer, tracker or swarm is reachable |
 
 Anything beyond that is `archive verify` (vault integrity) or a fresh fetch.

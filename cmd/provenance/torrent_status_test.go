@@ -82,6 +82,7 @@ func TestTorrentStatusListJSON(t *testing.T) {
 
 	var doc struct {
 		StagingRoot string `json:"staging_root"`
+		Complete    bool   `json:"complete"`
 		Jobs        []struct {
 			JobID         string   `json:"job_id"`
 			InfoHash      string   `json:"info_hash"`
@@ -93,7 +94,12 @@ func TestTorrentStatusListJSON(t *testing.T) {
 				Seeding string `json:"seeding"`
 			} `json:"recorded_state"`
 			Payload *struct {
-				Files int `json:"files"`
+				Files  int `json:"files"`
+				Assets []struct {
+					Path   string `json:"path"`
+					Length int64  `json:"length"`
+					SHA256 string `json:"sha256"`
+				} `json:"assets"`
 			} `json:"payload"`
 			Capture *struct {
 				Manifest string `json:"manifest"`
@@ -118,8 +124,20 @@ func TestTorrentStatusListJSON(t *testing.T) {
 	if first.RecordedState.Payload != "ready" || first.RecordedState.Capture != "committed" {
 		t.Errorf("recorded_state = %+v", first.RecordedState)
 	}
+	if !doc.Complete {
+		t.Error("a listing with no unreadable records reported complete=false")
+	}
 	if first.Payload == nil || first.Payload.Files != 1 {
 		t.Errorf("payload projection = %+v", first.Payload)
+	}
+	if first.Payload != nil {
+		if len(first.Payload.Assets) != 1 {
+			t.Fatalf("payload assets = %+v", first.Payload.Assets)
+		}
+		asset := first.Payload.Assets[0]
+		if asset.Path != "fixture/a.bin" || asset.Length != 10 || asset.SHA256 != strings.Repeat("a", 64) {
+			t.Errorf("asset = %+v", asset)
+		}
 	}
 	if first.Capture == nil || first.Capture.Manifest == "" || first.Capture.Key == "" {
 		t.Errorf("capture projection = %+v", first.Capture)
@@ -281,6 +299,7 @@ func TestTorrentStatusUnreadableKeepsJSONValid(t *testing.T) {
 		t.Errorf("error = %v, want it to say the listing is incomplete", err)
 	}
 	var doc struct {
+		Complete   bool             `json:"complete"`
 		Jobs       []map[string]any `json:"jobs"`
 		Unreadable []struct {
 			File   string `json:"file"`
@@ -292,6 +311,9 @@ func TestTorrentStatusUnreadableKeepsJSONValid(t *testing.T) {
 	}
 	if len(doc.Jobs) != 1 || len(doc.Unreadable) != 1 {
 		t.Fatalf("document = %+v", doc)
+	}
+	if doc.Complete {
+		t.Error("document with an unreadable record reported complete=true")
 	}
 	if doc.Unreadable[0].File != "broken.job.json" || doc.Unreadable[0].Reason == "" {
 		t.Errorf("unreadable entry = %+v", doc.Unreadable[0])

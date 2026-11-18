@@ -465,6 +465,7 @@ With a job id the fields are shown one per line, including `payload verified …
 ```json
 {
   "staging_root": "/home/you/downloads/release",
+  "complete": true,
   "jobs": [
     {
       "job_id": "bt-94158d67ef6b15e5e8c80798996ff59369721f72",
@@ -475,7 +476,13 @@ With a job id the fields are shown one per line, including `payload verified …
       "created_at": "2026-11-18T14:40:02Z",
       "updated_at": "2026-11-18T14:44:56Z",
       "recorded_state": { "payload": "ready", "capture": "committed", "seeding": "seeding" },
-      "payload": { "verified_at": "2026-11-18T14:44:55Z", "files": 1 },
+      "payload": {
+        "verified_at": "2026-11-18T14:44:55Z",
+        "files": 1,
+        "assets": [
+          { "path": "fixture/c.bin", "length": 18000, "sha256": "…64 hex…" }
+        ]
+      },
       "capture": {
         "committed_at": "2026-11-18T14:44:56Z",
         "manifest": ".provenance/runs/2026-11-18T144456Z.json",
@@ -487,7 +494,11 @@ With a job id the fields are shown one per line, including `payload verified …
 }
 ```
 
-`jobs` is sorted by job id and is `[]` when the root has no jobs. A record that cannot be read appears in `"unreadable": [{"file": …, "reason": …}]` instead of being dropped; the document stays valid JSON, a warning goes to stderr, and the command exits 1 because the listing is incomplete. Records are validated on read: unsafe paths in a record, a mismatched file name, or an unsupported `format` make it unreadable rather than trusted. Status output never includes the magnet source, metainfo, tracker URLs, credentials or passkeys.
+`jobs` is sorted by job id and is `[]` when the root has no jobs. A record that cannot be read appears in `"unreadable": [{"file": …, "reason": …}]` instead of being dropped; the document stays valid JSON, a warning goes to stderr, and the command exits 1 because the listing is incomplete. `"complete"` carries the same fact in-band, so a script that only parses stdout can tell a full listing from a partial one without depending on the exit code.
+
+Records are validated on read: unsafe paths in a record, a mismatched file name, an unsupported `format`, or a record that is not a regular file (a symlink planted in the staging tree) make it unreadable rather than trusted. `staging_root` is the resolved absolute path, so two spellings of one root — including a symlinked one — produce identical output. Status output never includes the magnet source, metainfo, tracker URLs, credentials or passkeys.
+
+`payload.assets` is the recorded attestation only (path, length, SHA-256). Status does not re-hash those files; `provenance manifest verify` does.
 
 | Case | Exit code |
 |------|-----------|

@@ -41,9 +41,11 @@ var (
 // PayloadStatus describes the last recorded payload attestation.
 type PayloadStatus struct {
 	VerifiedAt time.Time `json:"verified_at"`
-	// Files is the number of selected files in the attestation. The digests
-	// themselves live in the record and in the capture manifest.
+	// Files is len(Assets), kept for callers that only need the count.
 	Files int `json:"files"`
+	// Assets is the recorded digest of each selected file, as the writer
+	// attested it. It is reported, not rechecked: status never reads payload.
+	Assets []Asset `json:"assets,omitempty"`
 }
 
 // CaptureStatus describes the last recorded capture commit.
@@ -88,8 +90,13 @@ type UnreadableJob struct {
 
 // JobListing is the result of listing a staging root's jobs.
 type JobListing struct {
-	// StagingRoot is the absolute root the listing came from.
+	// StagingRoot is the canonical absolute root the listing came from:
+	// symlinks are resolved, so two spellings of one root agree.
 	StagingRoot string `json:"staging_root"`
+	// Complete is false when at least one record could not be read. It is the
+	// in-band form of the non-zero exit code, so a script that only parses
+	// stdout can tell a full listing from a partial one.
+	Complete bool `json:"complete"`
 	// Jobs is sorted by job id and never nil, so JSON shows [] rather than null.
 	Jobs []JobStatus `json:"jobs"`
 	// Unreadable is sorted by file name and omitted when empty.
@@ -106,7 +113,7 @@ func ListJobs(stagingDir string) (JobListing, error) {
 	if err != nil {
 		return JobListing{}, err
 	}
-	listing := JobListing{StagingRoot: root, Jobs: []JobStatus{}}
+	listing := JobListing{StagingRoot: root, Complete: true, Jobs: []JobStatus{}}
 
 	dir := filepath.Join(root, filepath.FromSlash(torrentStateDir))
 	entries, err := os.ReadDir(dir)
@@ -124,12 +131,14 @@ func ListJobs(stagingDir string) (JobListing, error) {
 		}
 		status, err := statusFromPath(root, filepath.Join(dir, entry.Name()))
 		if err != nil {
+			listing.Complete = false
 			listing.Unreadable = append(listing.Unreadable, UnreadableJob{File: entry.Name(), Reason: err.Error()})
 			continue
 		}
 		// The file name must agree with the identity inside the record, so a
 		// planted or renamed record cannot masquerade as another job.
 		if want := status.JobID + ".job.json"; entry.Name() != want {
+			listing.Complete = false
 			listing.Unreadable = append(listing.Unreadable, UnreadableJob{
 				File:   entry.Name(),
 				Reason: fmt.Sprintf("record identifies as %s but the file is named %q", status.JobID, entry.Name()),
@@ -156,7 +165,7 @@ func ReadJobStatus(stagingDir, rawID string) (JobStatus, error) {
 		return JobStatus{}, err
 	}
 	path := filepath.Join(root, filepath.FromSlash(torrentStateDir), id+".job.json")
-	job, err := readJob(path)
+	job, err := readJobRecordFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return JobStatus{}, fmt.Errorf("%w: %s", ErrJobNotFound, id)
 	}
@@ -195,16 +204,40 @@ func statusRoot(stagingDir string) (string, error) {
 	if !fi.IsDir() {
 		return "", fmt.Errorf("staging root %s is not a directory", abs)
 	}
+	// Resolve symlinks so a reader that reaches the root through a link reports
+	// the same root as everyone else. This is a reporting detail only: status
+	// takes no lock, so lock identity is not involved.
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		abs = resolved
+	}
 	return abs, nil
 }
 
 // statusFromPath reads and validates one record for a listing.
 func statusFromPath(root, path string) (JobStatus, error) {
-	job, err := readJob(path)
+	job, err := readJobRecordFile(path)
 	if err != nil {
 		return JobStatus{}, err
 	}
 	return projectJob(root, job)
+}
+
+// readJobRecordFile decodes a record for read-only projection and refuses
+// anything that is not a regular file: a symlink planted in the staging tree
+// must not make status read outside the root. The writer's own reader is
+// unchanged.
+func readJobRecordFile(path string) (*jobRecord, error) {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	if err != nil {
+		return nil, fmt.Errorf("inspect job record: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("job record %s is not a regular file", filepath.Base(path))
+	}
+	return readJob(path)
 }
 
 // projectJob validates a decoded record and reduces it to the status
@@ -240,9 +273,12 @@ func projectJob(root string, job *jobRecord) (JobStatus, error) {
 		}
 	}
 	if job.Payload != nil {
+		assets := make([]Asset, 0, len(job.Payload.Assets))
+		assets = append(assets, job.Payload.Assets...)
 		status.Payload = &PayloadStatus{
 			VerifiedAt: job.Payload.VerifiedAt,
-			Files:      len(job.Payload.Assets),
+			Files:      len(assets),
+			Assets:     assets,
 		}
 	}
 	if job.Capture != nil {

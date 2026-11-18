@@ -465,3 +465,144 @@ func TestReadDuringAtomicReplacement(t *testing.T) {
 		}
 	}
 }
+
+// TestListJobsReportsComplete: a listing says in-band whether it is full, so a
+// script that only reads stdout does not have to infer it from the exit code.
+func TestListJobsReportsComplete(t *testing.T) {
+	root := t.TempDir()
+	writeJobFixture(t, root, jobFixture(hashOf('a'), nil))
+
+	listing, err := ListJobs(root)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if !listing.Complete {
+		t.Error("a listing with no unreadable records reported itself incomplete")
+	}
+
+	dir := filepath.Join(root, filepath.FromSlash(torrentStateDir))
+	if err := os.WriteFile(filepath.Join(dir, "broken.job.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	partial, err := ListJobs(root)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if partial.Complete {
+		t.Error("a listing with an unreadable record reported itself complete")
+	}
+	if len(partial.Jobs) != 1 || len(partial.Unreadable) != 1 {
+		t.Errorf("partial listing = %+v", partial)
+	}
+}
+
+// TestStatusProjectsPayloadAssets: the recorded per-file digests are reported,
+// and only the fields the projection declares.
+func TestStatusProjectsPayloadAssets(t *testing.T) {
+	root := t.TempDir()
+	ih := hashOf('b')
+	digest := strings.Repeat("b", 64)
+	writeJobFixture(t, root, jobFixture(ih, func(j *jobRecord) {
+		j.Payload.Assets = []Asset{
+			{Path: "fixture/a.bin", Length: 10, SHA256: digest},
+			{Path: "fixture/b.bin", Length: 20, SHA256: strings.Repeat("c", 64)},
+		}
+	}))
+
+	status, err := ReadJobStatus(root, jobID(ih))
+	if err != nil {
+		t.Fatalf("ReadJobStatus: %v", err)
+	}
+	if status.Payload == nil || status.Payload.Files != 2 || len(status.Payload.Assets) != 2 {
+		t.Fatalf("payload projection = %+v", status.Payload)
+	}
+	first := status.Payload.Assets[0]
+	if first.Path != "fixture/a.bin" || first.Length != 10 || first.SHA256 != digest {
+		t.Errorf("asset = %+v", first)
+	}
+	// The projection is not the record: nothing else from payload leaks out.
+	encoded, err := json.Marshal(status.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for key := range fields {
+		switch key {
+		case "verified_at", "files", "assets":
+		default:
+			t.Errorf("unexpected payload field %q", key)
+		}
+	}
+}
+
+// TestStatusCanonicalStagingRoot: two spellings of one root report the same
+// root, so a script comparing listings from different invocations agrees.
+func TestStatusCanonicalStagingRoot(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "staging")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeJobFixture(t, root, jobFixture(hashOf('c'), nil))
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	direct, err := ListJobs(root)
+	if err != nil {
+		t.Fatalf("ListJobs(root): %v", err)
+	}
+	viaLink, err := ListJobs(link)
+	if err != nil {
+		t.Fatalf("ListJobs(link): %v", err)
+	}
+	if direct.StagingRoot != viaLink.StagingRoot {
+		t.Errorf("staging root differs by spelling: %q vs %q", direct.StagingRoot, viaLink.StagingRoot)
+	}
+	if direct.StagingRoot != root {
+		t.Errorf("staging root = %q, want the resolved %q", direct.StagingRoot, root)
+	}
+	if len(viaLink.Jobs) != 1 {
+		t.Errorf("jobs through a symlinked root = %d, want 1", len(viaLink.Jobs))
+	}
+}
+
+// TestStatusRejectsSymlinkedRecord: a symlink in the staging tree must not make
+// the reader open a file outside the root, even when that file is a valid
+// record.
+func TestStatusRejectsSymlinkedRecord(t *testing.T) {
+	outside := t.TempDir()
+	ih := hashOf('d')
+	real := writeJobFixture(t, outside, jobFixture(ih, nil))
+
+	root := t.TempDir()
+	dir := filepath.Join(root, filepath.FromSlash(torrentStateDir))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, jobID(ih)+".job.json")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	listing, err := ListJobs(root)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(listing.Jobs) != 0 || len(listing.Unreadable) != 1 {
+		t.Fatalf("symlinked record was read: %+v", listing)
+	}
+	if !strings.Contains(listing.Unreadable[0].Reason, "not a regular file") {
+		t.Errorf("reason = %q", listing.Unreadable[0].Reason)
+	}
+	if listing.Complete {
+		t.Error("listing with a symlinked record reported itself complete")
+	}
+	if _, err := ReadJobStatus(root, jobID(ih)); err == nil {
+		t.Error("ReadJobStatus followed a symlinked record")
+	}
+}
