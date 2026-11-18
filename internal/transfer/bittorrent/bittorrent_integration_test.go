@@ -236,9 +236,13 @@ func TestInterruptedFetchResumesAndReusesVerifiedBytes(t *testing.T) {
 	}
 
 	// Pass 3: no peer at all. Persisted metainfo plus verified retained data
-	// must be enough to re-capture.
+	// must be enough to re-capture. The staging root is owned for the lifetime
+	// of a Session, so the previous one is closed first.
 	if errs := s.client.Close(); len(errs) > 0 {
 		t.Logf("seeder close: %v", errs)
+	}
+	if err := sess2.Close(); err != nil {
+		t.Fatalf("close resume session: %v", err)
 	}
 	sess3, err := New(Config{
 		StagingDir:           staging,
@@ -305,6 +309,11 @@ func TestCorruptedRetainedDataIsRepaired(t *testing.T) {
 	}
 	_ = f.Close()
 
+	// Staging ownership is per Session, so release the first one before the
+	// repair run opens its own.
+	if err := sess.Close(); err != nil {
+		t.Fatalf("close first session: %v", err)
+	}
 	sess2 := newTestSession(t, staging, s.peer())
 	ctx2, cancel2 := waitCtx(t)
 	defer cancel2()

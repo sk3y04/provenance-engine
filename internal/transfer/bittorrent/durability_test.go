@@ -63,9 +63,13 @@ func TestCaptureRetryAfterPayloadVerifyDoesNotRefetch(t *testing.T) {
 		t.Fatalf("capture manifests = %d, want 0 after a pre-capture failure", n)
 	}
 
-	// Take the swarm away entirely: the retry must not need it.
+	// Take the swarm away entirely: the retry must not need it. The staging root
+	// is owned by a Session, so the failed one is closed first.
 	if errs := s.client.Close(); len(errs) > 0 {
 		t.Logf("seeder close: %v", errs)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("close failed session: %v", err)
 	}
 	sess2, err := New(offlineConfig(staging))
 	if err != nil {
@@ -141,9 +145,14 @@ func TestCaptureCommitCrashReconcilesWithoutDuplicate(t *testing.T) {
 		t.Fatalf("manifests with key = %d, want 1 committed capture", n)
 	}
 
-	// Restart with no swarm and no verification input other than staging.
+	// Restart with no swarm and no verification input other than staging. The
+	// crashed session still holds ownership until it is closed, exactly as an
+	// exited process releases it.
 	if errs := s.client.Close(); len(errs) > 0 {
 		t.Logf("seeder close: %v", errs)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("close crashed session: %v", err)
 	}
 	sess2, err := New(offlineConfig(staging))
 	if err != nil {
@@ -290,6 +299,10 @@ func TestStaleStagedPayloadIsReportedAndRepaired(t *testing.T) {
 	}
 	_ = f.Close()
 
+	// Release ownership before the repair run opens its own Session.
+	if err := sess.Close(); err != nil {
+		t.Fatalf("close first session: %v", err)
+	}
 	sess2 := newTestSession(t, staging, s.peer())
 	ctx2, cancel2 := waitCtx(t)
 	defer cancel2()

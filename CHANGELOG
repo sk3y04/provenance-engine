@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Exclusive staging ownership for torrent jobs**: a `bittorrent.Session` now
+  takes an exclusive lock on its staging root (`<root>/.provenance/torrent/
+  staging.lock`) for its whole lifetime, enforced inside the backend so callers
+  cannot bypass it by skipping the CLI. The scope is the root, not the infohash,
+  because the root is what is actually shared: the piece-completion database,
+  payload directories (two torrents with the same name collide), and
+  second-granular run-manifest names. A competing `fetch` or `inspect` fails
+  fast with a retryable `ErrStagingBusy` before reading or writing any job,
+  resume, payload or capture state; nothing is created and no swarm session is
+  started. Ownership is held while `--seed` keeps the client using the working
+  files, so a repeat fetch against that root stays busy until the owner exits
+  while the committed capture remains readable. Released by `Close` on success,
+  error and cancellation, and by the kernel on process death (flock/LockFileEx,
+  so no stale-lock recovery is needed and an existing lock file is never taken
+  as evidence of a lock). Concurrent `Fetch`/`List` on one Session are
+  serialized. `internal/filelock` gained a non-blocking `TryAcquire` with an
+  `ErrLocked` sentinel; `Acquire` is unchanged. No manifest schema change, no
+  new database. See `docs/TORRENT.md` for the ownership section and the
+  remaining reader-visibility gaps.
+
 - **Durable torrent jobs with an idempotent capture handoff**: each torrent job
   now keeps a versioned record (`provenance/torrent-job+2`) with a stable job
   ID, backend, immutable selection, pointers into the torrent backend's own

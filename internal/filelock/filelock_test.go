@@ -2,6 +2,7 @@ package filelock
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -74,5 +75,35 @@ func TestAcquireRespectsContextCancellation(t *testing.T) {
 	defer cancel()
 	if _, err := Acquire(ctx, path); err == nil {
 		t.Fatal("Acquire succeeded despite contention and cancelled context")
+	}
+}
+
+// TestTryAcquireReportsBusyWithoutWaiting: a caller that must fail fast (rather
+// than queue behind an owner) needs a non-blocking attempt that distinguishes
+// "someone else holds it" from a real lock error.
+func TestTryAcquireReportsBusyWithoutWaiting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.json")
+	held, err := Acquire(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	start := time.Now()
+	if _, err := TryAcquire(path); !errors.Is(err, ErrLocked) {
+		t.Fatalf("TryAcquire while held = %v, want ErrLocked", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("TryAcquire waited %s; it must not block", elapsed)
+	}
+
+	if err := held.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	l, err := TryAcquire(path)
+	if err != nil {
+		t.Fatalf("TryAcquire after release: %v", err)
+	}
+	if err := l.Release(); err != nil {
+		t.Fatalf("Release second: %v", err)
 	}
 }

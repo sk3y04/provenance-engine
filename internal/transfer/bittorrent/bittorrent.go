@@ -36,12 +36,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	at "github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
+	"github.com/sk3y04/provenance-engine/internal/filelock"
 )
 
 const (
@@ -71,6 +73,11 @@ var (
 	// job verified. The attestation is dropped and the existing re-verify-and-
 	// repair path takes over; it is never captured as-is.
 	ErrStagedPayloadInvalid = errors.New("staged payload no longer matches the verified job")
+	// ErrStagingBusy means another Session owns the staging root. It is
+	// retryable: nothing in this job was read or written, and the caller can
+	// try again once the owner exits (or releases the root by closing its
+	// Session).
+	ErrStagingBusy = errors.New("staging root is busy")
 )
 
 // Test seams for the two durability boundaries this slice defines. Production
@@ -182,15 +189,50 @@ type Capture struct {
 	ManifestPath string `json:"manifest_path"`
 }
 
-// Session owns one torrent client. Create one per job, call Close when done.
+// Session owns one torrent client and, for its whole lifetime, exclusive
+// ownership of one staging root.
+//
+// Ownership is root-scoped, not torrent-scoped, because the root is what is
+// shared: the backend's piece-completion database lives at <root>/.torrent.db
+// and is keyed by infohash but written by one library instance per root, two
+// torrents can resolve to the same payload directory when their names match,
+// and capture run manifests are named by second (<root>/.provenance/runs/
+// <ts>.json), so two captures in the same second collide. Per-torrent locking
+// would leave all three races open.
+//
+// Acquire ownership before any job, resume, payload or capture state is read or
+// written; the lock is released by Close, or by the OS when the process dies.
 type Session struct {
 	cfg     Config
 	client  *at.Client
 	peers   []at.PeerInfo
 	staging string
+
+	// runMu serializes List and Fetch on this Session. The backend holds one
+	// client and one job's mutable state, so overlapping calls are queued
+	// rather than interleaved.
+	runMu sync.Mutex
+
+	// ownMu guards the ownership handle, which Close clears. Callers must not
+	// run Close concurrently with List or Fetch, but a concurrent Close must
+	// never corrupt the handle.
+	ownMu sync.Mutex
+	owner *filelock.Lock
 }
 
-// New validates cfg, prepares the staging root, and starts a client.
+// lockPath is the stable sidecar for this root's ownership. filelock appends
+// ".lock"; the path is inside the root so any spelling that resolves to the
+// same directory contends on the same inode.
+func (s *Session) lockPath() string {
+	return filepath.Join(s.staging, filepath.FromSlash(torrentStateDir), "staging")
+}
+
+// New validates cfg, takes exclusive ownership of the staging root, and starts
+// a client.
+//
+// A competing Session over the same root fails with ErrStagingBusy before
+// anything is read or written: no job record is created, no torrent is added,
+// no swarm connection is attempted.
 func New(cfg Config) (*Session, error) {
 	staging := strings.TrimSpace(cfg.StagingDir)
 	if staging == "" {
@@ -221,29 +263,81 @@ func New(cfg Config) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	client, err := newClient(abs, cfg)
-	if err != nil {
+
+	s := &Session{cfg: cfg, peers: peers, staging: abs}
+	if err := s.acquireOwnership(); err != nil {
 		return nil, err
 	}
-	return &Session{cfg: cfg, client: client, peers: peers, staging: abs}, nil
+	client, err := newClient(abs, cfg)
+	if err != nil {
+		_ = s.releaseOwnership()
+		return nil, err
+	}
+	s.client = client
+	return s, nil
+}
+
+// acquireOwnership takes the root lock without waiting. Contention is the
+// ordinary "another run is active" case and must not block or touch anything.
+func (s *Session) acquireOwnership() error {
+	s.ownMu.Lock()
+	defer s.ownMu.Unlock()
+	if s.owner != nil {
+		return nil
+	}
+	l, err := filelock.TryAcquire(s.lockPath())
+	if err != nil {
+		if errors.Is(err, filelock.ErrLocked) {
+			return fmt.Errorf("%w: %s is owned by another provenance process; retry after it exits",
+				ErrStagingBusy, s.staging)
+		}
+		return fmt.Errorf("bittorrent: acquire staging ownership: %w", err)
+	}
+	s.owner = l
+	return nil
+}
+
+// releaseOwnership drops the lock exactly once. Release is explicit on success,
+// error and cancellation (all of which end at Close); process death releases it
+// through the OS, because the lock is an flock/LockFileEx held on an open
+// descriptor.
+func (s *Session) releaseOwnership() error {
+	s.ownMu.Lock()
+	defer s.ownMu.Unlock()
+	if s.owner == nil {
+		return nil
+	}
+	err := s.owner.Release()
+	s.owner = nil
+	return err
+}
+
+// checkOpen fails fast when the session has already been closed.
+func (s *Session) checkOpen() error {
+	s.ownMu.Lock()
+	defer s.ownMu.Unlock()
+	if s.owner == nil {
+		return errors.New("bittorrent: session is closed")
+	}
+	return nil
 }
 
 // StagingDir returns the absolute staging root.
 func (s *Session) StagingDir() string { return s.staging }
 
-// Close stops the client. Safe to call once; the caller's deferred Close makes
-// an interrupted transfer leave its partial data behind for the next run.
+// Close stops the client and releases staging ownership. Safe to call more than
+// once; the client is stopped before the lock is released so no background
+// writer can outlive ownership.
 func (s *Session) Close() error {
-	if s.client == nil {
-		return nil
-	}
-	errs := s.client.Close()
-	s.client = nil
 	var err error
-	for _, e := range errs {
-		err = errors.Join(err, e)
+	if s.client != nil {
+		errs := s.client.Close()
+		s.client = nil
+		for _, e := range errs {
+			err = errors.Join(err, e)
+		}
 	}
-	return err
+	return errors.Join(err, s.releaseOwnership())
 }
 
 // newClient builds the library client. Limits are conservative; the library
@@ -373,6 +467,11 @@ type opened struct {
 // downloading payload. Run individually, it fetches nothing; a torrent whose
 // peers start sending immediately may still leave a piece on disk.
 func (s *Session) List(ctx context.Context, rawSource string) (Info, error) {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if err := s.checkOpen(); err != nil {
+		return Info{}, err
+	}
 	src, err := parseSource(rawSource)
 	if err != nil {
 		return Info{}, err
@@ -401,6 +500,15 @@ func (s *Session) List(ctx context.Context, rawSource string) (Info, error) {
 //     swarm, so a capture failure is retried without fetching again;
 //  3. only then is the transfer resumed.
 func (s *Session) Fetch(ctx context.Context, rawSource string, selection []string) (Capture, error) {
+	// Everything below runs under exclusive staging ownership taken in New, so
+	// the job read, the reconciliation decision and the capture commit cannot
+	// interleave with another Session over this root. runMu only serializes
+	// concurrent Fetch/List calls on this Session.
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if err := s.checkOpen(); err != nil {
+		return Capture{}, err
+	}
 	src, err := parseSource(rawSource)
 	if err != nil {
 		return Capture{}, err

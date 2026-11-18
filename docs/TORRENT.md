@@ -141,6 +141,67 @@ The integration test asserts exactly that: a 3-file fixture with 16 KiB pieces
 where piece 0 spans `a.bin` and part of `b.bin`; selecting `b.bin` writes
 `a.bin` too, and the capture contains one item.
 
+## Staging ownership
+
+One process owns one staging root at a time. The lock is
+`<root>/.provenance/torrent/staging.lock`, taken with `internal/filelock`
+(`flock` on unix, `LockFileEx` on Windows) and held for the whole life of a
+`bittorrent.Session` — from `New` until `Close`. Callers cannot skip it: it is
+enforced inside the backend, not in the CLI.
+
+### Why the root and not the infohash
+
+Everything the backend mutates is root-scoped or can collide across torrents in
+one root:
+
+| State | Path | Shared by |
+|---|---|---|
+| piece completion | `<root>/.torrent.db` | every torrent in the root (one library instance per data dir) |
+| payload | `<root>/<torrent name>/…` | two torrents whose names match resolve to the same directory |
+| capture run manifest | `<root>/.provenance/runs/<ts>.json` | one-second granularity, so two captures in the same second overwrite each other |
+| capture items | `<root>/.provenance/items/<id>.json` | unique per infohash, but published by the same writer |
+| job / metainfo | `<root>/.provenance/torrent/…` | per infohash, but read and rewritten by reconciliation |
+
+A per-infohash lock would leave the first three races open, so ownership is
+taken on the root.
+
+### Lock identity and spellings
+
+The lock is a file inside the root, and `filepath.Abs` normalises lexical
+spellings (`/a/b/`, `/a/./b`, `/a/x/../b`). Symlinked spellings are *not*
+normalised but resolve to the same inode, so they contend on the same lock. Case
+aliases on case-insensitive filesystems behave the same way. The sidecar is
+never deleted: removing it would race a process that is about to lock it, and
+an existing file is never treated as evidence of a live lock.
+
+### Acquire and release points
+
+| Point | Action |
+|---|---|
+| `New` | `TryAcquire` after the root exists, before the torrent client (which opens `.torrent.db`) is created |
+| `New` failure | released if client construction fails; never acquired if the root is busy |
+| `List` / `Fetch` | no re-acquisition; they run under the lock taken in `New`, serialized on the session |
+| `Close` | client stopped first, then the lock released, so no background writer outlives ownership |
+| process death | released by the kernel when the descriptor closes (no stale-lock recovery needed) |
+
+A competing `New` fails with `ErrStagingBusy` before reading or writing anything:
+no job record is created, no torrent is added, no swarm connection is attempted.
+Nothing is retried automatically — the caller decides when to try again.
+
+Ownership is not dropped at "capture committed". While `--seed` keeps the client
+up, it still writes part files and completion state, so a repeat `fetch` against
+that staging scope stays busy until the owner exits. The capture itself is
+already published and readable at that point.
+
+### Readers are not locked
+
+Ownership excludes other writers, not readers. `archive import` and
+`manifest verify` do not take the lock, so they can run while a job is active.
+The visibility point is unchanged (see the next section): items are written
+before the run manifest, so a reader that runs mid-capture can see item files
+that are not part of a published capture yet. That is pre-existing behavior;
+this slice only prevents two writers from interleaving.
+
 ## Job state and crash recovery
 
 A job is a durable local record at
@@ -211,9 +272,11 @@ that key:
 
 Residual windows this slice does **not** close:
 
-- There is no lock on the job record. Two `fetch` processes on the same staging
-  root can interleave; the torrent backend already assumes one writer per data
-  directory, so run one job per staging root.
+- Two writers can no longer interleave: the staging root is owned for the
+  lifetime of a Session (see above). What remains is reader visibility — a
+  `manifest verify` that runs mid-capture can see an item file whose run
+  manifest has not been published yet, and `archive import` simply does not
+  see it. That ordering is unchanged by this slice.
 - `capture: committed` is written after the manifest, so the crash window above
   is real — it is reconciled, not prevented.
 - Reconciliation assumes the capture manifest still exists. A job whose
@@ -222,6 +285,9 @@ Residual windows this slice does **not** close:
 - Staged bytes are re-hashed before adopting a capture, so a repeat `fetch` costs
   a local re-read of the selection. That is deliberate: a correct capture record
   does not prove the working copy is still correct.
+- The lock is advisory. A process that deletes `<root>/.provenance/torrent/`
+  or replaces the root mid-run is outside the contract; nothing can prevent
+  that from inside the directory being locked.
 
 ## Resume and restart
 
@@ -284,6 +350,8 @@ tracker. Covered:
 | `TestStaleStagedPayloadIsReportedAndRepaired` | a corrupted staged file is reported as a warning, dropped to unverified, repaired and re-adopted under the same key |
 | `TestJobArtifactsDoNotLeakTrackerSecrets` | job record, manifests and items never contain tracker/passkey strings |
 | `job_test.go` | key stability, v1→v2 upgrade, immutable selection, record path confinement, source sanitisation |
+| `ownership_test.go` | second session on the same root is busy, busy sessions write nothing, symlink/`.` spellings are the same owner, independent roots run concurrently, concurrent Fetch on one Session is serialized, closed sessions refuse work, ownership survives `--seed` |
+| `ownership_process_test.go` (real processes) | barrier: a competing process gets the busy error and writes nothing, then exactly one manifest after the owner exits; SIGKILL of the owner releases the lock and the job reconciles; a seeding owner stays exclusive and releases on cancel; different torrents in one root are excluded; independent roots proceed concurrently |
 | path unit tests | component validation, containment, peer parsing, kind mapping |
 
 ## Follow-ups
@@ -291,8 +359,8 @@ tracker. Covered:
 1. Add `THIRD_PARTY_NOTICES` (MPL texts, the missing `go-llsqlite/adapter`
    licence) or ship with `-tags nosqlite`; decide before the first binary
    release that includes this slice.
-2. A multi-job queue: this slice makes one job durable and recoverable per
-   staging root, but nothing enumerates or schedules jobs, locks a job against
-   concurrent writers, or surfaces job state without running `fetch`.
+2. A multi-job queue: jobs are now durable and mutually exclusive per staging
+   root, but nothing enumerates or schedules them, and there is no
+   `torrent status` that reports state without running `fetch`.
 3. Optional per-job bandwidth cap, needed before fetching large public swarms.
 4. Verify behaviour against a real swarm with a private tracker, outside CI.
