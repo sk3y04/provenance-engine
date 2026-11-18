@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/sk3y04/provenance-engine/internal/app"
@@ -21,6 +22,12 @@ type SyncOptions struct {
 	RateLimiter *ratelimit.Manager
 }
 
+// Seams for hermetic tests; production always uses the real paths.
+var (
+	scanFn     = dispatcher.Scan
+	downloadFn = app.Download
+)
+
 func Sync(ctx context.Context, name string, opts SyncOptions) (*SyncResult, error) {
 	c, err := Get(name)
 	if err != nil {
@@ -36,6 +43,12 @@ func SyncAll(ctx context.Context, opts SyncOptions) error {
 	}
 	var firstErr error
 	for _, c := range all {
+		if cerr := ctx.Err(); cerr != nil {
+			if firstErr == nil {
+				firstErr = cerr
+			}
+			break
+		}
 		result, err := syncCollection(ctx, &c, opts)
 		if err != nil && firstErr == nil {
 			firstErr = err
@@ -56,7 +69,7 @@ func syncCollection(ctx context.Context, c *Collection, opts SyncOptions) (*Sync
 		return nil, fmt.Errorf("classify: %w", err)
 	}
 
-	m, err := dispatcher.Scan(ctx, c.URL, dOpts)
+	m, err := scanFn(ctx, c.URL, dOpts)
 	if err != nil {
 		return nil, fmt.Errorf("scan: %w", err)
 	}
@@ -67,7 +80,7 @@ func syncCollection(ctx context.Context, c *Collection, opts SyncOptions) (*Sync
 	if seen == nil {
 		seen = make(map[string]bool)
 	}
-	newURLs, newIDs, urlToItem, total, skipped := partitionNewItems(m.Items, seen)
+	newURLs, _, urlToItem, total, skipped := partitionNewItems(m.Items, seen)
 
 	result := &SyncResult{
 		Total:   total,
@@ -95,40 +108,35 @@ func syncCollection(ctx context.Context, c *Collection, opts SyncOptions) (*Sync
 		c.Name, result.New, result.Skipped, result.Total)
 
 	dOpts.Reporter = sess
-	downloadErr := app.Download(ctx, newURLs, "", dOpts)
+	downloadErr := downloadFn(ctx, newURLs, "", dOpts)
 	counts := sess.Counts()
 	result.Failed = counts.Failed
 	result.New = counts.Succeeded
 	result.Skipped += counts.Skipped
 	result.SessionName = sessName
 
-	if downloadErr != nil {
-		_ = RecordSync(c.Name, *result)
-		return result, fmt.Errorf("sync download: %w", downloadErr)
+	// Mark an item seen only when every one of its URLs succeeded, and do so
+	// even on partial failure: succeeded posts must not re-download, while
+	// failed ones stay retryable on the next sync.
+	succeeded := make(map[string]bool)
+	for _, e := range sess.EntriesByStatus(session.StatusSucceeded) {
+		succeeded[e.URL] = true
 	}
-	result.SessionName = sessName
+	if ids := fullySucceededIDs(urlToItem, succeeded); len(ids) > 0 {
+		if err := AddSeen(c.Name, ids...); err != nil {
+			return result, fmt.Errorf("save seen ids: %w", err)
+		}
+	}
 
-	if err := AddSeen(c.Name, newIDs...); err != nil {
-		return result, fmt.Errorf("save seen ids: %w", err)
+	if err := RecordSync(c.Name, *result); err != nil {
+		return result, fmt.Errorf("record sync: %w", err)
+	}
+	if downloadErr != nil {
+		return result, fmt.Errorf("sync download: %w", downloadErr)
 	}
 
 	if opts.Record {
 		_ = recordCapture(*c, sessName, urlToItem)
-	}
-
-	// Reload collection before recording to avoid TOCTOU race with concurrent
-	// AddSeen/RecordSync calls. This ensures we merge with the latest state on disk.
-	if c2, err := Get(c.Name); err == nil {
-		c2.LastResult = result
-		c2.LastSync = time.Now()
-		c2.UpdatedAt = c2.LastSync
-		if err := RecordSync(c.Name, *result); err != nil {
-			return result, fmt.Errorf("record sync: %w", err)
-		}
-	} else {
-		if err := RecordSync(c.Name, *result); err != nil {
-			return result, fmt.Errorf("record sync: %w", err)
-		}
 	}
 
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] collection %q: synced — %d downloaded, %d skipped, %d failed\n",
@@ -145,6 +153,33 @@ func itemID(item manifest.Item) string {
 		return item.ID
 	}
 	return ""
+}
+
+// fullySucceededIDs returns the item identities whose every new URL succeeded.
+// A post carrying several media files is only marked seen when all of them
+// downloaded, so a partial failure never drops the missing files from future
+// syncs. The result is sorted for deterministic persistence.
+func fullySucceededIDs(urlToItem map[string]manifest.Item, succeeded map[string]bool) []string {
+	needed := make(map[string]int)
+	done := make(map[string]int)
+	for url, item := range urlToItem {
+		id := itemID(item)
+		if id == "" {
+			id = url
+		}
+		needed[id]++
+		if succeeded[url] {
+			done[id]++
+		}
+	}
+	ids := make([]string, 0, len(needed))
+	for id, n := range needed {
+		if done[id] == n {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // partitionNewItems splits scanned items into not-yet-seen URLs/IDs and the
