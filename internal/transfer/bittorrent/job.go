@@ -12,8 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anacrolix/torrent/metainfo"
-
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 )
@@ -102,10 +100,16 @@ type captureRecord struct {
 // state and the three independently-tracked states above. It carries no
 // tracker URLs, passkeys, peer addresses, or absolute local paths.
 type jobRecord struct {
-	Format     string         `json:"format"`
-	JobID      string         `json:"job_id"`
-	Backend    string         `json:"backend"`
-	InfoHash   string         `json:"info_hash"`
+	Format  string `json:"format"`
+	JobID   string `json:"job_id"`
+	Backend string `json:"backend"`
+	// InfoHash is the full v1 SHA-1 infohash, or empty for a v2-only job. Its
+	// meaning is unchanged: a v1 torrent always records its v1 hash here.
+	InfoHash string `json:"info_hash"`
+	// InfoHashV2 is the full v2 SHA-256 infohash, recorded only when the
+	// torrent has a v2 identity (hybrid or v2-only). It is a separate field so
+	// nothing has to guess which 20 bytes of a 32-byte hash are "the" hash.
+	InfoHashV2 string         `json:"info_hash_v2,omitempty"`
 	Source     string         `json:"source"`
 	StagingRef string         `json:"staging_ref"`
 	Selection  []string       `json:"selection"`
@@ -130,25 +134,112 @@ func (j *jobRecord) formatLabel() string {
 	return j.Format
 }
 
-// jobID derives a stable identifier from the infohash alone, so a restart of
-// the same torrent is the same job rather than a new one.
-func jobID(infoHash string) string { return "bt-" + infoHash }
+// jobIdentity derives the identity a job record describes.
+func jobIdentity(job *jobRecord) Identity {
+	id, _ := identityFromJob(job)
+	return id
+}
+
+// identityLabel is the hex hash used in external ids (capture items). v1 jobs
+// keep the v1 hash; a v2-only job uses its full v2 hash, which is unambiguous by
+// length.
+func (j *jobRecord) identityLabel() string {
+	if j.InfoHash != "" {
+		return j.InfoHash
+	}
+	return j.InfoHashV2
+}
 
 func (s *Session) statePath(name string) string {
 	return filepath.Join(s.staging, filepath.FromSlash(torrentStateDir), name)
 }
 
-func (s *Session) metainfoPath(ih metainfo.Hash) string {
-	return s.statePath(ih.HexString() + ".torrent")
+func (s *Session) metainfoPath(id Identity) string {
+	return s.statePath(id.MetainfoFile())
 }
 
-func (s *Session) jobPath(ih string) string {
-	return s.statePath(jobID(ih) + ".job.json")
+func (s *Session) jobPath(jobID string) string {
+	return s.statePath(jobID + ".job.json")
 }
 
 // metainfoRel is the job-root-relative metainfo path recorded in a job.
-func metainfoRel(ih string) string {
-	return strings.TrimPrefix(filepath.ToSlash(filepath.Join(torrentStateDir, ih+".torrent")), "./")
+func metainfoRel(name string) string {
+	return strings.TrimPrefix(filepath.ToSlash(filepath.Join(torrentStateDir, name+".torrent")), "./")
+}
+
+// metainfoRelFor is the metainfo path a job with this identity records.
+func metainfoRelFor(id Identity) string {
+	return metainfoRel(strings.TrimSuffix(id.MetainfoFile(), ".torrent"))
+}
+
+// ErrIdentityConflict means another job in this staging root would share this
+// torrent's payload or completion state. The library keys piece completion by a
+// 20-byte infohash and stores payload under the torrent's name, so two different
+// identities can point at the same bytes; the adapter refuses that instead of
+// silently sharing them.
+var ErrIdentityConflict = errors.New("staging root already holds a different torrent job")
+
+// checkIdentityConflict rejects a second identity that maps onto the same
+// library piece-completion key in this root.
+func (s *Session) checkIdentityConflict(id Identity) error {
+	entries, err := os.ReadDir(s.statePath(""))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read job directory: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".job.json") || name == id.JobID()+".job.json" {
+			continue
+		}
+		other, err := readJob(s.statePath(name))
+		if err != nil {
+			continue
+		}
+		otherID, err := identityFromJob(other)
+		if err != nil || otherID.SameTorrent(id) {
+			continue
+		}
+		if otherID.StorageKey() == id.StorageKey() {
+			return fmt.Errorf("%w: job %s and %s would share the library's piece-completion key; use a separate staging root",
+				ErrIdentityConflict, other.JobID, id.JobID())
+		}
+	}
+	return nil
+}
+
+// checkPayloadDirConflict rejects a second identity that would write into the
+// same payload directory. It runs once the torrent name is known, because that
+// name is what the library uses below its data directory.
+func (s *Session) checkPayloadDirConflict(id Identity, stagingRef string) error {
+	entries, err := os.ReadDir(s.statePath(""))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read job directory: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".job.json") || name == id.JobID()+".job.json" {
+			continue
+		}
+		other, err := readJob(s.statePath(name))
+		if err != nil {
+			continue
+		}
+		otherID, err := identityFromJob(other)
+		if err != nil || otherID.SameTorrent(id) {
+			continue
+		}
+		if other.StagingRef != "" && other.StagingRef == stagingRef {
+			return fmt.Errorf("%w: job %s already writes payload to %q; use a separate staging root",
+				ErrIdentityConflict, other.JobID, stagingRef)
+		}
+	}
+	return nil
 }
 
 // loadOrCreateJob reads the job record for a source, creating it on first use,
@@ -156,13 +247,13 @@ func metainfoRel(ih string) string {
 // written before any payload work, so an interrupted first run still leaves a
 // durable job behind.
 func (s *Session) loadOrCreateJob(src source, want []string) (*jobRecord, error) {
-	path := s.jobPath(src.infoHash.HexString())
+	path := s.jobPath(src.id.JobID())
 	job, err := readJob(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	if job != nil {
-		if err := s.validateJob(job, src.infoHash); err != nil {
+		if err := s.validateJob(job, src.id); err != nil {
 			return nil, err
 		}
 		if !equalSelection(job.Selection, want) {
@@ -170,20 +261,24 @@ func (s *Session) loadOrCreateJob(src source, want []string) (*jobRecord, error)
 				ErrSelectionLocked, job.JobID, job.Selection, want)
 		}
 		job.Format = JobFormatVersion
-		job.Source = src.canonical()
+		job.Source = src.id.Source()
 		return job, s.saveJob(job)
+	}
+	if err := s.checkIdentityConflict(src.id); err != nil {
+		return nil, err
 	}
 
 	now := time.Now().UTC()
 	job = &jobRecord{
-		Format:    JobFormatVersion,
-		JobID:     jobID(src.infoHash.HexString()),
-		Backend:   Backend,
-		InfoHash:  src.infoHash.HexString(),
-		Source:    src.canonical(),
-		Selection: want,
+		Format:     JobFormatVersion,
+		JobID:      src.id.JobID(),
+		Backend:    Backend,
+		InfoHash:   src.id.V1Hex(),
+		InfoHashV2: src.id.V2Hex(),
+		Source:     src.id.Source(),
+		Selection:  want,
 		Resume: resumeRef{
-			MetainfoPath: metainfoRel(src.infoHash.HexString()),
+			MetainfoPath: metainfoRelFor(src.id),
 			DataDir:      ".",
 			PartFiles:    true,
 		},
@@ -200,29 +295,33 @@ func (s *Session) loadOrCreateJob(src source, want []string) (*jobRecord, error)
 // validateJob refuses a record that does not describe this torrent in this
 // staging root. The record's paths are treated like any other untrusted input:
 // they must stay inside the job root.
-func (s *Session) validateJob(job *jobRecord, want metainfo.Hash) error {
+func (s *Session) validateJob(job *jobRecord, want Identity) error {
 	return validateJobRecord(s.staging, job, want)
 }
 
 // validateJobRecord is the Session-free form of the same validation, so a
 // read-only caller (torrent status) can check a record without constructing a
 // Session. It only fills defaults in memory and never touches the filesystem.
-func validateJobRecord(staging string, job *jobRecord, want metainfo.Hash) error {
-	if job.InfoHash != want.HexString() {
-		return fmt.Errorf("job record %s describes torrent %s, not %s", job.JobID, job.InfoHash, want.HexString())
+func validateJobRecord(staging string, job *jobRecord, want Identity) error {
+	got, err := identityFromJob(job)
+	if err != nil {
+		return err
 	}
-	if job.JobID != jobID(job.InfoHash) {
-		return fmt.Errorf("job record id %q does not match torrent %s", job.JobID, job.InfoHash)
+	if !got.SameTorrent(want) {
+		return fmt.Errorf("job record %s describes %s, not %s", job.JobID, got, want)
+	}
+	if job.JobID != got.JobID() {
+		return fmt.Errorf("job record id %q does not match its identity %s", job.JobID, got)
 	}
 	if job.Resume.MetainfoPath == "" {
-		job.Resume.MetainfoPath = metainfoRel(job.InfoHash)
+		job.Resume.MetainfoPath = metainfoRelFor(got)
 	}
 	if _, err := joinWithin(staging, job.Resume.MetainfoPath); err != nil {
 		return err
 	}
-	if job.Resume.MetainfoPath != metainfoRel(job.InfoHash) {
+	if job.Resume.MetainfoPath != metainfoRelFor(got) {
 		return fmt.Errorf("%w: job record points at metainfo %q, expected %q",
-			ErrUnsafePath, job.Resume.MetainfoPath, metainfoRel(job.InfoHash))
+			ErrUnsafePath, job.Resume.MetainfoPath, metainfoRelFor(got))
 	}
 	if job.Resume.DataDir == "" {
 		job.Resume.DataDir = "."
@@ -259,7 +358,7 @@ func readJob(path string) (*jobRecord, error) {
 	case JobFormatVersion:
 	case jobFormatV1, "":
 		job.Format = JobFormatVersion
-		job.Resume = resumeRef{MetainfoPath: metainfoRel(job.InfoHash), DataDir: ".", PartFiles: true}
+		job.Resume = resumeRef{MetainfoPath: metainfoRel(strings.ToLower(job.InfoHash)), DataDir: ".", PartFiles: true}
 		job.State = JobState{Payload: PayloadPending, Capture: CapturePending, Seeding: SeedingStopped}
 		job.Payload = nil
 		job.Capture = nil
@@ -281,7 +380,7 @@ func (s *Session) saveJob(job *jobRecord) error {
 	if err != nil {
 		return fmt.Errorf("encode job record: %w", err)
 	}
-	if err := atomicfile.WriteFile(s.jobPath(job.InfoHash), data, 0o600); err != nil {
+	if err := atomicfile.WriteFile(s.jobPath(job.JobID), data, 0o600); err != nil {
 		return fmt.Errorf("write job record: %w", err)
 	}
 	return nil

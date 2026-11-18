@@ -505,6 +505,8 @@ With a job id the fields are shown one per line, including `payload verified …
 }
 ```
 
+`info_hash` is the v1 infohash and is **empty** for a v2-only job; `info_hash_v2` is the full 32-byte v2 infohash and is present for v2-only and hybrid jobs. Job ids follow the identities: `bt-<40 hex>` for v1 and hybrid, `bt2-<64 hex>` for v2-only. A full v2 hash also resolves an existing hybrid job (read-only alias).
+
 `jobs` is sorted by job id and is `[]` when the root has no jobs. A record that cannot be read appears in `"unreadable": [{"file": …, "reason": …}]` instead of being dropped; the document stays valid JSON, a warning goes to stderr, and the command exits 1 because the listing is incomplete. `"complete"` carries the same fact in-band, so a script that only parses stdout can tell a full listing from a partial one without depending on the exit code.
 
 Records are validated on read: unsafe paths in a record, a mismatched file name, an unsupported `format`, or a record that is not a regular file (a symlink planted in the staging tree) make it unreadable rather than trusted. `staging_root` is the resolved absolute path, so two spellings of one root — including a symlinked one — produce identical output. Status output never includes the magnet source, metainfo, tracker URLs, credentials or passkeys.

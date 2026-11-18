@@ -71,6 +71,7 @@ type JobStatus struct {
 	JobID         string         `json:"job_id"`
 	Backend       string         `json:"backend"`
 	InfoHash      string         `json:"info_hash"`
+	InfoHashV2    string         `json:"info_hash_v2,omitempty"`
 	StagingRef    string         `json:"staging_ref,omitempty"`
 	Selection     []string       `json:"selection"`
 	CreatedAt     time.Time      `json:"created_at"`
@@ -160,26 +161,64 @@ func ReadJobStatus(stagingDir, rawID string) (JobStatus, error) {
 	if err != nil {
 		return JobStatus{}, err
 	}
-	id, ihHex, err := parseJobID(rawID)
+	req, err := parseIdentityString(rawID)
 	if err != nil {
 		return JobStatus{}, err
 	}
-	path := filepath.Join(root, filepath.FromSlash(torrentStateDir), id+".job.json")
+	path := filepath.Join(root, filepath.FromSlash(torrentStateDir), req.JobID()+".job.json")
 	job, err := readJobRecordFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return JobStatus{}, fmt.Errorf("%w: %s", ErrJobNotFound, id)
-	}
-	if err != nil {
+		// A full v2 hash can name an existing hybrid job, which is canonical
+		// under its v1 id. Resolving that alias only reads records; it never
+		// rewrites, renames or creates one.
+		if job, err = resolveIdentityAlias(root, req); err != nil {
+			return JobStatus{}, err
+		}
+	} else if err != nil {
 		return JobStatus{}, err
 	}
 	status, err := projectJob(root, job)
 	if err != nil {
 		return JobStatus{}, err
 	}
-	if status.JobID != id || status.InfoHash != ihHex {
-		return JobStatus{}, fmt.Errorf("job record %s does not describe %s", path, id)
+	got, err := identityFromJob(job)
+	if err != nil {
+		return JobStatus{}, err
+	}
+	if !got.Compare(req) {
+		return JobStatus{}, fmt.Errorf("job record %s does not describe %s", path, req)
 	}
 	return status, nil
+}
+
+// resolveIdentityAlias finds a job whose identity includes the requested one
+// (the hybrid case: a v2 hash that belongs to a job recorded under its v1 id).
+func resolveIdentityAlias(root string, req Identity) (*jobRecord, error) {
+	dir := filepath.Join(root, filepath.FromSlash(torrentStateDir))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrJobNotFound, req.JobID())
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".job.json") {
+			continue
+		}
+		job, err := readJobRecordFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		got, err := identityFromJob(job)
+		if err != nil {
+			continue
+		}
+		if got.SameTorrent(req) {
+			continue
+		}
+		if got.Compare(req) {
+			return job, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %s", ErrJobNotFound, req.JobID())
 }
 
 // statusRoot resolves and checks the staging root without creating it. Status
@@ -245,11 +284,12 @@ func readJobRecordFile(path string) (*jobRecord, error) {
 // in-memory copy.
 func projectJob(root string, job *jobRecord) (JobStatus, error) {
 	job.InfoHash = strings.ToLower(job.InfoHash)
-	ih, err := parseInfoHash(job.InfoHash)
+	job.InfoHashV2 = strings.ToLower(job.InfoHashV2)
+	id, err := identityFromJob(job)
 	if err != nil {
-		return JobStatus{}, fmt.Errorf("job record has an invalid infohash: %w", err)
+		return JobStatus{}, err
 	}
-	if err := validateJobRecord(root, job, ih); err != nil {
+	if err := validateJobRecord(root, job, id); err != nil {
 		return JobStatus{}, err
 	}
 
@@ -257,6 +297,7 @@ func projectJob(root string, job *jobRecord) (JobStatus, error) {
 		JobID:         job.JobID,
 		Backend:       job.Backend,
 		InfoHash:      job.InfoHash,
+		InfoHashV2:    job.InfoHashV2,
 		StagingRef:    job.StagingRef,
 		Selection:     append([]string{}, job.Selection...),
 		CreatedAt:     job.CreatedAt,
@@ -290,19 +331,6 @@ func projectJob(root string, job *jobRecord) (JobStatus, error) {
 		}
 	}
 	return status, nil
-}
-
-// parseJobID normalises a requested id. Accepted forms are the canonical job id
-// ("bt-" plus the 40-hex v1 infohash) and the bare infohash. Anything else —
-// paths, separators, traversal, partial ids — is rejected before any file is
-// touched.
-func parseJobID(raw string) (id, infohash string, err error) {
-	s := strings.ToLower(strings.TrimSpace(raw))
-	s = strings.TrimPrefix(s, "bt-")
-	if _, perr := parseInfoHash(s); perr != nil {
-		return "", "", fmt.Errorf("%w: %q (want bt-<40 hex> or the bare infohash)", ErrInvalidJobID, raw)
-	}
-	return jobID(s), s, nil
 }
 
 // parseInfoHash decodes a v1 infohash without panicking on hostile input.

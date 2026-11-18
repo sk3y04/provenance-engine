@@ -145,7 +145,7 @@ func TestJobRecordRejectsForeignPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
-	if err := s.validateJob(job, src.infoHash); err != nil {
+	if err := s.validateJob(job, src.id); err != nil {
 		t.Fatalf("healthy job rejected: %v", err)
 	}
 
@@ -165,7 +165,7 @@ func TestJobRecordRejectsForeignPaths(t *testing.T) {
 		broken := *job
 		broken.Resume = job.Resume
 		tc.mutate(&broken)
-		err := s.validateJob(&broken, src.infoHash)
+		err := s.validateJob(&broken, src.id)
 		if err == nil {
 			t.Errorf("%s: accepted, want an error", tc.name)
 			continue

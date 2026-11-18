@@ -102,9 +102,10 @@ func TestTorrentInspectHumanOutput(t *testing.T) {
 	}
 }
 
-// TestTorrentInspectUnsupportedIdentity: a v2 metainfo is refused by name rather
-// than silently treated as v1.
-func TestTorrentInspectUnsupportedIdentity(t *testing.T) {
+// TestTorrentInspectMalformedV2Identity: metainfo that claims v2 without a file
+// tree is refused by name rather than silently treated as v1. Well-formed v2
+// torrents are accepted by the same command path.
+func TestTorrentInspectMalformedV2Identity(t *testing.T) {
 	saveTorrentFlags(t)
 	path, _ := torrentFixture(t)
 	mi, err := metainfo.LoadFromFile(path)

@@ -36,14 +36,6 @@ import (
 //     outright, so "no priorities yet" is not the only thing standing between a
 //     metadata exchange and a payload request.
 
-// ErrUnsupportedIdentity rejects a torrent whose identity this adapter cannot
-// represent: BitTorrent v2-only or hybrid (v1+v2) metainfo, or metainfo with no
-// v1 piece hashes. Selection, verification and capture are defined over v1 file
-// offsets and v1 piece hashes, so accepting those would mean a second
-// persistence scheme and a second capture key. The adapter refuses them
-// explicitly instead of pretending a v2 infohash is a v1 one.
-var ErrUnsupportedIdentity = errors.New("unsupported torrent identity")
-
 // InspectConfig configures Inspect. It deliberately has no staging directory:
 // inspection does not read or write one.
 type InspectConfig struct {
@@ -95,10 +87,14 @@ func inspectMetainfoFile(src source) (Info, error) {
 	if err != nil {
 		return Info{}, fmt.Errorf("%w: parse info of %s: %v", ErrUnsupportedSource, base, err)
 	}
-	if err := requireV1Identity(&info); err != nil {
+	// The identity comes from the bytes just parsed, so a v2-only or hybrid
+	// torrent is described by its own full hashes rather than a truncated or
+	// synthesised one.
+	id, err := requireIdentity(mi, &info)
+	if err != nil {
 		return Info{}, fmt.Errorf("%s: %w", base, err)
 	}
-	if src.infoHash != mi.HashInfoBytes() {
+	if !id.SameTorrent(src.id) {
 		return Info{}, fmt.Errorf("%w: %s changed while it was read", ErrUnsupportedSource, base)
 	}
 	rels, err := validateInfoPaths(&info)
@@ -185,15 +181,18 @@ func inspectMagnet(ctx context.Context, src source, cfg InspectConfig) (Info, er
 	case <-metaCtx.Done():
 		return Info{}, fmt.Errorf("%w after %s: %w", ErrMetadataTimeout, cfg.MetadataTimeout, metaCtx.Err())
 	}
-	if got := t.InfoHash(); got != src.infoHash {
-		return Info{}, fmt.Errorf("metadata infohash %s does not match source %s", got.HexString(), src.infoHash.HexString())
-	}
 	info := t.Info()
 	if info == nil {
 		return Info{}, errors.New("torrent reported no info after metadata")
 	}
-	if err := requireV1Identity(info); err != nil {
+	// Torrent.InfoHash is a 20-byte short hash for v2 torrents, so identity is
+	// checked against the metadata bytes instead of that accessor.
+	got, err := IdentityFromInfo(info, t.Metainfo().InfoBytes)
+	if err != nil {
 		return Info{}, err
+	}
+	if !got.SameTorrent(src.id) {
+		return Info{}, fmt.Errorf("metadata identity %s does not match source %s", got, src.id)
 	}
 	rels, err := validateInfoPaths(info)
 	if err != nil {
@@ -202,30 +201,29 @@ func inspectMagnet(ctx context.Context, src source, cfg InspectConfig) (Info, er
 	return infoFromMetainfo(src, info, rels), nil
 }
 
-// requireV1Identity refuses a torrent this adapter cannot represent. It runs on
-// every path, before any layout is reported and before a fetch opens storage.
-func requireV1Identity(info *metainfo.Info) error {
+// requireIdentity refuses a torrent this adapter cannot represent and returns
+// the identity it does have. It runs on every path, before any layout is
+// reported and before a fetch opens storage: v1, v2-only and hybrid metainfo are
+// accepted, a dictionary with neither identity is not.
+func requireIdentity(mi *metainfo.MetaInfo, info *metainfo.Info) (Identity, error) {
 	if info == nil {
-		return fmt.Errorf("%w: no info dictionary", ErrUnsupportedIdentity)
-	}
-	if info.HasV2() {
-		return fmt.Errorf("%w: v2-only and hybrid (v1+v2) metainfo are not supported; only v1 torrents are accepted",
-			ErrUnsupportedIdentity)
-	}
-	if len(info.Pieces) == 0 {
-		return fmt.Errorf("%w: metainfo has no v1 piece hashes", ErrUnsupportedIdentity)
+		return Identity{}, fmt.Errorf("%w: no info dictionary", ErrUnsupportedIdentity)
 	}
 	if info.PieceLength <= 0 {
-		return fmt.Errorf("%w: metainfo has no piece length", ErrUnsupportedIdentity)
+		return Identity{}, fmt.Errorf("%w: metainfo has no piece length", ErrUnsupportedIdentity)
 	}
-	return nil
+	if info.HasV2() && len(info.FileTree.Dir) == 0 {
+		return Identity{}, fmt.Errorf("%w: v2 info dictionary has no file tree", ErrUnsupportedIdentity)
+	}
+	return IdentityFromInfo(info, mi.InfoBytes)
 }
 
 // infoFromMetainfo projects a validated info dictionary. Offsets mirror the
 // library's own file layout (initFiles), so a caller can reason about pieces.
 func infoFromMetainfo(src source, info *metainfo.Info, rels []string) Info {
 	list := Info{
-		InfoHash:    src.infoHash.HexString(),
+		InfoHash:    src.id.V1Hex(),
+		InfoHashV2:  src.id.V2Hex(),
 		Name:        info.BestName(),
 		TotalLength: info.TotalLength(),
 		Files:       make([]File, 0, len(rels)),

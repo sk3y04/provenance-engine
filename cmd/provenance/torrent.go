@@ -149,7 +149,12 @@ func runTorrentInspect(ctx context.Context, source string, stdout io.Writer) err
 	if flagTorrentJSON {
 		return writeTorrentJSON(stdout, info)
 	}
-	_, _ = fmt.Fprintf(os.Stderr, "[provenance] infohash %s\n", info.InfoHash)
+	if info.InfoHash != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "[provenance] infohash %s\n", info.InfoHash)
+	}
+	if info.InfoHashV2 != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "[provenance] infohash (v2) %s\n", info.InfoHashV2)
+	}
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] %s — %d file(s), %s total\n",
 		info.Name, len(info.Files), manifest.HumanSize(info.TotalLength))
 	for i, f := range info.Files {
@@ -258,7 +263,12 @@ func printJobListing(w io.Writer, listing bittorrent.JobListing) {
 	for _, job := range listing.Jobs {
 		_, _ = fmt.Fprintf(w, "\n%s  payload=%s capture=%s seeding=%s\n",
 			job.JobID, job.RecordedState.Payload, job.RecordedState.Capture, job.RecordedState.Seeding)
-		_, _ = fmt.Fprintf(w, "  infohash   %s\n", job.InfoHash)
+		if job.InfoHash != "" {
+			_, _ = fmt.Fprintf(w, "  infohash   %s\n", job.InfoHash)
+		}
+		if job.InfoHashV2 != "" {
+			_, _ = fmt.Fprintf(w, "  infohash2  %s\n", job.InfoHashV2)
+		}
 		if len(job.Selection) > 0 {
 			_, _ = fmt.Fprintf(w, "  files      %s\n", strings.Join(job.Selection, ", "))
 		}
@@ -273,7 +283,12 @@ func printJobListing(w io.Writer, listing bittorrent.JobListing) {
 func printJobStatus(w io.Writer, job bittorrent.JobStatus) {
 	_, _ = fmt.Fprintf(w, "job            %s\n", job.JobID)
 	_, _ = fmt.Fprintf(w, "backend        %s\n", job.Backend)
-	_, _ = fmt.Fprintf(w, "infohash       %s\n", job.InfoHash)
+	if job.InfoHash != "" {
+		_, _ = fmt.Fprintf(w, "infohash       %s\n", job.InfoHash)
+	}
+	if job.InfoHashV2 != "" {
+		_, _ = fmt.Fprintf(w, "infohash v2    %s\n", job.InfoHashV2)
+	}
 	if job.StagingRef != "" {
 		_, _ = fmt.Fprintf(w, "staging ref    %s\n", job.StagingRef)
 	}

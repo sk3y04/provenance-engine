@@ -169,7 +169,11 @@ type File struct {
 
 // Info is metadata-only torrent information.
 type Info struct {
-	InfoHash    string `json:"info_hash"`
+	// InfoHash is the full v1 SHA-1 infohash, empty for a v2-only torrent.
+	InfoHash string `json:"info_hash"`
+	// InfoHashV2 is the full 32-byte v2 infohash, present for v2-only and
+	// hybrid torrents.
+	InfoHashV2  string `json:"info_hash_v2,omitempty"`
 	Name        string `json:"name"`
 	TotalLength int64  `json:"total_length"`
 	Files       []File `json:"files"`
@@ -187,7 +191,10 @@ type Asset struct {
 
 // Capture is the result of a successful Fetch.
 type Capture struct {
-	InfoHash   string  `json:"info_hash"`
+	// InfoHash is the full v1 infohash, empty for a v2-only torrent.
+	InfoHash string `json:"info_hash"`
+	// InfoHashV2 is the full v2 infohash when the torrent has one.
+	InfoHashV2 string  `json:"info_hash_v2,omitempty"`
 	JobID      string  `json:"job_id"`
 	StagingDir string  `json:"staging_dir"`
 	Assets     []Asset `json:"assets"`
@@ -437,14 +444,20 @@ func (p peerAddr) Network() string { return "tcp" }
 // memory only: they can carry trackers, passkeys, and local paths that must
 // not reach a capture manifest or a diagnostic.
 type source struct {
-	kind     string // "magnet" or "file"
+	kind string // "magnet" or "file"
+	// id is the canonical identity. v1 and v2 hashes are kept separately and in
+	// full; nothing here is a truncated value.
+	id Identity
+	// infoHash is the library's storage key for this torrent (v1 hash, or the
+	// library's 20-byte short form for v2-only). It is used for paths inside the
+	// staging root and never as a durable identity.
 	infoHash metainfo.Hash
 	magnet   string
 	path     string
 }
 
 func (s source) canonical() string {
-	return "magnet:?xt=urn:btih:" + s.infoHash.HexString()
+	return s.id.Source()
 }
 
 func parseSource(raw string) (source, error) {
@@ -462,7 +475,7 @@ func parseSource(raw string) (source, error) {
 			// slice: selection and capture are defined over v1 file offsets.
 			return source{}, fmt.Errorf("%w: only v1 (urn:btih) magnets are supported", ErrUnsupportedSource)
 		}
-		return source{kind: "magnet", infoHash: m.InfoHash, magnet: raw}, nil
+		return source{kind: "magnet", id: Identity{V1: m.InfoHash, HasV1: true}, infoHash: m.InfoHash, magnet: raw}, nil
 	}
 	fi, err := os.Stat(raw)
 	if err != nil {
@@ -481,7 +494,13 @@ func parseSource(raw string) (source, error) {
 	if len(mi.InfoBytes) == 0 {
 		return source{}, fmt.Errorf("%w: %s has no info dictionary", ErrUnsupportedSource, filepath.Base(raw))
 	}
-	return source{kind: "file", infoHash: mi.HashInfoBytes(), path: raw}, nil
+	// A local .torrent can be v1, v2-only, or hybrid. The identity is derived
+	// from the exact bytes on disk, not from a display name or a hash string.
+	id, err := IdentityFromMetaInfo(mi)
+	if err != nil {
+		return source{}, fmt.Errorf("%s: %w", filepath.Base(raw), err)
+	}
+	return source{kind: "file", id: id, infoHash: id.StorageKey(), path: raw}, nil
 }
 
 // opened is one torrent with metadata available and paths validated.
@@ -687,6 +706,9 @@ func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRe
 	if err := s.stagingChecks(o.stagingRoot); err != nil {
 		return Capture{}, err
 	}
+	if err := s.checkPayloadDirConflict(jobIdentity(job), o.info.Name); err != nil {
+		return Capture{}, err
+	}
 	if job.StagingRef != o.info.Name {
 		job.StagingRef = o.info.Name
 		if err := s.saveJob(job); err != nil {
@@ -816,11 +838,11 @@ func (s *Session) captureStaged(job *jobRecord, bytesRead int64, warnings []stri
 // open adds the torrent, waits for metadata, persists the exact metainfo once,
 // and validates every path in it.
 func (s *Session) open(ctx context.Context, src source) (*opened, error) {
-	miPath := s.metainfoPath(src.infoHash)
+	miPath := s.metainfoPath(src.id)
 
 	var t *at.Torrent
 	var err error
-	if persisted, perr := loadPersistedMetainfo(miPath, src.infoHash); perr == nil {
+	if persisted, perr := loadPersistedMetainfo(miPath, src.id); perr == nil {
 		// Reuse the metainfo we saved on a previous run. This is what makes a
 		// restart independent of metadata availability, and it means a resume
 		// needs no peer at all to start verifying.
@@ -851,8 +873,10 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 			// touches it at all: nothing is created first.
 			if info, ierr := mi.UnmarshalInfo(); ierr != nil {
 				return nil, fmt.Errorf("parse info of %s: %w", filepath.Base(src.path), ierr)
-			} else if ierr := requireV1Identity(&info); ierr != nil {
+			} else if got, ierr := requireIdentity(mi, &info); ierr != nil {
 				return nil, fmt.Errorf("%s: %w", filepath.Base(src.path), ierr)
+			} else if !got.SameTorrent(src.id) {
+				return nil, fmt.Errorf("%s: identity %s changed while it was read", filepath.Base(src.path), got)
 			} else if _, verr := validateInfoPaths(&info); verr != nil {
 				return nil, verr
 			}
@@ -884,10 +908,14 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	if got := t.InfoHash(); got != src.infoHash {
-		return nil, fmt.Errorf("metadata infohash %s does not match source %s", got.HexString(), src.infoHash.HexString())
+	// Torrent.InfoHash is the library's 20-byte short hash for v2 torrents, so the
+	// full identity is taken from the metadata bytes it actually holds.
+	if got, ierr := IdentityFromInfo(t.Info(), t.Metainfo().InfoBytes); ierr != nil {
+		return nil, ierr
+	} else if !got.SameTorrent(src.id) {
+		return nil, fmt.Errorf("metadata identity %s does not match source %s", got, src.id)
 	}
-	if err := s.persistMetainfo(t, miPath, src.infoHash); err != nil {
+	if err := s.persistMetainfo(t, miPath, src.id); err != nil {
 		return nil, err
 	}
 
@@ -895,10 +923,8 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 	if info == nil {
 		return nil, errors.New("torrent reported no info after metadata")
 	}
-	// Refresh metadata can arrive from a peer as a v2/hybrid dictionary even
-	// when the magnet named a v1 infohash; identity is checked before any
-	// layout is used.
-	if err := requireV1Identity(info); err != nil {
+	mi := t.Metainfo()
+	if _, err := requireIdentity(&mi, info); err != nil {
 		return nil, err
 	}
 	name := info.BestName()
@@ -1088,6 +1114,10 @@ func (s *Session) waitComplete(ctx context.Context, o *opened, selected []valida
 		if o.allSelectedComplete(selected) {
 			return nil
 		}
+		if rel, ok := o.missingPieceLayer(selected); ok {
+			o.t.DisallowDataDownload()
+			return fmt.Errorf("%w: %s: the metainfo for this piece carries no v2 hash", ErrUnsupportedIdentity, rel)
+		}
 		if o.selectedPiecesSettled(selected) {
 			// Verified pieces that never reach their final names mean the
 			// storage layer failed to promote a part file. The library only logs
@@ -1128,6 +1158,20 @@ func (o *opened) allSelectedComplete(selected []validatedFile) bool {
 		}
 	}
 	return true
+}
+
+// missingPieceLayer reports a selected piece the library cannot hash because the
+// metainfo has no v2 piece-layer entry for it. Waiting would never finish and
+// would end as a timeout; a capture from unverifiable pieces must be impossible.
+func (o *opened) missingPieceLayer(selected []validatedFile) (string, bool) {
+	for _, sf := range selected {
+		for i := sf.file.BeginPieceIndex(); i < sf.file.EndPieceIndex(); i++ {
+			if o.t.Piece(i).State().MissingPieceLayerHash {
+				return sf.rel, true
+			}
+		}
+	}
+	return "", false
 }
 
 // selectedPiecesSettled reports whether every piece covering a selected file is
@@ -1186,13 +1230,23 @@ func (s *Session) report(o *opened, selected []validatedFile) {
 
 // persistMetainfo writes the exact metainfo bytes the client holds. Re-reading
 // it on the next run is what lets a resume start without a peer.
-func (s *Session) persistMetainfo(t *at.Torrent, path string, want metainfo.Hash) error {
+func (s *Session) persistMetainfo(t *at.Torrent, path string, want Identity) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
 	mi := t.Metainfo()
-	if got := mi.HashInfoBytes(); got != want {
-		return fmt.Errorf("library metainfo hashes to %s, expected %s", got.HexString(), want.HexString())
+	got, err := IdentityFromMetaInfo(&mi)
+	if err != nil {
+		return fmt.Errorf("library metainfo has no usable identity: %w", err)
+	}
+	if !got.SameTorrent(want) {
+		return fmt.Errorf("library metainfo describes %s, expected %s", got, want)
+	}
+	if want.HasV2 && len(mi.PieceLayers) == 0 {
+		// Without piece layers no piece of a v2 torrent can be verified, and a
+		// restart could not re-verify what it reopens.
+		return fmt.Errorf("%w: %s cannot be resumed: the metainfo carries no piece layers",
+			ErrUnsupportedIdentity, want)
 	}
 	var buf bytes.Buffer
 	if err := mi.Write(&buf); err != nil {
@@ -1206,7 +1260,7 @@ func (s *Session) persistMetainfo(t *at.Torrent, path string, want metainfo.Hash
 
 // loadPersistedMetainfo loads a previously persisted metainfo and checks that
 // it still describes the requested torrent.
-func loadPersistedMetainfo(path string, want metainfo.Hash) (*metainfo.MetaInfo, error) {
+func loadPersistedMetainfo(path string, want Identity) (*metainfo.MetaInfo, error) {
 	mi, err := metainfo.LoadFromFile(path)
 	if err != nil {
 		return nil, err
@@ -1214,8 +1268,17 @@ func loadPersistedMetainfo(path string, want metainfo.Hash) (*metainfo.MetaInfo,
 	if len(mi.InfoBytes) == 0 {
 		return nil, errors.New("persisted metainfo has no info dictionary")
 	}
-	if got := mi.HashInfoBytes(); got != want {
-		return nil, fmt.Errorf("persisted metainfo hashes to %s, expected %s", got.HexString(), want.HexString())
+	got, err := IdentityFromMetaInfo(mi)
+	if err != nil {
+		return nil, err
+	}
+	if !got.SameTorrent(want) {
+		return nil, fmt.Errorf("persisted metainfo describes %s, expected %s", got, want)
+	}
+	if want.HasV2 && len(mi.PieceLayers) == 0 {
+		// A v2 metainfo without piece layers must never be used for resume: the
+		// pieces it names cannot be verified.
+		return nil, errors.New("persisted metainfo carries no v2 piece layers")
 	}
 	return mi, nil
 }

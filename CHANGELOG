@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ### Fixed
 
 - **A failed piece write is now a diagnosable error, not a silent stall**: the
@@ -22,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **BitTorrent v2 and hybrid local `.torrent` support**: `torrent inspect` and
+  `torrent fetch` accept v1, v2-only (BEP 52) and hybrid torrent files. Identity
+  is a typed value holding the full v1 SHA-1 and full v2 SHA-256 separately; the
+  library's 20-byte truncated hash is used only as the storage key the library
+  requires. v1 job ids (`bt-<40 hex>`), capture keys, status lookups and
+  persisted metainfo names are unchanged, so existing jobs resume and reconcile
+  as before. A v2-only job gets `bt2-<64 hex>` and records `info_hash_v2` with an
+  empty `info_hash` — the SHA-1 of a v2 info dictionary is never presented as an
+  identity. A hybrid keeps its v1 job id and validates both hashes; a lookup by
+  the full v2 hash resolves that job read-only. Persisted metainfo now carries v2
+  piece layers (`Torrent.Metainfo()`), without which a v2 restart cannot verify
+  anything; a layer-less metainfo and two different identities that would share a
+  payload directory or completion key fail explicitly (`ErrUnsupportedIdentity`,
+  `ErrIdentityConflict`) instead of silently sharing or waiting. `btmh` magnets
+  remain unsupported. See `docs/TORRENT.md` ("Identities").
 - **Metadata-first admission for torrent fetches**: payload storage is now
   opened only after the layout, the requested selection and the staging paths
   have passed admission. The torrent is created with

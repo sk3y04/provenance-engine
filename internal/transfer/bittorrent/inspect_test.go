@@ -316,9 +316,10 @@ func TestInspectMagnetTimeoutAndCancelCleanUp(t *testing.T) {
 	}
 }
 
-// TestInspectRejectsUnsupportedIdentity: v2/hybrid metainfo and v2 magnets are
-// refused explicitly, before any layout is used.
-func TestInspectRejectsUnsupportedIdentity(t *testing.T) {
+// TestInspectRejectsMalformedV2Identity: metainfo that claims v2 without a file
+// tree is malformed and is refused before any layout is used. A well-formed v2
+// torrent is accepted (see TestV2OnlyInspectIsOffline); v2 magnets stay unsupported.
+func TestInspectRejectsMalformedV2Identity(t *testing.T) {
 	v1 := metainfoFor(t, "fixture", []string{"a.bin"}, patterned(1000, 'a'))
 	info, err := v1.UnmarshalInfo()
 	if err != nil {
@@ -330,7 +331,7 @@ func TestInspectRejectsUnsupportedIdentity(t *testing.T) {
 	path := writeMetaInfo(t, v2)
 
 	if _, err := Inspect(context.Background(), path, InspectConfig{DisablePeerDiscovery: true}); !errors.Is(err, ErrUnsupportedIdentity) {
-		t.Errorf("v2 metainfo error = %v, want ErrUnsupportedIdentity", err)
+		t.Errorf("malformed v2 metainfo error = %v, want ErrUnsupportedIdentity", err)
 	}
 
 	// The same refusal for a fetch, and before anything is added to a client.
@@ -340,13 +341,13 @@ func TestInspectRejectsUnsupportedIdentity(t *testing.T) {
 	ctx, cancel := waitCtx(t)
 	defer cancel()
 	if _, err := sess.Fetch(ctx, path, []string{"fixture/a.bin"}); !errors.Is(err, ErrUnsupportedIdentity) {
-		t.Errorf("v2 fetch error = %v, want ErrUnsupportedIdentity", err)
+		t.Errorf("malformed v2 fetch error = %v, want ErrUnsupportedIdentity", err)
 	}
 	if n := spy.opens.Load(); n != 0 {
-		t.Errorf("payload storage opened %d time(s) for a v2 torrent", n)
+		t.Errorf("payload storage opened %d time(s) for a malformed v2 torrent", n)
 	}
 	if _, err := os.Stat(filepath.Join(staging, "fixture")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("v2 fetch created a payload directory: %v", err)
+		t.Errorf("malformed v2 fetch created a payload directory: %v", err)
 	}
 
 	// A v2 magnet has no v1 infohash to accept.

@@ -111,6 +111,46 @@ metainfo are rejected explicitly (`ErrUnsupportedIdentity`), as are v2 magnets
 v1 piece hashes, and persisting a second identity would change job IDs and
 capture keys.
 
+## Identities: v1, v2 and hybrid
+
+A local `.torrent` file may be v1 (SHA-1 infohash), v2 (BEP 52, SHA-256) or
+hybrid (both). `Identity` keeps the two hashes **separately and in full**:
+
+| Kind | `info_hash` | `info_hash_v2` | Job id | Persisted metainfo |
+|------|-------------|----------------|--------|--------------------|
+| v1 | 40 hex | — | `bt-<40 hex>` | `<v1 hex>.torrent` |
+| v2-only | — (never the SHA-1 of the info bytes) | 64 hex | `bt2-<64 hex>` | `<v2 hex>.torrent` |
+| hybrid | 40 hex | 64 hex | `bt-<40 hex>` (canonical) | `<v1 hex>.torrent` |
+
+Consequences worth stating:
+
+- **v1 jobs, capture keys and status lookups are unchanged.** The job id, the
+  idempotency key and the metainfo file name for a v1 torrent are byte-identical
+  to what earlier builds wrote, so existing records resume and reconcile.
+- **A hybrid is one job.** It validates both hashes and is recorded under its v1
+  id, so it captures once. A lookup by the full v2 hash resolves that job
+  (read-only): `bt2-<64 hex>` and the bare 64-hex form are accepted by
+  `torrent status`, and neither creates, renames nor rewrites anything. There is
+  no index to fall out of sync; resolution is a scan of the job records.
+- **The library's short hash is never an identity.** `Torrent.InfoHash()` returns
+  a 20-byte value even for a v2 torrent (a truncation of the v2 hash). The
+  adapter uses it only where the library requires a 20-byte key — its
+  piece-completion database and payload namespace — and derives identity from the
+  exact metainfo bytes instead.
+- **Piece layers are part of resume state.** A v2 torrent needs its top-level
+  `piece layers` table to verify any piece. Persisted metainfo is written from
+  `Torrent.Metainfo()`, which includes them; a metainfo without layers is refused
+  (`ErrUnsupportedIdentity`, "carries no piece layers") rather than resumed into
+  an unverifiable state, and a piece the library reports as
+  `MissingPieceLayerHash` fails the transfer instead of waiting forever.
+- **Conflicts are refused.** The library stores payload under the torrent's name
+  and keys completion by the short hash, so a second, different identity in the
+  same staging root would share bytes. That is `ErrIdentityConflict`, not silent
+  reuse.
+
+`btmh` magnets remain unsupported: only a local `.torrent` can introduce a v2
+identity, so nothing in this slice accepts a v2 magnet URI.
+
 ## Metadata first: inspection and admission
 
 The order below is the contract this slice implements, and the tests assert each
@@ -580,6 +620,7 @@ tracker. Covered:
 | `ownership_test.go` | second session on the same root is busy, busy sessions write nothing, symlink/`.` spellings are the same owner, independent roots run concurrently, concurrent Fetch on one Session is serialized, closed sessions refuse work, ownership survives `--seed` |
 | `ownership_process_test.go` (real processes) | barrier: a competing process gets the busy error and writes nothing, then exactly one manifest after the owner exits; SIGKILL of the owner releases the lock and the job reconciles; a seeding owner stays exclusive and releases on cancel; different torrents in one root are excluded; independent roots proceed concurrently |
 | `status_test.go` | deterministic list order, projection of a recorded job, empty root creates nothing, unreadable records reported with a reason (corrupt JSON, unsupported format, mismatched file name), lookup by id/bare infohash/case-insensitive, path-like ids rejected before any filesystem access, missing root not created, v1 record readable and byte-identical afterwards, secrets never projected or echoed, unsafe record paths rejected, 300 atomic replacements observed only as complete old/new records |
+| `v2_test.go` | v2-only `.torrent` inspected offline (no v1 hash invented, no magnet source); v2 fetch from a loopback seeder interrupted and restarted from the persisted metainfo with its piece layers, resume measured by bytes read, identity surviving status; hybrid identity checked against independently computed SHA-1 and SHA-256 of the info bytes, canonical v1 job, `bt2-` and bare-v2 alias resolution without mutation, one capture after restart, mismatched identity refused; layer-less metainfo fails closed with no capture; two same-named v2 torrents in one root rejected as a conflict |
 | `corruption_test.go` | shared-piece corruption with real persisted state (same length, completion DB untouched): repaired by re-fetching at most the damaged piece (measured bytes), captured hash matches the fixture, one run manifest, reconciled; no-peer attempt is bounded, publishes nothing and leaves the historical capture byte-identical; injected chunk-write failure → `ErrStorageFailure`; injected failed promotion → `ErrNotFinalized` after the grace, nothing published; cancellation during verification and during finalization publishes nothing, closes cleanly and hands ownership to the next run |
 | `inspect_test.go` | local `.torrent` inspected with a client-construction counter stuck at 0; magnet inspection resolves metadata while the seeder reports 0 payload bytes and 0 chunks written; no temp dir survives; inspection leaves an existing staging root byte-identical; rejection before storage open for unknown selection, path collision and symlinked payload path (storage spy count 0), and exactly one open on the admitted path; metadata timeout and cancellation clean up; v2/hybrid refused for inspect and fetch |
 | `ownership_process_test.go` → `TestInspectDoesNotNeedStagingOwnership` | a separate process inspects a magnet while another process owns the staging root, writes nothing there, and does not disturb ownership |

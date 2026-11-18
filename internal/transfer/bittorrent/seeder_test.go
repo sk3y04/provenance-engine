@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -239,9 +240,22 @@ func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool)
 }
 
 // jobRecordFor reads the persisted job record from a staging root.
-func jobRecordFor(t *testing.T, staging, infohash string) *jobRecord {
+// jobID derives a v1 job id for fixtures and assertions.
+func jobID(infoHash string) string { return "bt-" + infoHash }
+
+// jobRecordFor reads a job record by job id ("bt-<v1>", "bt2-<v2>") or by a bare
+// v1 infohash, which keeps older fixtures working.
+func jobRecordFor(t *testing.T, staging, idOrInfohash string) *jobRecord {
 	t.Helper()
-	path := filepath.Join(staging, filepath.FromSlash(torrentStateDir), jobID(infohash)+".job.json")
+	id := idOrInfohash
+	if !strings.HasPrefix(id, "bt-") && !strings.HasPrefix(id, "bt2-") {
+		if len(id) == 64 {
+			id = "bt2-" + id
+		} else {
+			id = "bt-" + id
+		}
+	}
+	path := filepath.Join(staging, filepath.FromSlash(torrentStateDir), id+".job.json")
 	job, err := readJob(path)
 	if err != nil {
 		t.Fatalf("read job record: %v", err)

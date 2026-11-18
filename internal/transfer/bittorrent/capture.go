@@ -15,7 +15,10 @@ import (
 // It records identity (infohash, job, path inside the torrent) and nothing
 // that could leak a tracker, passkey, or local path.
 type itemMetadata struct {
-	InfoHash    string `json:"info_hash"`
+	// InfoHash is the v1 infohash, empty for a v2-only torrent.
+	InfoHash string `json:"info_hash"`
+	// InfoHashV2 is the full v2 infohash when the torrent has one.
+	InfoHashV2  string `json:"info_hash_v2,omitempty"`
 	JobID       string `json:"job_id"`
 	TorrentPath string `json:"torrent_path"`
 	// PiecesVerified records that every piece covering this file reached the
@@ -129,6 +132,7 @@ func (s *Session) commitCapture(job *jobRecord, assets []Asset, key string) (str
 
 		meta, err := json.Marshal(itemMetadata{
 			InfoHash:       job.InfoHash,
+			InfoHashV2:     job.InfoHashV2,
 			JobID:          job.JobID,
 			TorrentPath:    a.Path,
 			PiecesVerified: true,
@@ -137,7 +141,7 @@ func (s *Session) commitCapture(job *jobRecord, assets []Asset, key string) (str
 			return "", fmt.Errorf("encode item metadata: %w", err)
 		}
 		item := manifest.CaptureItem{
-			ExternalID:     job.InfoHash + ":" + a.Path,
+			ExternalID:     job.identityLabel() + ":" + a.Path,
 			URL:            job.Source,
 			CanonicalURL:   job.Source,
 			Title:          filepath.Base(a.Path),
@@ -171,6 +175,7 @@ func (s *Session) commitCapture(job *jobRecord, assets []Asset, key string) (str
 func (s *Session) captureResult(job *jobRecord, assets []Asset, key, manifestPath string, bytesRead int64, warnings []string, reconciled bool) Capture {
 	return Capture{
 		InfoHash:     job.InfoHash,
+		InfoHashV2:   job.InfoHashV2,
 		JobID:        job.JobID,
 		StagingDir:   s.staging,
 		Assets:       assets,
