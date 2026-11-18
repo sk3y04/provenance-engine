@@ -1,6 +1,8 @@
 package catalog
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"testing"
 	"time"
@@ -9,9 +11,12 @@ import (
 )
 
 // makeRevision writes a collection revision captured at at and returns its id.
+// The id is a real content address (sha256 hex), matching what production
+// ingestion produces.
 func makeRevision(t *testing.T, vaultRoot, col string, at time.Time) string {
 	t.Helper()
-	id := fmt.Sprintf("rev-%s-%d", col, at.UnixNano())
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", col, at.UnixNano())))
+	id := hex.EncodeToString(sum[:])
 	rev := &archive.Revision{
 		ID:         id,
 		CapturedAt: at,

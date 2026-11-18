@@ -184,3 +184,23 @@ func TestWriteReadRevisionRoundTrip(t *testing.T) {
 		t.Fatalf("text lost in round trip: %+v", got.Entities[0].Text)
 	}
 }
+
+// TestRevisionIDValidationRejectsTraversal proves revision ids that are not
+// content addresses cannot escape the vault's revisions directory when a user
+// supplies one (for example `vault revision diff <id> <id>`).
+func TestRevisionIDValidationRejectsTraversal(t *testing.T) {
+	vault := t.TempDir()
+	for _, id := range []string{
+		"",
+		"abc",
+		"../../etc",
+		"../../../tmp/evil",
+		"/etc/passwd",
+		"ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789", // uppercase
+		strings.Repeat("g", 64), // wrong alphabet
+	} {
+		if _, err := ReadRevision(vault, id); err == nil {
+			t.Errorf("ReadRevision(%q) accepted an invalid id", id)
+		}
+	}
+}

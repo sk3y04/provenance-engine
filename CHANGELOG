@@ -164,6 +164,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Revision IDs from user input are path-safe**: `archive.ReadRevision` joined
+  its `id` argument straight into the vault path, so `vault revision diff`
+  accepted ids like `../../../tmp/evil` and read a `manifest.json` from outside
+  the vault. Ids must now be a 64-character lowercase sha256 content address;
+  everything else is rejected with a clear error. Retention fixtures now use
+  real content-address ids.
 - **Invalid `--min-size`/`--max-size` values are rejected**: `manifest.ParseSize`
   silently converted `NaN`, `Inf`, negative values, and sizes that overflow
   int64 into wrapped/negative byte counts, producing nonsensical filters. These

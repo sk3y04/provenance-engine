@@ -122,6 +122,21 @@ func IngestCaptureManifest(bs *blobstore.Store, opts IngestOptions, cm *manifest
 	return rev, nil
 }
 
+// validRevisionID reports whether id is a revision content address: a
+// lowercase 64-character sha256 hex digest. Anything else could escape the
+// vault's revisions directory when joined into a path.
+func validRevisionID(id string) bool {
+	if len(id) != sha256.Size*2 {
+		return false
+	}
+	for _, c := range id {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func WriteRevision(vaultRoot string, rev *Revision) error {
 	dir := filepath.Join(vaultRoot, "revisions", rev.ID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -148,6 +163,9 @@ func WriteRevision(vaultRoot string, rev *Revision) error {
 }
 
 func ReadRevision(vaultRoot, id string) (*Revision, error) {
+	if !validRevisionID(id) {
+		return nil, fmt.Errorf("invalid revision id %q", id)
+	}
 	dir := filepath.Join(vaultRoot, "revisions", id)
 	path := filepath.Join(dir, "manifest.json")
 	data, err := os.ReadFile(path)
