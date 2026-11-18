@@ -580,19 +580,7 @@ func downloadVideoLinks(ctx context.Context, d *extractor.Deps, links []string, 
 	}
 	narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] downloading %d item(s) with concurrency=%d\n", total, concurrency)
 
-	ytOpts := extractor.YtdlpOptions{
-		OutputDir:          opts.OutputDir,
-		CookiesFile:        opts.CookiesFile,
-		CookiesFromBrowser: opts.CookiesFromBrowser,
-		Quality:            opts.Quality,
-		AudioOnly:          opts.AudioOnly,
-		DryRun:             opts.DryRun,
-		DownloadArchive:    ytdlpArchivePath,
-		OutputLayout:       opts.OutputLayout,
-		OutputTemplate:     opts.OutputTemplate,
-		SpeedLimit:         opts.SpeedLimit,
-		Progress:           opts.FileProgress,
-	}
+	ytOpts := batchYtOpts(d, opts, ytdlpArchivePath)
 
 	pool := worker.NewPool(ctx, concurrency)
 
@@ -662,6 +650,26 @@ func downloadVideoLinks(ctx context.Context, d *extractor.Deps, links []string, 
 	narratef(ctx, kindInfo, reasonInfo, "", "", "[provenance] batch complete: %d/%d succeeded, %d failed\n",
 		completed.Load(), total, failed.Load())
 	return firstErr
+}
+
+// batchYtOpts builds the yt-dlp options for the batch/crawler fast path.
+// It must carry the same runtime fields as the single-URL Dispatch path.
+func batchYtOpts(d *extractor.Deps, opts Options, archivePath string) extractor.YtdlpOptions {
+	return extractor.YtdlpOptions{
+		OutputDir:          opts.OutputDir,
+		CookiesFile:        opts.CookiesFile,
+		CookiesFromBrowser: opts.CookiesFromBrowser,
+		Quality:            opts.Quality,
+		AudioOnly:          opts.AudioOnly,
+		DryRun:             opts.DryRun,
+		DownloadArchive:    archivePath,
+		OutputLayout:       opts.OutputLayout,
+		OutputTemplate:     opts.OutputTemplate,
+		SpeedLimit:         opts.SpeedLimit,
+		Progress:           opts.FileProgress,
+		Events:             opts.Events,
+		AutoInstall:        d.AutoInstall,
+	}
 }
 
 // BatchDispatch reads URLs (one per line, blanks/# comments allowed) from
@@ -785,7 +793,9 @@ func writeLinkCache(outDir, sourceURL string, links []string) (string, error) {
 	}
 	host := "links"
 	if u, err := url.Parse(sourceURL); err == nil && u.Host != "" {
-		host = strings.ReplaceAll(u.Host, ".", "_")
+		// Sanitize the whole host: ports and IPv6 brackets are not portable
+		// filename characters.
+		host = sanitizeFilename(strings.ReplaceAll(u.Host, ".", "_"))
 		// Append a tail of the path to disambiguate multiple playlists per host.
 		tail := strings.TrimRight(u.Path, "/")
 		if i := strings.LastIndex(tail, "/"); i >= 0 {
@@ -816,7 +826,7 @@ func writeLinkCache(outDir, sourceURL string, links []string) (string, error) {
 func sanitizeFilename(s string) string {
 	repl := strings.NewReplacer(
 		"/", "_", "\\", "_", ":", "_", "*", "_", "?", "_",
-		"\"", "_", "<", "_", ">", "_", "|", "_",
+		"\"", "_", "<", "_", ">", "_", "|", "_", "[", "_", "]", "_",
 	)
 	return repl.Replace(s)
 }
