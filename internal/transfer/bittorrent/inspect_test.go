@@ -350,10 +350,18 @@ func TestInspectRejectsMalformedV2Identity(t *testing.T) {
 		t.Errorf("malformed v2 fetch created a payload directory: %v", err)
 	}
 
-	// A v2 magnet has no v1 infohash to accept.
+	// A btmh magnet is now accepted for resolution: with no peers it must fail
+	// as a bounded metadata wait, not as an identity rejection.
 	v2magnet := "magnet:?xt=urn:btmh:1220" + strings.Repeat("cd", 32)
-	if _, err := Inspect(context.Background(), v2magnet, InspectConfig{}); !errors.Is(err, ErrUnsupportedSource) && !errors.Is(err, ErrUnsupportedIdentity) {
-		t.Errorf("v2 magnet error = %v, want an unsupported-identity or unsupported-source rejection", err)
+	if _, err := Inspect(context.Background(), v2magnet, InspectConfig{
+		DisablePeerDiscovery: true, MetadataTimeout: 200 * time.Millisecond,
+	}); !errors.Is(err, ErrMetadataTimeout) {
+		t.Errorf("btmh magnet error = %v, want ErrMetadataTimeout", err)
+	}
+	// A malformed multihash is still refused before any client work.
+	bad := "magnet:?xt=urn:btmh:12" + strings.Repeat("cd", 32)
+	if _, err := Inspect(context.Background(), bad, InspectConfig{DisablePeerDiscovery: true}); !errors.Is(err, ErrUnsupportedSource) {
+		t.Errorf("malformed btmh magnet error = %v, want ErrUnsupportedSource", err)
 	}
 }
 

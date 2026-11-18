@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **v2-only and hybrid magnet ingestion**: `torrent inspect` and `torrent fetch`
+  accept `urn:btmh` magnets and magnets carrying both `btih` and `btmh`. Metadata
+  is resolved before the durable job id is chosen, so a hybrid named by a btmh
+  magnet lands in its canonical `bt-<v1>` job (and an existing job record gains
+  the v2 identity metadata revealed) instead of creating a `bt2-` record; btih
+  behaviour is unchanged. A dual-identity magnet must match both hashes against
+  the metadata, and a contradictory pair is refused without adopting a job or
+  publishing a capture. Piece layers are only distributed in `.torrent` files
+  (the pinned library never fetches them over the wire), so a v2-only btmh magnet
+  is inspection-only: `Fetch` fails with `ErrUnsupportedIdentity` naming the
+  missing layers before any job record or payload storage exists. Hybrids verify
+  with their v1 piece hashes and resume from persisted metainfo without layers;
+  the missing-layer guard remains for v2-only torrents. Synthetic identities that
+  collide on the library's 20-byte storage key are refused by the conflict check.
+
 ### Fixed
 
 - **A failed piece write is now a diagnosable error, not a silent stall**: the

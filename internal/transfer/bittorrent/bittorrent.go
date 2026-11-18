@@ -466,16 +466,25 @@ func parseSource(raw string) (source, error) {
 		return source{}, fmt.Errorf("%w: empty source", ErrUnsupportedSource)
 	}
 	if strings.HasPrefix(strings.ToLower(raw), "magnet:") {
-		m, err := metainfo.ParseMagnetUri(raw)
+		// The library parses and validates both urn:btih (v1) and urn:btmh
+		// (v2 multihash), rejects a second hash of either kind, and rejects a
+		// multihash that is not SHA2-256/32 bytes. A magnet may carry one or
+		// both; the adapter requires at least one.
+		m, err := metainfo.ParseMagnetV2Uri(raw)
 		if err != nil {
-			return source{}, fmt.Errorf("%w: %v", ErrUnsupportedSource, err)
+			return source{}, fmt.Errorf("%w: %s", ErrUnsupportedSource, sanitizeSourceText(err.Error(), raw))
 		}
-		if m.InfoHash == (metainfo.Hash{}) {
-			// BitTorrent v2-only magnets (urn:btmh) are out of scope for this
-			// slice: selection and capture are defined over v1 file offsets.
-			return source{}, fmt.Errorf("%w: only v1 (urn:btih) magnets are supported", ErrUnsupportedSource)
+		var id Identity
+		if m.InfoHash.Ok {
+			id.V1, id.HasV1 = m.InfoHash.Value, true
 		}
-		return source{kind: "magnet", id: Identity{V1: m.InfoHash, HasV1: true}, infoHash: m.InfoHash, magnet: raw}, nil
+		if m.V2InfoHash.Ok {
+			id.V2, id.HasV2 = m.V2InfoHash.Value, true
+		}
+		if !id.HasV1 && !id.HasV2 {
+			return source{}, fmt.Errorf("%w: magnet carries no urn:btih or urn:btmh infohash", ErrUnsupportedSource)
+		}
+		return source{kind: "magnet", id: id, infoHash: id.StorageKey(), magnet: raw}, nil
 	}
 	fi, err := os.Stat(raw)
 	if err != nil {
@@ -513,6 +522,23 @@ func applyAdmissionOpts(spec *at.TorrentSpec) {
 	spec.DeferStorageOpen = true
 	spec.DisallowDataDownload = true
 	spec.DisallowDataUpload = true
+}
+
+// checkVerifiable refuses a torrent whose pieces can never be verified with the
+// data on hand. BitTorrent v2 piece hashes live in the .torrent's top-level
+// "piece layers" table; BEP 52 defines no way to transfer them over the wire, so
+// a v2-only torrent resolved from a btmh magnet arrives with metadata but no
+// piece hashes at all. A hybrid is fine: its info dictionary carries v1 piece
+// hashes, which the library prefers for verification.
+func (s *Session) checkVerifiable(id Identity, mi metainfo.MetaInfo) error {
+	if !id.HasV2 || id.HasV1 {
+		return nil
+	}
+	if len(mi.PieceLayers) > 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: v2-only torrent has no piece layers; BEP 52 distributes them only in .torrent files, so a btmh magnet cannot be verified or resumed (use the .torrent file)",
+		ErrUnsupportedIdentity)
 }
 
 // openPayload opens payload storage. It is called only after the layout and the
@@ -565,6 +591,9 @@ type opened struct {
 	byPath      map[string]*at.File
 	staging     string
 	stagingRoot string
+	// id is the full identity resolved from the metadata (not the possibly
+	// narrower identity the source string supplied).
+	id Identity
 
 	// errMu guards writeErr, which records the first storage write failure the
 	// library reports asynchronously. It is read from the completion poll loop
@@ -632,9 +661,34 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 		defer cancel()
 	}
 
-	job, err := s.loadOrCreateJob(src, normalizeSelection(selection))
+	// A magnet can name a narrower identity than the torrent turns out to have
+	// (btih or btmh for a hybrid), and a btmh magnet can name a v2-only torrent
+	// that will never be verifiable. Resolve metadata before choosing the
+	// durable job id, so the canonical id is derived from the full identity and
+	// no record is created for a torrent that cannot be fetched.
+	var preOpened *opened
+	jobID := src.id
+	if src.kind == "magnet" {
+		metaCtx, cancelMeta := context.WithTimeout(ctx, s.cfg.MetadataTimeout)
+		o, oerr := s.open(metaCtx, src)
+		cancelMeta()
+		if oerr != nil {
+			return Capture{}, oerr
+		}
+		preOpened = o
+		jobID = o.id
+	}
+
+	job, err := s.loadOrCreateJob(jobID, normalizeSelection(selection))
 	if err != nil {
 		return Capture{}, err
+	}
+	if preOpened != nil {
+		// Enrich the record with an identity the source string did not carry
+		// (btih or btmh naming a hybrid), never replacing one it did.
+		if err := s.enrichJobIdentity(job, preOpened.id); err != nil {
+			return Capture{}, err
+		}
 	}
 
 	// 1. Committed already? The key is derived from the recorded payload, so
@@ -683,17 +737,21 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 	}
 
 	// 3. Transfer.
-	return s.transferAndCapture(ctx, src, job, warnings)
+	return s.transferAndCapture(ctx, src, job, warnings, preOpened)
 }
 
 // transferAndCapture runs the torrent backend for the job's selection, records
 // the verified payload, and commits the capture.
-func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRecord, warnings []string) (Capture, error) {
-	metaCtx, cancelMeta := context.WithTimeout(ctx, s.cfg.MetadataTimeout)
-	o, err := s.open(metaCtx, src)
-	cancelMeta()
-	if err != nil {
-		return Capture{}, err
+func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRecord, warnings []string, pre *opened) (Capture, error) {
+	o := pre
+	if o == nil {
+		metaCtx, cancelMeta := context.WithTimeout(ctx, s.cfg.MetadataTimeout)
+		var err error
+		o, err = s.open(metaCtx, src)
+		cancelMeta()
+		if err != nil {
+			return Capture{}, err
+		}
 	}
 
 	selected, err := o.resolveSelection(job.Selection)
@@ -906,16 +964,31 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 	select {
 	case <-t.GotInfo():
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		if src.id.HasV1 && src.id.HasV2 {
+			// A dual-identity magnet is accepted only if the metadata satisfies
+			// both hashes. The library validates them while acquiring the
+			// metadata, so a contradictory pair never arrives as an identity
+			// error; report what actually happened.
+			return nil, fmt.Errorf("%w: metadata never validated against both supplied infohashes (btih and btmh); one of them is wrong: %w",
+				ErrMetadataTimeout, ctx.Err())
+		}
+		return nil, fmt.Errorf("%w: %w", ErrMetadataTimeout, ctx.Err())
 	}
 	// Torrent.InfoHash is the library's 20-byte short hash for v2 torrents, so the
-	// full identity is taken from the metadata bytes it actually holds.
-	if got, ierr := IdentityFromInfo(t.Info(), t.Metainfo().InfoBytes); ierr != nil {
+	// full identity is taken from the metadata bytes it actually holds. Every
+	// hash the source supplied must agree with it; the metadata may carry more
+	// identity than the source did (a btih or btmh magnet naming a hybrid).
+	resolved, ierr := IdentityFromInfo(t.Info(), t.Metainfo().InfoBytes)
+	if ierr != nil {
 		return nil, ierr
-	} else if !got.SameTorrent(src.id) {
-		return nil, fmt.Errorf("metadata identity %s does not match source %s", got, src.id)
 	}
-	if err := s.persistMetainfo(t, miPath, src.id); err != nil {
+	if !resolved.Compare(src.id) {
+		return nil, fmt.Errorf("metadata identity %s does not match source %s", resolved, src.id)
+	}
+	if err := s.checkVerifiable(resolved, t.Metainfo()); err != nil {
+		return nil, err
+	}
+	if err := s.persistMetainfo(t, miPath, resolved); err != nil {
 		return nil, err
 	}
 
@@ -954,6 +1027,7 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 		byPath:      byPath,
 		staging:     s.staging,
 		stagingRoot: stagingRoot,
+		id:          resolved,
 	}
 	// Chunk writes cannot happen before admission enables transfer, so the
 	// handler is installed before any write can be attempted.
@@ -1164,6 +1238,11 @@ func (o *opened) allSelectedComplete(selected []validatedFile) bool {
 // metainfo has no v2 piece-layer entry for it. Waiting would never finish and
 // would end as a timeout; a capture from unverifiable pieces must be impossible.
 func (o *opened) missingPieceLayer(selected []validatedFile) (string, bool) {
+	if o.id.HasV1 {
+		// Verification uses the v1 piece hashes when the info dictionary has
+		// them, so absent v2 layers do not make these pieces unverifiable.
+		return "", false
+	}
 	for _, sf := range selected {
 		for i := sf.file.BeginPieceIndex(); i < sf.file.EndPieceIndex(); i++ {
 			if o.t.Piece(i).State().MissingPieceLayerHash {
@@ -1242,9 +1321,10 @@ func (s *Session) persistMetainfo(t *at.Torrent, path string, want Identity) err
 	if !got.SameTorrent(want) {
 		return fmt.Errorf("library metainfo describes %s, expected %s", got, want)
 	}
-	if want.HasV2 && len(mi.PieceLayers) == 0 {
-		// Without piece layers no piece of a v2 torrent can be verified, and a
-		// restart could not re-verify what it reopens.
+	if want.HasV2 && !want.HasV1 && len(mi.PieceLayers) == 0 {
+		// A v2-only torrent has no other piece hashes to fall back on. A hybrid
+		// does: its info dictionary carries v1 piece hashes, which verification
+		// prefers, so it resumes without layers.
 		return fmt.Errorf("%w: %s cannot be resumed: the metainfo carries no piece layers",
 			ErrUnsupportedIdentity, want)
 	}
@@ -1272,12 +1352,13 @@ func loadPersistedMetainfo(path string, want Identity) (*metainfo.MetaInfo, erro
 	if err != nil {
 		return nil, err
 	}
-	if !got.SameTorrent(want) {
+	// The persisted metainfo may carry more identity than the source string
+	// does (a btih or btmh magnet naming a hybrid); shared hashes must agree.
+	if !got.Compare(want) {
 		return nil, fmt.Errorf("persisted metainfo describes %s, expected %s", got, want)
 	}
-	if want.HasV2 && len(mi.PieceLayers) == 0 {
-		// A v2 metainfo without piece layers must never be used for resume: the
-		// pieces it names cannot be verified.
+	if want.HasV2 && !want.HasV1 && len(mi.PieceLayers) == 0 {
+		// A v2-only metainfo without piece layers can never verify anything.
 		return nil, errors.New("persisted metainfo carries no v2 piece layers")
 	}
 	return mi, nil

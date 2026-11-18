@@ -148,8 +148,40 @@ Consequences worth stating:
   same staging root would share bytes. That is `ErrIdentityConflict`, not silent
   reuse.
 
-`btmh` magnets remain unsupported: only a local `.torrent` can introduce a v2
-identity, so nothing in this slice accepts a v2 magnet URI.
+### Magnets: btih, btmh, hybrid
+
+A magnet may name a v1 hash (`urn:btih`), a v2 hash (`urn:btmh`, multihash
+`1220…`) or both. The library's parser validates the multihash (SHA2-256,
+32 bytes) and rejects a second hash of either kind; the adapter rejects a magnet
+with neither.
+
+| Magnet | Resolves to | Fetch |
+|--------|-------------|-------|
+| btih only | whatever the metadata is: v1, or a hybrid | supported |
+| btmh only on a v2-only torrent | v2-only (`bt2-<v2>`) | **refused**: piece layers exist only in `.torrent` files, so no piece can be verified |
+| btmh only on a hybrid | hybrid, canonical `bt-<v1>` | supported (v1 piece hashes verify) |
+| btih + btmh | hybrid; both hashes must match the metadata | supported |
+
+Metadata is resolved **before** the durable job id is chosen, so a hybrid named
+by a btmh-only magnet lands in its canonical `bt-<v1>` job instead of creating a
+`bt2-` record that would later have to be renamed. A record is enriched with the
+v2 identity that metadata revealed; a recorded hash is never replaced.
+
+Piece layers: BEP 52 distributes them only in the `.torrent` file, and the
+pinned library never obtains them over the wire (`setInfoBytesLocked(…, nil)` on
+the metadata path). A magnet-originated hybrid therefore has **no** piece layers,
+which is fine because its info dictionary carries v1 piece hashes and the library
+prefers those for verification (`Piece.Storage` takes `v1HashBytes` first). A
+v2-only magnet has no v1 fallback, so `Fetch` fails with
+`ErrUnsupportedIdentity` ("v2-only torrent has no piece layers … use the
+.torrent file") before any job record or payload storage is created.
+Inspection still works for it: identity and file list come from the metadata and
+nothing is implied about readiness.
+
+A contradictory dual-identity magnet is never accepted. Both hashes are checked
+against the metadata; the library rejects metadata that fails either, so the
+observable failure is a metadata timeout naming the contradictory pair rather
+than a generic deadline, and no job is adopted and nothing is published.
 
 ## Metadata first: inspection and admission
 
@@ -620,6 +652,7 @@ tracker. Covered:
 | `ownership_test.go` | second session on the same root is busy, busy sessions write nothing, symlink/`.` spellings are the same owner, independent roots run concurrently, concurrent Fetch on one Session is serialized, closed sessions refuse work, ownership survives `--seed` |
 | `ownership_process_test.go` (real processes) | barrier: a competing process gets the busy error and writes nothing, then exactly one manifest after the owner exits; SIGKILL of the owner releases the lock and the job reconciles; a seeding owner stays exclusive and releases on cancel; different torrents in one root are excluded; independent roots proceed concurrently |
 | `status_test.go` | deterministic list order, projection of a recorded job, empty root creates nothing, unreadable records reported with a reason (corrupt JSON, unsupported format, mismatched file name), lookup by id/bare infohash/case-insensitive, path-like ids rejected before any filesystem access, missing root not created, v1 record readable and byte-identical afterwards, secrets never projected or echoed, unsafe record paths rejected, 300 atomic replacements observed only as complete old/new records |
+| `magnet_v2_test.go` | v2-only magnet inspection (identity + files, zero payload bytes from the seeder, staging untouched) and a fetch refused with the piece-layer blocker before a job exists; hybrid reached by btih, btmh, dual and local `.torrent` all reconciling to one canonical job, one capture key and one manifest, including a no-peer reopen; contradictory dual magnets (wrong v1 and wrong v2) adopting nothing and publishing nothing; synthetic identities with equal StorageKey refused by the conflict check with no storage side effects |
 | `v2_test.go` | v2-only `.torrent` inspected offline (no v1 hash invented, no magnet source); v2 fetch from a loopback seeder interrupted and restarted from the persisted metainfo with its piece layers, resume measured by bytes read, identity surviving status; hybrid identity checked against independently computed SHA-1 and SHA-256 of the info bytes, canonical v1 job, `bt2-` and bare-v2 alias resolution without mutation, one capture after restart, mismatched identity refused; layer-less metainfo fails closed with no capture; two same-named v2 torrents in one root rejected as a conflict |
 | `corruption_test.go` | shared-piece corruption with real persisted state (same length, completion DB untouched): repaired by re-fetching at most the damaged piece (measured bytes), captured hash matches the fixture, one run manifest, reconciled; no-peer attempt is bounded, publishes nothing and leaves the historical capture byte-identical; injected chunk-write failure → `ErrStorageFailure`; injected failed promotion → `ErrNotFinalized` after the grace, nothing published; cancellation during verification and during finalization publishes nothing, closes cleanly and hands ownership to the next run |
 | `inspect_test.go` | local `.torrent` inspected with a client-construction counter stuck at 0; magnet inspection resolves metadata while the seeder reports 0 payload bytes and 0 chunks written; no temp dir survives; inspection leaves an existing staging root byte-identical; rejection before storage open for unknown selection, path collision and symlinked payload path (storage spy count 0), and exactly one open on the admitted path; metadata timeout and cancellation clean up; v2/hybrid refused for inspect and fetch |

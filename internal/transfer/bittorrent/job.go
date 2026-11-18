@@ -134,6 +134,25 @@ func (j *jobRecord) formatLabel() string {
 	return j.Format
 }
 
+// enrichJobIdentity records a v2 identity that metadata revealed for a job first
+// named by a narrower source (btih or btmh magnet for a hybrid). It never
+// replaces a recorded hash and never changes the job id: a job created from a
+// v2-only source keeps its bt2- id, and one created from btih keeps bt-<v1>.
+func (s *Session) enrichJobIdentity(job *jobRecord, got Identity) error {
+	current, err := identityFromJob(job)
+	if err != nil {
+		return err
+	}
+	if !got.Compare(current) {
+		return fmt.Errorf("job %s records %s but the metadata resolved %s", job.JobID, current, got)
+	}
+	if got.HasV2 && job.InfoHashV2 == "" {
+		job.InfoHashV2 = got.V2Hex()
+		return s.saveJob(job)
+	}
+	return nil
+}
+
 // jobIdentity derives the identity a job record describes.
 func jobIdentity(job *jobRecord) Identity {
 	id, _ := identityFromJob(job)
@@ -246,14 +265,14 @@ func (s *Session) checkPayloadDirConflict(id Identity, stagingRef string) error 
 // and enforces that an existing job's selection cannot change. The record is
 // written before any payload work, so an interrupted first run still leaves a
 // durable job behind.
-func (s *Session) loadOrCreateJob(src source, want []string) (*jobRecord, error) {
-	path := s.jobPath(src.id.JobID())
+func (s *Session) loadOrCreateJob(id Identity, want []string) (*jobRecord, error) {
+	path := s.jobPath(id.JobID())
 	job, err := readJob(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	if job != nil {
-		if err := s.validateJob(job, src.id); err != nil {
+		if err := s.validateJob(job, id); err != nil {
 			return nil, err
 		}
 		if !equalSelection(job.Selection, want) {
@@ -261,24 +280,24 @@ func (s *Session) loadOrCreateJob(src source, want []string) (*jobRecord, error)
 				ErrSelectionLocked, job.JobID, job.Selection, want)
 		}
 		job.Format = JobFormatVersion
-		job.Source = src.id.Source()
+		job.Source = id.Source()
 		return job, s.saveJob(job)
 	}
-	if err := s.checkIdentityConflict(src.id); err != nil {
+	if err := s.checkIdentityConflict(id); err != nil {
 		return nil, err
 	}
 
 	now := time.Now().UTC()
 	job = &jobRecord{
 		Format:     JobFormatVersion,
-		JobID:      src.id.JobID(),
+		JobID:      id.JobID(),
 		Backend:    Backend,
-		InfoHash:   src.id.V1Hex(),
-		InfoHashV2: src.id.V2Hex(),
-		Source:     src.id.Source(),
+		InfoHash:   id.V1Hex(),
+		InfoHashV2: id.V2Hex(),
+		Source:     id.Source(),
 		Selection:  want,
 		Resume: resumeRef{
-			MetainfoPath: metainfoRelFor(src.id),
+			MetainfoPath: metainfoRelFor(id),
 			DataDir:      ".",
 			PartFiles:    true,
 		},
@@ -307,7 +326,7 @@ func validateJobRecord(staging string, job *jobRecord, want Identity) error {
 	if err != nil {
 		return err
 	}
-	if !got.SameTorrent(want) {
+	if !got.Compare(want) {
 		return fmt.Errorf("job record %s describes %s, not %s", job.JobID, got, want)
 	}
 	if job.JobID != got.JobID() {

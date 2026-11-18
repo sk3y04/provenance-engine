@@ -112,13 +112,13 @@ func TestSelectionLockedAcrossVersions(t *testing.T) {
 	s := &Session{staging: dir}
 	src := magnetSource(t, ih)
 
-	if _, err := s.loadOrCreateJob(src, []string{"fixture/a.bin"}); err != nil {
+	if _, err := s.loadOrCreateJob(src.id, []string{"fixture/a.bin"}); err != nil {
 		t.Fatalf("create job: %v", err)
 	}
-	if _, err := s.loadOrCreateJob(src, []string{"fixture/b.bin"}); !errors.Is(err, ErrSelectionLocked) {
+	if _, err := s.loadOrCreateJob(src.id, []string{"fixture/b.bin"}); !errors.Is(err, ErrSelectionLocked) {
 		t.Fatalf("changed selection error = %v, want ErrSelectionLocked", err)
 	}
-	job, err := s.loadOrCreateJob(src, []string{"fixture/a.bin"})
+	job, err := s.loadOrCreateJob(src.id, []string{"fixture/a.bin"})
 	if err != nil {
 		t.Fatalf("same selection: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestJobRecordRejectsForeignPaths(t *testing.T) {
 	ih := strings.Repeat("ef", 20)
 	s := &Session{staging: dir}
 	src := magnetSource(t, ih)
-	job, err := s.loadOrCreateJob(src, []string{"fixture/a.bin"})
+	job, err := s.loadOrCreateJob(src.id, []string{"fixture/a.bin"})
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestJobRecordStoresOnlySanitisedSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse source: %v", err)
 	}
-	job, err := s.loadOrCreateJob(src, []string{"fixture/a.bin"})
+	job, err := s.loadOrCreateJob(src.id, []string{"fixture/a.bin"})
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestMarkPayloadReadySortsAndPersists(t *testing.T) {
 	ih := strings.Repeat("7b", 20)
 	s := &Session{staging: dir}
 	src := magnetSource(t, ih)
-	job, err := s.loadOrCreateJob(src, []string{"fixture/b.bin", "fixture/a.bin"})
+	job, err := s.loadOrCreateJob(src.id, []string{"fixture/b.bin", "fixture/a.bin"})
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
