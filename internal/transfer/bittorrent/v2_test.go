@@ -247,7 +247,7 @@ func TestV2OnlyInspectIsOffline(t *testing.T) {
 
 	v2h := infohash_v2.HashBytes(mi.InfoBytes)
 	wantV2 := v2h.HexString()
-	info, err := Inspect(context.Background(), path, InspectConfig{DisablePeerDiscovery: true})
+	info, err := Inspect(context.Background(), path, InspectConfig{Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("inspect: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestV2OnlyFetchInterruptRestart(t *testing.T) {
 	sel := newMetaSeeder(t, "fixture", files, mi, 128<<10)
 
 	// Offline inspection of the same file the fetch will use.
-	offline, err := Inspect(context.Background(), path, InspectConfig{DisablePeerDiscovery: true})
+	offline, err := Inspect(context.Background(), path, InspectConfig{Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("inspect: %v", err)
 	}
@@ -382,7 +382,7 @@ func TestHybridIdentityCanonicalJob(t *testing.T) {
 	}
 
 	path := writeTorrentFile(t, mi)
-	info, err := Inspect(context.Background(), path, InspectConfig{DisablePeerDiscovery: true})
+	info, err := Inspect(context.Background(), path, InspectConfig{Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("inspect hybrid: %v", err)
 	}

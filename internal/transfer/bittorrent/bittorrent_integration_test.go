@@ -254,9 +254,9 @@ func TestInterruptedFetchResumesAndReusesVerifiedBytes(t *testing.T) {
 		t.Fatalf("close resume session: %v", err)
 	}
 	sess3, err := New(Config{
-		StagingDir:           staging,
-		DisablePeerDiscovery: true,
-		MetadataTimeout:      5 * time.Second,
+		StagingDir:      staging,
+		Discovery:       DiscoveryDirect,
+		MetadataTimeout: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("new offline session: %v", err)

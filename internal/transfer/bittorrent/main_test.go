@@ -58,10 +58,10 @@ func TestMain(m *testing.M) {
 // "this process owns the staging root".
 func runHelper() int {
 	cfg := Config{
-		StagingDir:           os.Getenv(helperStaging),
-		DisablePeerDiscovery: true,
-		MetadataTimeout:      20 * time.Second,
-		Timeout:              60 * time.Second,
+		StagingDir:      os.Getenv(helperStaging),
+		Discovery:       DiscoveryDirect,
+		MetadataTimeout: 20 * time.Second,
+		Timeout:         60 * time.Second,
 	}
 	if p := os.Getenv(helperPeer); p != "" {
 		cfg.Peers = []string{p}
@@ -81,9 +81,9 @@ func runHelper() int {
 	// op=inspect models the CLI: no Session, no staging root, no lock.
 	if os.Getenv(helperOp) == "inspect" {
 		info, ierr := Inspect(context.Background(), source, InspectConfig{
-			Peers:                cfg.Peers,
-			DisablePeerDiscovery: true,
-			MetadataTimeout:      30 * time.Second,
+			Peers:           cfg.Peers,
+			Discovery:       DiscoveryDirect,
+			MetadataTimeout: 30 * time.Second,
 		})
 		if ierr != nil {
 			fmt.Printf("ERR %v\n", ierr)
@@ -125,9 +125,9 @@ func runHelper() int {
 	case "list":
 		// The session holds the root; inspection must not need it.
 		info, lerr := Inspect(ctx, source, InspectConfig{
-			Peers:                cfg.Peers,
-			DisablePeerDiscovery: true,
-			MetadataTimeout:      30 * time.Second,
+			Peers:           cfg.Peers,
+			Discovery:       DiscoveryDirect,
+			MetadataTimeout: 30 * time.Second,
 		})
 		if lerr != nil {
 			fmt.Printf("ERR %v\n", lerr)

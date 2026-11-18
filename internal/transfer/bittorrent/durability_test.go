@@ -19,9 +19,9 @@ import (
 // accomplishes had to come from staged bytes and the persisted job.
 func offlineConfig(staging string) Config {
 	return Config{
-		StagingDir:           staging,
-		DisablePeerDiscovery: true,
-		MetadataTimeout:      5 * time.Second,
+		StagingDir:      staging,
+		Discovery:       DiscoveryDirect,
+		MetadataTimeout: 5 * time.Second,
 	}
 }
 

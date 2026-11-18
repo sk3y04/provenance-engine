@@ -412,7 +412,7 @@ provenance archive collection wallpapers --collection visual-refs --vault ~/Vaul
 
 ## `provenance torrent`
 
-Selective BitTorrent fetch. A source is a v1 magnet link (`urn:btih`) or a local `.torrent` file. There is no "download everything" mode: `fetch` requires at least one `--select` path, and an unknown path is an error rather than a silent whole-torrent download.
+Selective BitTorrent fetch. A source is a magnet (`urn:btih`, `urn:btmh`, or both) or a local `.torrent` file; v1, v2-only (BEP 52) and hybrid torrents are all read. There is no "download everything" mode: `fetch` requires at least one `--select` path, and an unknown path is an error rather than a silent whole-torrent download.
 
 Downloads are verified against the torrent's piece hashes, then written to a capture manifest in the same format `collect sync --record` produces, so `manifest verify` and `archive import` work on the result unchanged:
 
@@ -430,10 +430,46 @@ provenance archive import ./downloads/release --collection music --vault ~/Vault
 | `-o`, `--output` | string | `./downloads` | Staging root for `fetch` and `status`; `inspect` does not use it |
 | `--select` | string (repeatable) | *(required for fetch)* | Exact file path from `inspect`; commas also accepted |
 | `--peer` | string (repeatable) | - | Explicit `host:port` peer, for private swarms |
+| `--discovery` | string | `public` | Peer discovery profile: `public` (trackers, DHT, PEX) or `direct` (explicit `--peer` only). Any other value is an error |
 | `--max-bytes` | size | `0` (no limit) | Reject a selection larger than this before downloading |
 | `--timeout` | duration | `0` (no limit) | Overall deadline for the fetch |
 | `--seed` | bool | `false` | Keep seeding after capture until interrupted |
 | `--json` | bool | `false` | Machine-readable output for `inspect`, `fetch` and `status` |
+
+### Discovery profiles
+
+`--discovery` applies to `inspect` and `fetch` (`status` is read-only and never
+contacts a peer). It is per invocation: the profile is not recorded on the job,
+so a later plain `fetch` of the same job is a `public` run.
+
+```bash
+provenance torrent fetch ./release.torrent --select "release/track.flac" \
+  --discovery direct --peer 192.0.2.10:51413 -o ./downloads/release
+```
+
+`public` is the default and behaves like earlier builds: trackers, DHT, PEX and
+the peers given with `--peer`.
+
+`direct` uses **only** the peers given with `--peer`. It does not announce to or
+scrape trackers, create a DHT (so there is no bootstrap lookup), advertise or
+accept PEX, use webseeds, fetch metainfo sources (`xs=`/`as=`), dial peer
+addresses embedded in a magnet (`x.pe`), map ports with UPnP/NAT-PMP, or open a
+UDP socket (uTP and IPv6 are off). The listener binds `127.0.0.1`, so inbound
+connections can only come from this host. Name resolution still applies to the
+`--peer` addresses you pass, and nothing else resolves a name.
+
+A direct run persists a metainfo with no announce list, so a resume from that
+job's state carries no tracker URL. `direct` is not a private-tracker profile
+and not anonymity: it limits which endpoints the client contacts, not what peers
+can see. See `docs/TORRENT.md#discovery-profiles` for the enforcement points and
+the tests behind each claim.
+
+An unknown value fails before anything is created:
+
+```
+$ provenance torrent fetch x.torrent --select a --discovery swarm
+Error: --discovery: unsupported discovery profile: "swarm" (want "public" or "direct")
+```
 
 ### `torrent inspect`
 
@@ -441,8 +477,8 @@ Metadata only, and job-free: it takes no staging lock, creates no payload direct
 
 - A local `.torrent` is parsed in memory — no client is constructed, nothing is dialled, no temporary directory is created.
 - A magnet is resolved through a short-lived client bounded by `--timeout` (default two minutes), with payload storage deferred and both data directions disabled, so no piece is requested or served. The client and its private temporary directory are closed and removed on success, error, timeout and cancellation.
-- v2-only and hybrid metainfo are refused with `unsupported torrent identity`, and `urn:btmh` magnets with `unsupported torrent source`. Only v1 torrents are accepted, because selection and capture are defined over v1 file offsets.
-- `--peer` and `--timeout` apply; `-o`, `--max-bytes` and `--seed` do not.
+- v1, v2-only and hybrid metainfo are all accepted, identified by their own full hashes. A v2-only magnet (`urn:btmh`) is listable, but its fetch is refused with `unsupported torrent identity`: BEP 9 transfers only the info dictionary, and a v2-only torrent needs the piece layers that live in a `.torrent` file.
+- `--peer`, `--discovery` and `--timeout` apply; `-o`, `--max-bytes` and `--seed` do not.
 
 Inspection can run while a fetch owns the same staging root.
 

@@ -15,19 +15,19 @@ import (
 // and it is released by Close so the retry succeeds.
 func TestSecondSessionOnSameRootIsBusy(t *testing.T) {
 	staging := t.TempDir()
-	first, err := New(Config{StagingDir: staging, DisablePeerDiscovery: true})
+	first, err := New(Config{StagingDir: staging, Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("first session: %v", err)
 	}
 
-	if _, err := New(Config{StagingDir: staging, DisablePeerDiscovery: true}); !errors.Is(err, ErrStagingBusy) {
+	if _, err := New(Config{StagingDir: staging, Discovery: DiscoveryDirect}); !errors.Is(err, ErrStagingBusy) {
 		t.Fatalf("second session error = %v, want ErrStagingBusy", err)
 	}
 
 	if err := first.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	third, err := New(Config{StagingDir: staging, DisablePeerDiscovery: true})
+	third, err := New(Config{StagingDir: staging, Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("after release: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestBusySessionLeavesStateUntouched(t *testing.T) {
 	manifestsBefore := manifestCount(t, staging)
 	filesBefore := snapshotTree(t, staging)
 
-	if _, err := New(Config{StagingDir: staging, DisablePeerDiscovery: true}); !errors.Is(err, ErrStagingBusy) {
+	if _, err := New(Config{StagingDir: staging, Discovery: DiscoveryDirect}); !errors.Is(err, ErrStagingBusy) {
 		t.Fatalf("competing session error = %v, want ErrStagingBusy", err)
 	}
 
@@ -79,19 +79,19 @@ func TestSymlinkedSpellingIsSameOwner(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	owner, err := New(Config{StagingDir: root, DisablePeerDiscovery: true})
+	owner, err := New(Config{StagingDir: root, Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("owner session: %v", err)
 	}
 	for _, spelling := range []string{alias, alias + string(filepath.Separator), filepath.Join(root, ".", "")} {
-		if _, err := New(Config{StagingDir: spelling, DisablePeerDiscovery: true}); !errors.Is(err, ErrStagingBusy) {
+		if _, err := New(Config{StagingDir: spelling, Discovery: DiscoveryDirect}); !errors.Is(err, ErrStagingBusy) {
 			t.Errorf("spelling %q: error = %v, want ErrStagingBusy", spelling, err)
 		}
 	}
 	if err := owner.Close(); err != nil {
 		t.Fatalf("close owner: %v", err)
 	}
-	viaAlias, err := New(Config{StagingDir: alias, DisablePeerDiscovery: true})
+	viaAlias, err := New(Config{StagingDir: alias, Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("acquire through alias after release: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestConcurrentFetchOnOneSessionIsSerialized(t *testing.T) {
 func TestClosedSessionRejectsWork(t *testing.T) {
 	s := newSeeder(t, "fixture", 16*1024, map[string][]byte{"a.bin": patterned(2000, 'x')})
 	staging := t.TempDir()
-	sess, err := New(Config{StagingDir: staging, DisablePeerDiscovery: true, Peers: []string{s.peer()}})
+	sess, err := New(Config{StagingDir: staging, Discovery: DiscoveryDirect, Peers: []string{s.peer()}})
 	if err != nil {
 		t.Fatalf("new session: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestClosedSessionRejectsWork(t *testing.T) {
 	if err := sess.Close(); err != nil {
 		t.Fatalf("second close: %v", err)
 	}
-	next, err := New(Config{StagingDir: staging, DisablePeerDiscovery: true})
+	next, err := New(Config{StagingDir: staging, Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("reopen after double close: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestOwnershipHeldDuringLongOperation(t *testing.T) {
 	waitFor(t, "capture while seeding", 45*time.Second, func() bool {
 		return manifestCount(t, staging) == 1
 	})
-	if _, err := New(Config{StagingDir: staging, DisablePeerDiscovery: true}); !errors.Is(err, ErrStagingBusy) {
+	if _, err := New(Config{StagingDir: staging, Discovery: DiscoveryDirect}); !errors.Is(err, ErrStagingBusy) {
 		t.Fatalf("session created while the owner seeds: %v, want ErrStagingBusy", err)
 	}
 
@@ -248,7 +248,7 @@ func TestOwnershipHeldDuringLongOperation(t *testing.T) {
 	if err := sess.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	next, err := New(Config{StagingDir: staging, DisablePeerDiscovery: true})
+	next, err := New(Config{StagingDir: staging, Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("acquire after the seeding owner closed: %v", err)
 	}

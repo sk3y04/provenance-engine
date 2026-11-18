@@ -66,8 +66,8 @@ func TestInspectLocalTorrentBuildsNoClient(t *testing.T) {
 
 	clients := 0
 	info, err := Inspect(context.Background(), path, InspectConfig{
-		DisablePeerDiscovery: true,
-		onClient:             func() { clients++ },
+		Discovery: DiscoveryDirect,
+		onClient:  func() { clients++ },
 	})
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
@@ -113,9 +113,9 @@ func TestInspectMagnetRequestsNoPayload(t *testing.T) {
 	t.Setenv("TMPDIR", tmp)
 
 	info, err := Inspect(context.Background(), s.magnet(), InspectConfig{
-		Peers:                []string{s.peer()},
-		DisablePeerDiscovery: true,
-		MetadataTimeout:      30 * time.Second,
+		Peers:           []string{s.peer()},
+		Discovery:       DiscoveryDirect,
+		MetadataTimeout: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
@@ -275,8 +275,8 @@ func TestInspectMagnetTimeoutAndCancelCleanUp(t *testing.T) {
 		t.Setenv("TMPDIR", tmp)
 		start := time.Now()
 		_, err := Inspect(context.Background(), magnet, InspectConfig{
-			DisablePeerDiscovery: true,
-			MetadataTimeout:      250 * time.Millisecond,
+			Discovery:       DiscoveryDirect,
+			MetadataTimeout: 250 * time.Millisecond,
 		})
 		if !errors.Is(err, ErrMetadataTimeout) {
 			t.Fatalf("error = %v, want ErrMetadataTimeout", err)
@@ -298,8 +298,8 @@ func TestInspectMagnetTimeoutAndCancelCleanUp(t *testing.T) {
 			cancel()
 		}()
 		_, err := Inspect(ctx, magnet, InspectConfig{
-			DisablePeerDiscovery: true,
-			MetadataTimeout:      30 * time.Second,
+			Discovery:       DiscoveryDirect,
+			MetadataTimeout: 30 * time.Second,
 		})
 		if !errors.Is(err, ErrMetadataTimeout) {
 			t.Fatalf("error = %v, want ErrMetadataTimeout", err)
@@ -330,7 +330,7 @@ func TestInspectRejectsMalformedV2Identity(t *testing.T) {
 	v2.SetDefaults()
 	path := writeMetaInfo(t, v2)
 
-	if _, err := Inspect(context.Background(), path, InspectConfig{DisablePeerDiscovery: true}); !errors.Is(err, ErrUnsupportedIdentity) {
+	if _, err := Inspect(context.Background(), path, InspectConfig{Discovery: DiscoveryDirect}); !errors.Is(err, ErrUnsupportedIdentity) {
 		t.Errorf("malformed v2 metainfo error = %v, want ErrUnsupportedIdentity", err)
 	}
 
@@ -354,13 +354,13 @@ func TestInspectRejectsMalformedV2Identity(t *testing.T) {
 	// as a bounded metadata wait, not as an identity rejection.
 	v2magnet := "magnet:?xt=urn:btmh:1220" + strings.Repeat("cd", 32)
 	if _, err := Inspect(context.Background(), v2magnet, InspectConfig{
-		DisablePeerDiscovery: true, MetadataTimeout: 200 * time.Millisecond,
+		Discovery: DiscoveryDirect, MetadataTimeout: 200 * time.Millisecond,
 	}); !errors.Is(err, ErrMetadataTimeout) {
 		t.Errorf("btmh magnet error = %v, want ErrMetadataTimeout", err)
 	}
 	// A malformed multihash is still refused before any client work.
 	bad := "magnet:?xt=urn:btmh:12" + strings.Repeat("cd", 32)
-	if _, err := Inspect(context.Background(), bad, InspectConfig{DisablePeerDiscovery: true}); !errors.Is(err, ErrUnsupportedSource) {
+	if _, err := Inspect(context.Background(), bad, InspectConfig{Discovery: DiscoveryDirect}); !errors.Is(err, ErrUnsupportedSource) {
 		t.Errorf("malformed btmh magnet error = %v, want ErrUnsupportedSource", err)
 	}
 }

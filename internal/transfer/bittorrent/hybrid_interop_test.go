@@ -80,7 +80,7 @@ func TestHybridInteropMetainfo(t *testing.T) {
 		t.Logf("fixture carries %d protocol padding entries", paddingEntries)
 	}
 
-	inspected, err := Inspect(context.Background(), interopTorrent, InspectConfig{DisablePeerDiscovery: true})
+	inspected, err := Inspect(context.Background(), interopTorrent, InspectConfig{Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("inspect: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestPaddingEntriesAreNotUserFiles(t *testing.T) {
 		t.Fatalf("fixture does not carry a padding entry: %+v", entries)
 	}
 
-	inspected, err := Inspect(context.Background(), path, InspectConfig{DisablePeerDiscovery: true})
+	inspected, err := Inspect(context.Background(), path, InspectConfig{Discovery: DiscoveryDirect})
 	if err != nil {
 		t.Fatalf("inspect: %v", err)
 	}

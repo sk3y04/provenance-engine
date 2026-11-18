@@ -45,9 +45,11 @@ type InspectConfig struct {
 	// MetadataTimeout bounds the wait for metainfo. Zero uses two minutes.
 	MetadataTimeout time.Duration
 
-	// DisablePeerDiscovery disables DHT, PEX, trackers and webseeds and binds
-	// the listener to loopback, for hermetic use.
-	DisablePeerDiscovery bool
+	// Discovery selects which network branches an inspection may use. A local
+	// .torrent builds no client at all, so it is unaffected; a magnet gets a
+	// client built under this profile, and DiscoveryDirect means it can only
+	// reach the peers in Peers. The zero value is DiscoveryPublic.
+	Discovery Discovery
 
 	// onClient is a test seam: it runs immediately before an inspection client
 	// is constructed, so a test can prove that a local .torrent builds none.
@@ -61,6 +63,14 @@ type InspectConfig struct {
 // client and its temporary directory are closed and removed before Inspect
 // returns, including on cancellation and timeout.
 func Inspect(ctx context.Context, rawSource string, cfg InspectConfig) (Info, error) {
+	// Validate the profile first: an unknown value is a configuration error and
+	// must not be mistaken for a source error, nor fall back to public.
+	mode, err := ParseDiscovery(string(cfg.Discovery))
+	if err != nil {
+		return Info{}, err
+	}
+	cfg.Discovery = mode
+
 	src, err := parseSource(rawSource)
 	if err != nil {
 		return Info{}, err
@@ -131,14 +141,10 @@ func inspectMagnet(ctx context.Context, src source, cfg InspectConfig) (Info, er
 		ClientBaseDir:   tmp,
 		PieceCompletion: storage.NewMapPieceCompletion(),
 	})
-	if cfg.DisablePeerDiscovery {
-		cc.NoDHT = true
-		cc.DisableTrackers = true
-		cc.DisablePEX = true
-		cc.DisableUTP = true
-		cc.DisableIPv6 = true
-		cc.ListenHost = func(string) string { return "127.0.0.1" }
-	}
+	// Same policy as a fetch: no DHT, trackers, PEX, uTP, IPv6 or
+	// port-forwarding, and a loopback listener. Applied before the client
+	// exists, so no discoverer can be constructed and switched off later.
+	applyClientDiscovery(cc, cfg.Discovery)
 	peers, err := parsePeers(cfg.Peers)
 	if err != nil {
 		return Info{}, err
@@ -152,6 +158,9 @@ func inspectMagnet(ctx context.Context, src source, cfg InspectConfig) (Info, er
 	spec.DeferStorageOpen = true
 	spec.DisallowDataDownload = true
 	spec.DisallowDataUpload = true
+	// A magnet can carry trackers, webseed URLs, metainfo sources and peer
+	// addresses; inspection must not dial any of them in direct mode.
+	applySpecDiscovery(spec, cfg.Discovery)
 
 	if cfg.onClient != nil {
 		cfg.onClient()

@@ -45,7 +45,7 @@ func TestV2OnlyMagnet(t *testing.T) {
 	before := snapshotTree(t, staging)
 
 	info, err := Inspect(context.Background(), magnet, InspectConfig{
-		Peers: []string{sel.peer()}, DisablePeerDiscovery: true, MetadataTimeout: 30e9,
+		Peers: []string{sel.peer()}, Discovery: DiscoveryDirect, MetadataTimeout: 30e9,
 	})
 	if err != nil {
 		t.Fatalf("inspect v2-only magnet: %v", err)

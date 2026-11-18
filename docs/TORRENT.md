@@ -105,11 +105,102 @@ adapter can remove.
 3. Selected files are captured through `internal/manifest`, so
    `manifest verify` and `archive import` work unchanged.
 
-Sources: a v1 magnet (`urn:btih`) or a local `.torrent` file. v2-only and hybrid
-metainfo are rejected explicitly (`ErrUnsupportedIdentity`), as are v2 magnets
-(`urn:btmh`): selection and capture here are defined over v1 file offsets and
-v1 piece hashes, and persisting a second identity would change job IDs and
-capture keys.
+Sources: a v1 magnet (`urn:btih`), a v2-only magnet (`urn:btmh`), a dual-identity
+magnet, or a local `.torrent` file of any of the three forms. v1, v2-only (BEP
+52) and hybrid metainfo are all accepted; only a v2-only **magnet** is refused at
+fetch time, because a magnet arrives without the piece layers a v2-only torrent
+needs to verify anything (see "Piece layers" below and
+`docs/findings-v2-magnet.md`).
+
+## Discovery profiles
+
+`--discovery` decides which network branches a run may use. `public` is the
+default and preserves the behaviour of earlier builds; `direct` is the
+explicit-peers-only profile. The value is validated before anything else
+happens, and an unknown value is an error — there is no fallback.
+
+| Branch | `public` | `direct` |
+|--------|----------|----------|
+| Explicit `--peer` addresses | dialled | dialled (the only source) |
+| Tracker announce / scrape (magnet `tr=`, `.torrent` announce/announce-list) | yes | **no** |
+| DHT (and its bootstrap lookup) | yes | **no** — no DHT server is created |
+| PEX (advertising and accepting) | yes | **no** |
+| Webseeds (magnet `ws=`, `.torrent` url-list) | no (pinned off since the first slice) | no, and the URLs are stripped from the spec |
+| Metainfo sources (magnet `xs=`/`as=`, HTTP fetch) | library default | **no** — stripped from the spec |
+| Peer addresses inside a magnet (`x.pe`) | dialled | **no** — stripped from the spec |
+| Local service discovery (BEP 14 multicast) | off (opt-in, never enabled) | off |
+| UPnP / NAT-PMP port mapping | off | off |
+| Listener | all interfaces | `127.0.0.1` only; IPv6 and uTP off |
+| Inbound connections | accepted | loopback only |
+
+### How it is enforced
+
+Two layers, both applied before the library can act on the value:
+
+1. **Client switches, before construction.** `clientConfig` builds the library
+   config and applies `applyClientDiscovery` last, so the client never exists in
+   a state where a forbidden discoverer could be switched off later. In the
+   pinned `v1.62.0`: `NoDHT` is what stops the DHT server (and its bootstrap
+   lookup) from being created at all; `DisableTrackers` stops pending announce
+   updates and scrapes; `DisablePEX` keeps the `ut_pex` extension from being
+   advertised *and* drops inbound PEX messages; `ListenHost` + `DisableIPv6`
+   make the listener `127.0.0.1`, and `DisableUTP` + `NoDHT` mean no UDP socket
+   is opened.
+2. **Spec sanitisation, before `AddTorrentSpec`.** `admitSpec` is the single
+   entry point for a torrent into a session, and it strips trackers, webseeds,
+   metainfo sources, DHT node hints and magnet-supplied peer addresses in direct
+   mode. It is used by all three sources — a fresh magnet, a local `.torrent`,
+   and **the resume path** that rebuilds a spec from the persisted metainfo — so
+   a restart cannot reintroduce a tracker the run is not allowed to use.
+
+Only additive spec fields are touched. `InfoBytes`, the v1/v2 hashes and the
+piece layers are identity and content, and no discovery policy edits them.
+
+A consequence worth knowing: because the spec is sanitised before the client
+builds its view of the torrent, a direct run **persists** a metainfo with no
+announce list. Resume state from a direct run therefore carries no tracker URL
+(and no passkey a tracker URL might contain). The reverse is not true — a public
+run persists the announce list it was given — so mixing profiles over one job
+keeps whatever the first run wrote.
+
+### What `direct` does not claim
+
+- **Not anonymity.** Peers still see this host's address; the profile is about
+  which endpoints this client is willing to contact first, not about hiding
+  where it is.
+- **Name resolution still happens for `--peer`.** Those addresses are the
+  caller's instruction, so the system resolver may be used for them. Nothing
+  else in a direct run resolves a name, because no tracker, webseed, metainfo
+  source or bootstrap node exists to resolve. Pass literal addresses if even that
+  lookup matters.
+- **IPv4 only.** With IPv6 and uTP off there is no socket to dial an IPv6 peer
+  on, so a direct run cannot use one.
+- **Not a private-tracker mode.** BEP 27 asks for a tracker to be the *only*
+  discovery mechanism, which is the opposite of direct. A tracker-only profile,
+  and the redaction that goes with it, is BT-03 in the roadmap; until then the
+  two settings must not be conflated.
+- **Per run, not sticky.** The job record format is unchanged, so the profile is
+  a property of the invocation: `fetch --discovery direct` followed by a plain
+  `fetch` is a public run. Nothing about a job's identity, selection or capture
+  key depends on which profile fetched it.
+
+### What is verified, and how
+
+| Claim | Evidence |
+|-------|----------|
+| direct opens no UDP socket and binds loopback only | `TestDirectPolicyAdmitsNoUDPAndBindsLoopback`, with a public client as the control (it must show a UDP socket and a non-loopback listener, or the test refuses to conclude anything) |
+| direct never announces to a tracker | `TestDirectMagnetFailsBoundedWithoutContactingTracker`, `TestDirectInspectMagnetDoesNotContactTracker`, `TestDirectFetchAndRepairStayOffTracker` — each counts requests against a live local tracker, and `TestTrackerTripwireIsArmed` proves the tripwire answers an enabled client |
+| direct never fetches from a webseed | `TestDirectFetchNeverUsesWebseed`; `TestWebseedTripwireIsArmed` proves the tripwire serves a real download (60 KB over HTTP ranges) when webseeds are enabled |
+| magnet `x.pe` is not dialled | `TestDirectIgnoresMagnetPeerAddresses` (times out; the same magnet resolves when the peer is passed with `--peer`) |
+| resume cannot reintroduce a tracker | `TestOpenAppliesDiscoveryPolicyToResumeState` (client view and persisted metainfo, both profiles), `TestDirectFetchAndRepairStayOffTracker` (fetch → corrupt → bounded failure → repair) |
+| a bad profile is refused before any work | `TestNewRejectsInvalidDiscoveryBeforeTouchingTheFilesystem`, `TestTorrentFetchRejectsUnknownDiscoveryBeforeWork` |
+
+Not verified at the packet level: DHT, PEX and local-discovery traffic are
+covered by the config mapping plus the runtime absence of the sockets those
+branches need, not by a packet capture. PEX in particular has no wire-level test
+here, because a conforming peer would have to speak `ut_pex` to exercise it; the
+claim rests on the extension not being advertised and inbound messages being
+dropped in the pinned library.
 
 ## Identities: v1, v2 and hybrid
 
@@ -322,8 +413,14 @@ the extent that the paths were validated beforehand.
 - **No secrets in records.** The stored source reference is a magnet carrying
   only the infohash; trackers (which can contain passkeys) and local paths do not
   reach job records, capture items, or terminal output.
+- **Discovery is a policy, not a hint.** `--discovery direct` is applied to the
+  client config before the client exists and to every spec before the library
+  sees it, so no discoverer can be constructed and switched off later, and the
+  resume path is covered by the same code. An unknown profile is refused before
+  the staging root is created. See "Discovery profiles".
 - **No remote surface.** No listener for control, no API, no RPC. The client
-  only speaks the peer protocol.
+  only speaks the peer protocol. In `direct` the peer listener is bound to
+  loopback, so even that surface is local.
 
 ## Pieces, files and selection
 
@@ -638,6 +735,7 @@ OS error test. Removing the fault and retrying publishes exactly one capture.
 | Metadata wait | 2 minutes | fixed default (`Config.MetadataTimeout`) |
 | Peers per torrent | library default (50) | CLI sets 40 (`MaxPeers`) |
 | Metainfo file size | 16 MiB | fixed cap |
+| Discovery profile | `public` | `--discovery public|direct` (per run) |
 
 Disk usage follows the selection plus shared edge pieces; there is no quota
 enforcement yet.
@@ -647,7 +745,10 @@ enforcement yet.
 - Durable multi-job queue, backend resume references, crash-boundary
   reconciliation (`PR 2` in the plan).
 - Seeding policy beyond opt-in `--seed`.
-- Web seeds (disabled), WebTorrent (disabled), v2-only torrents.
+- Web seeds (disabled in both discovery profiles), WebTorrent (disabled).
+- A tracker-only / private-swarm profile (BEP 27) and original-metainfo
+  redaction: `--discovery direct` is the opposite of a tracker-only mode, and
+  the two are not interchangeable.
 - HTTP API, event stream, TUI integration.
 - aria2 RPC, session import/export, `.aria2` checkpoints.
 - Soulseek / slskd.
@@ -655,9 +756,11 @@ enforcement yet.
 
 ## Tests
 
-`internal/transfer/bittorrent` runs a local in-process seeder over loopback with
-DHT, PEX, trackers, webseeds and uTP disabled — CI never contacts a public
-tracker. Covered:
+`internal/transfer/bittorrent` runs a local in-process seeder over loopback, and
+the discovery tests use local tracker and webseed servers, so no test contacts
+anything outside this host — CI never reaches a public tracker or swarm. The
+public-profile controls deliberately leave discovery enabled, but only against
+loopback endpoints. Covered:
 
 | Test | Proves |
 |------|--------|
@@ -686,6 +789,8 @@ tracker. Covered:
 | `inspect_test.go` | local `.torrent` inspected with a client-construction counter stuck at 0; magnet inspection resolves metadata while the seeder reports 0 payload bytes and 0 chunks written; no temp dir survives; inspection leaves an existing staging root byte-identical; rejection before storage open for unknown selection, path collision and symlinked payload path (storage spy count 0), and exactly one open on the admitted path; metadata timeout and cancellation clean up; v2/hybrid refused for inspect and fetch |
 | `ownership_process_test.go` → `TestInspectDoesNotNeedStagingOwnership` | a separate process inspects a magnet while another process owns the staging root, writes nothing there, and does not disturb ownership |
 | `status_process_test.go` (real CLI, real processes) | `torrent status` against a root owned by a seeding process returns promptly with the recorded capture, leaves the tree unchanged, and does not disturb ownership (a competing fetch is still busy); after `SIGKILL` of that owner, status reports the last recorded state as recorded while a lock file still exists, and a later fetch acquires the root and reconciles |
+| `discovery_test.go` | profile parsing and validation; the client-config mapping for both profiles; the spec sanitisation (and that it leaves identity bytes untouched); a direct client opens no UDP socket and binds loopback only, against a public client as control; a live tracker tripwire that announces when trackers are enabled and is never touched in direct mode (fetch, inspect, resume and repair); a webseed tripwire that serves a real ranged download when enabled and is never touched in direct mode; magnet `x.pe` ignored in direct mode; resume state stripped of trackers and webseed URLs in direct mode but not in public; invalid profiles refused before the staging root or a temp client exists |
+| `cmd/provenance` torrent tests | `--discovery` is inherited by `inspect`/`fetch`, an unknown value is rejected naming both valid values, and `fetch` refuses it before creating the staging root |
 | path unit tests | component validation, containment, peer parsing, kind mapping |
 
 ## Follow-ups
@@ -698,3 +803,10 @@ tracker. Covered:
    `torrent status` that reports state without running `fetch`.
 3. Optional per-job bandwidth cap, needed before fetching large public swarms.
 4. Verify behaviour against a real swarm with a private tracker, outside CI.
+5. Private-swarm policy (BEP 27): a tracker-only profile, redaction of the
+   persisted metainfo, and separation of restricted originals from sanitised job
+   metadata. `--discovery direct` is not that profile and must not be presented
+   as one.
+6. Cross-client interoperability (BT-02): this slice proves self-to-self loopback
+   transfers plus a loopback *webseed*; real peer-wire interoperability with
+   Transmission/qBittorrent and padded hybrids is still unproven.

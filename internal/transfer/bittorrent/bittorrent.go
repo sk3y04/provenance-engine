@@ -115,7 +115,9 @@ type Config struct {
 	StagingDir string
 
 	// Peers is an optional list of "host:port" peers to dial directly, in
-	// addition to whatever trackers or DHT find. Private swarms use this.
+	// addition to whatever trackers or DHT find. Private swarms use this. Under
+	// DiscoveryDirect it is the only peer source, and it is used verbatim: the
+	// addresses are the caller's, not the source's.
 	Peers []string
 
 	// MaxSelectedBytes rejects a selection larger than this before any
@@ -138,10 +140,12 @@ type Config struct {
 	// context is cancelled. Off by default: the slice stops at capture.
 	KeepSeeding bool
 
-	// DisablePeerDiscovery disables DHT, PEX, tracker announces and webseeds
-	// and binds the listener to loopback. It exists for hermetic tests and
-	// offline/private swarms; production fetches leave it false.
-	DisablePeerDiscovery bool
+	// Discovery selects which network branches this session may use. The zero
+	// value (and DiscoveryPublic) is the historical behaviour: trackers, DHT,
+	// PEX and the peers in Peers. DiscoveryDirect uses only the peers in Peers;
+	// see that constant for exactly what it closes. An unknown value is
+	// ErrInvalidDiscovery and never falls back to public.
+	Discovery Discovery
 
 	// OnUpdate, when non-nil, receives throttled aggregate progress.
 	OnUpdate func(Update)
@@ -265,6 +269,15 @@ func (s *Session) lockPath() string {
 // anything is read or written: no job record is created, no torrent is added,
 // no swarm connection is attempted.
 func New(cfg Config) (*Session, error) {
+	// The discovery profile is validated before anything else: a bad value must
+	// not create the staging root, take the lock or start a client, and it must
+	// never be replaced by a more permissive profile.
+	mode, err := ParseDiscovery(string(cfg.Discovery))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Discovery = mode
+
 	staging := strings.TrimSpace(cfg.StagingDir)
 	if staging == "" {
 		return nil, errors.New("bittorrent: a staging directory is required")
@@ -371,9 +384,10 @@ func (s *Session) Close() error {
 	return errors.Join(err, s.releaseOwnership())
 }
 
-// newClient builds the library client. Limits are conservative; the library
-// defaults assume a long-lived desktop client, not one short job.
-func newClient(staging string, cfg Config) (*at.Client, error) {
+// clientConfig builds the library client configuration for a session. It is
+// separate from newClient so a test can inspect every switch the discovery
+// profile sets without starting a client (and without opening a socket).
+func clientConfig(staging string, cfg Config) *at.ClientConfig {
 	cc := at.NewDefaultClientConfig()
 	// The library derives <DataDir>/<torrent name>/<path> for file storage,
 	// so the staging root is the client's data directory. That also keeps the
@@ -399,15 +413,15 @@ func newClient(staging string, cfg Config) (*at.Client, error) {
 		cc.TorrentPeersHighWater = cfg.MaxPeers * 4
 		cc.TorrentPeersLowWater = max(cfg.MaxPeers, 1)
 	}
-	if cfg.DisablePeerDiscovery {
-		cc.NoDHT = true
-		cc.DisableTrackers = true
-		cc.DisablePEX = true
-		cc.DisableUTP = true
-		cc.DisableIPv6 = true
-		cc.ListenHost = func(string) string { return "127.0.0.1" }
-	}
-	return at.NewClient(cc)
+	// Last, so a profile cannot be undone by a later default.
+	applyClientDiscovery(cc, cfg.Discovery)
+	return cc
+}
+
+// newClient builds the library client. Limits are conservative; the library
+// defaults assume a long-lived desktop client, not one short job.
+func newClient(staging string, cfg Config) (*at.Client, error) {
+	return at.NewClient(clientConfig(staging, cfg))
 }
 
 // parsePeers validates explicit peer addresses.
@@ -524,12 +538,31 @@ func applyAdmissionOpts(spec *at.TorrentSpec) {
 	spec.DisallowDataUpload = true
 }
 
+// admitSpec applies admission and discovery policy to a spec before the library
+// sees it. It is the single place a torrent enters this session, so a spec that
+// carries trackers, webseeds, metainfo sources, DHT hints or magnet-supplied
+// peer addresses cannot skip the policy — including on resume, where the spec
+// is rebuilt from the persisted metainfo.
+func (s *Session) admitSpec(spec *at.TorrentSpec) {
+	applyAdmissionOpts(spec)
+	applySpecDiscovery(spec, s.cfg.Discovery)
+}
+
 // checkVerifiable refuses a torrent whose pieces can never be verified with the
 // data on hand. BitTorrent v2 piece hashes live in the .torrent's top-level
-// "piece layers" table; BEP 52 defines no way to transfer them over the wire, so
-// a v2-only torrent resolved from a btmh magnet arrives with metadata but no
-// piece hashes at all. A hybrid is fine: its info dictionary carries v1 piece
-// hashes, which the library prefers for verification.
+// "piece layers" table, and BEP 9 metadata exchange transfers only the info
+// dictionary, so a v2-only torrent resolved from a btmh magnet arrives with
+// metadata but no piece hashes at all.
+//
+// BEP 52 does define peer-wire hash request/hashes, and the pinned library
+// implements it — but only while a download is running (fillWriteBuffer), which
+// is after this admission gate and after payload storage would have to open.
+// Admission stays ordered: verify up front or refuse. Widening this to allow a
+// v2-only magnet is a separate decision with its own conditions (see
+// docs/findings-v2-magnet.md), not a matter of removing this check.
+//
+// A hybrid is fine: its info dictionary carries v1 piece hashes, which the
+// library prefers for verification.
 func (s *Session) checkVerifiable(id Identity, mi metainfo.MetaInfo) error {
 	if !id.HasV2 || id.HasV1 {
 		return nil
@@ -905,7 +938,7 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 		// restart independent of metadata availability, and it means a resume
 		// needs no peer at all to start verifying.
 		spec := at.TorrentSpecFromMetaInfo(persisted)
-		applyAdmissionOpts(spec)
+		s.admitSpec(spec)
 		t, _, err = s.client.AddTorrentSpec(spec)
 		if err != nil {
 			return nil, fmt.Errorf("add persisted torrent: %w", err)
@@ -917,7 +950,7 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 			if serr != nil {
 				return nil, errors.New("add magnet: " + sanitizeSourceText(serr.Error(), src.magnet))
 			}
-			applyAdmissionOpts(spec)
+			s.admitSpec(spec)
 			t, _, err = s.client.AddTorrentSpec(spec)
 			if err != nil {
 				return nil, errors.New("add magnet: " + sanitizeSourceText(err.Error(), src.magnet))
@@ -939,7 +972,7 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 				return nil, verr
 			}
 			spec := at.TorrentSpecFromMetaInfo(mi)
-			applyAdmissionOpts(spec)
+			s.admitSpec(spec)
 			t, _, err = s.client.AddTorrentSpec(spec)
 			if err != nil {
 				return nil, fmt.Errorf("add torrent: %w", err)

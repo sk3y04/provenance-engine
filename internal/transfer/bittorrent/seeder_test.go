@@ -143,11 +143,11 @@ func (s *seeder) torrentFile(t *testing.T) string {
 func testConfig(t *testing.T, staging string, peers ...string) Config {
 	t.Helper()
 	return Config{
-		StagingDir:           staging,
-		Peers:                peers,
-		DisablePeerDiscovery: true,
-		MetadataTimeout:      20 * time.Second,
-		MaxPeers:             4,
+		StagingDir:      staging,
+		Peers:           peers,
+		Discovery:       DiscoveryDirect,
+		MetadataTimeout: 20 * time.Second,
+		MaxPeers:        4,
 	}
 }
 
@@ -282,9 +282,9 @@ func inspectForTest(t *testing.T, src string, peers ...string) (Info, error) {
 	ctx, cancel := waitCtx(t)
 	defer cancel()
 	return Inspect(ctx, src, InspectConfig{
-		Peers:                peers,
-		DisablePeerDiscovery: true,
-		MetadataTimeout:      30 * time.Second,
+		Peers:           peers,
+		Discovery:       DiscoveryDirect,
+		MetadataTimeout: 30 * time.Second,
 	})
 }
 

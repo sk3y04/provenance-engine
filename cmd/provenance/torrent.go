@@ -16,13 +16,14 @@ import (
 )
 
 var (
-	flagTorrentOut      string
-	flagTorrentSelect   []string
-	flagTorrentPeer     []string
-	flagTorrentMaxBytes string
-	flagTorrentTimeout  time.Duration
-	flagTorrentJSON     bool
-	flagTorrentSeed     bool
+	flagTorrentOut       string
+	flagTorrentSelect    []string
+	flagTorrentPeer      []string
+	flagTorrentMaxBytes  string
+	flagTorrentTimeout   time.Duration
+	flagTorrentJSON      bool
+	flagTorrentSeed      bool
+	flagTorrentDiscovery string
 )
 
 func torrentCmd() *cobra.Command {
@@ -43,12 +44,16 @@ against the torrent's piece hashes before a capture manifest is written to
 work on the result unchanged.
 
 Peers are found with trackers and DHT, or passed explicitly with --peer for a
-private swarm. The client does not seed after completion unless --seed is set,
-and it is never exposed to a remote endpoint. Only grab content you are
-authorized to download.`,
+private swarm. --discovery direct uses ONLY the peers given with --peer: no
+trackers, no DHT, no PEX, no webseeds, no local discovery, no port mapping and
+no inbound connections from outside this host. An unknown profile is an error,
+never a fallback to public. The client does not seed after completion unless
+--seed is set, and it is never exposed to a remote endpoint. Only grab content
+you are authorized to download.`,
 	}
 	cmd.PersistentFlags().StringVarP(&flagTorrentOut, "output", "o", "./downloads", "Staging directory for fetch and status (inspect does not use it)")
 	cmd.PersistentFlags().StringArrayVar(&flagTorrentPeer, "peer", nil, "Explicit peer address host:port (repeatable, for private swarms)")
+	cmd.PersistentFlags().StringVar(&flagTorrentDiscovery, "discovery", "public", "Peer discovery profile: public (trackers, DHT, PEX) or direct (explicit --peer only)")
 	cmd.PersistentFlags().StringVar(&flagTorrentMaxBytes, "max-bytes", "", "Reject a selection larger than this, e.g. 4GB")
 	cmd.PersistentFlags().DurationVar(&flagTorrentTimeout, "timeout", 0, "Overall transfer deadline, e.g. 30m (default: no limit)")
 	cmd.PersistentFlags().BoolVar(&flagTorrentSeed, "seed", false, "Keep seeding the completed torrent until interrupted")
@@ -113,17 +118,23 @@ owns the root.`,
 	return cmd
 }
 
-// torrentConfig maps the CLI flags onto the adapter configuration.
-func torrentConfig(maxBytes int64, onUpdate func(bittorrent.Update)) bittorrent.Config {
+// torrentConfig maps the CLI flags onto the adapter configuration. An unknown
+// --discovery value is returned as an error and never replaced by the default.
+func torrentConfig(maxBytes int64, onUpdate func(bittorrent.Update)) (bittorrent.Config, error) {
+	mode, err := bittorrent.ParseDiscovery(flagTorrentDiscovery)
+	if err != nil {
+		return bittorrent.Config{}, fmt.Errorf("--discovery: %w", err)
+	}
 	return bittorrent.Config{
 		StagingDir:       flagTorrentOut,
 		Peers:            flagTorrentPeer,
+		Discovery:        mode,
 		MaxSelectedBytes: maxBytes,
 		MaxPeers:         40,
 		Timeout:          flagTorrentTimeout,
 		KeepSeeding:      flagTorrentSeed,
 		OnUpdate:         onUpdate,
-	}
+	}, nil
 }
 
 func parseMaxBytes() (int64, error) {
@@ -139,8 +150,13 @@ func runTorrentInspect(ctx context.Context, source string, stdout io.Writer) err
 	// the staging root, and opens no payload storage, so -o is not used here.
 	// A local .torrent is parsed in memory; a magnet gets a temporary client
 	// that is closed before this returns.
+	mode, err := bittorrent.ParseDiscovery(flagTorrentDiscovery)
+	if err != nil {
+		return fmt.Errorf("--discovery: %w", err)
+	}
 	info, err := bittorrent.Inspect(ctx, source, bittorrent.InspectConfig{
 		Peers:           flagTorrentPeer,
+		Discovery:       mode,
 		MetadataTimeout: flagTorrentTimeout,
 	})
 	if err != nil {
@@ -174,13 +190,17 @@ func runTorrentFetch(ctx context.Context, source string) error {
 		return err
 	}
 	progress := &torrentProgress{}
-	sess, err := bittorrent.New(torrentConfig(maxBytes, progress.report))
+	cfg, err := torrentConfig(maxBytes, progress.report)
+	if err != nil {
+		return err
+	}
+	sess, err := bittorrent.New(cfg)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = sess.Close() }()
 
-	_, _ = fmt.Fprintf(os.Stderr, "[provenance] fetching %s\n", redactSource(source))
+	_, _ = fmt.Fprintf(os.Stderr, "[provenance] fetching %s (discovery %s)\n", redactSource(source), cfg.Discovery)
 	cap, err := sess.Fetch(ctx, source, selection)
 	if err != nil {
 		return err
