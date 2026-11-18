@@ -103,6 +103,12 @@ func (s *PgStore) InsertRevision(ctx context.Context, rev *archive.Revision, col
 		return fmt.Errorf("insert revision: %w", err)
 	}
 
+	seenDocs := make(map[[2]string]bool)
+	seenRels := make(map[[3]string]bool)
+	for _, rel := range rev.Relations {
+		seenRels[[3]string{rel.From, rel.To, string(rel.Kind)}] = true
+	}
+
 	for _, ent := range rev.Entities {
 		pubAt := interface{}(nil)
 		if ent.PublishedAt != nil {
@@ -129,6 +135,53 @@ func (s *PgStore) InsertRevision(ctx context.Context, rev *archive.Revision, col
 			if err != nil {
 				return fmt.Errorf("insert document: %w", err)
 			}
+			seenDocs[[2]string{ent.ExternalID, ent.Text.Content}] = true
+		}
+
+		// Importers attach documents and relations per entity; persist them
+		// too, deduplicated against the entity text and revision relations.
+		for _, doc := range ent.Documents {
+			key := [2]string{doc.ExternalID, doc.Content}
+			if doc.Content == "" || seenDocs[key] {
+				continue
+			}
+			seenDocs[key] = true
+			_, err = tx.Exec(ctx,
+				`INSERT INTO documents (revision_id, entity_external_id, content, format)
+				 VALUES ($1, $2, $3, $4)`,
+				rev.ID, doc.ExternalID, doc.Content, string(doc.Format))
+			if err != nil {
+				return fmt.Errorf("insert document: %w", err)
+			}
+		}
+		for _, rel := range ent.Relations {
+			key := [3]string{rel.From, rel.To, string(rel.Kind)}
+			if seenRels[key] {
+				continue
+			}
+			seenRels[key] = true
+			_, err = tx.Exec(ctx,
+				`INSERT INTO relations (revision_id, from_id, to_id, kind)
+				 VALUES ($1, $2, $3, $4)`,
+				rev.ID, rel.From, rel.To, string(rel.Kind))
+			if err != nil {
+				return fmt.Errorf("insert relation: %w", err)
+			}
+		}
+	}
+
+	for _, doc := range rev.Documents {
+		key := [2]string{doc.ExternalID, doc.Content}
+		if doc.Content == "" || seenDocs[key] {
+			continue
+		}
+		seenDocs[key] = true
+		_, err = tx.Exec(ctx,
+			`INSERT INTO documents (revision_id, entity_external_id, content, format)
+			 VALUES ($1, $2, $3, $4)`,
+			rev.ID, doc.ExternalID, doc.Content, string(doc.Format))
+		if err != nil {
+			return fmt.Errorf("insert document: %w", err)
 		}
 	}
 
@@ -172,7 +225,7 @@ func (s *PgStore) GetRevision(ctx context.Context, id string) (*archive.Revision
 		`SELECT external_id, url, COALESCE(canonical_url, ''), COALESCE(title, ''), COALESCE(author, ''),
 		        published_at, captured_at, COALESCE(kind, ''), COALESCE(extractor, ''),
 		        raw_metadata
-		 FROM entities WHERE revision_id=$1 ORDER BY captured_at`, id)
+		 FROM entities WHERE revision_id=$1 ORDER BY captured_at, external_id`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -195,18 +248,71 @@ func (s *PgStore) GetRevision(ctx context.Context, id string) (*archive.Revision
 
 	artRows, err := s.pool.Query(ctx,
 		`SELECT sha256, path, size, COALESCE(mime_type, ''), kind
-		 FROM artifacts WHERE revision_id=$1`, id)
-	if err == nil {
-		defer artRows.Close()
-		for artRows.Next() {
-			var art archive.Artifact
-			var kind string
-			if err := artRows.Scan(&art.Sha256, &art.Path, &art.Size, &art.MimeType, &kind); err != nil {
-				continue
-			}
-			art.Kind = archive.ArtifactKind(kind)
-			rev.Artifacts = append(rev.Artifacts, art)
+		 FROM artifacts WHERE revision_id=$1 ORDER BY sha256`, id)
+	if err != nil {
+		return nil, fmt.Errorf("query artifacts: %w", err)
+	}
+	defer artRows.Close()
+	for artRows.Next() {
+		var art archive.Artifact
+		var kind string
+		if err := artRows.Scan(&art.Sha256, &art.Path, &art.Size, &art.MimeType, &kind); err != nil {
+			return nil, fmt.Errorf("scan artifact: %w", err)
 		}
+		art.Kind = archive.ArtifactKind(kind)
+		rev.Artifacts = append(rev.Artifacts, art)
+	}
+	if err := artRows.Err(); err != nil {
+		return nil, fmt.Errorf("artifact rows: %w", err)
+	}
+
+	docRows, err := s.pool.Query(ctx,
+		`SELECT entity_external_id, content, format
+		 FROM documents WHERE revision_id=$1 ORDER BY entity_external_id, id`, id)
+	if err != nil {
+		return nil, fmt.Errorf("query documents: %w", err)
+	}
+	defer docRows.Close()
+	for docRows.Next() {
+		var doc archive.Document
+		var format string
+		if err := docRows.Scan(&doc.ExternalID, &doc.Content, &format); err != nil {
+			return nil, fmt.Errorf("scan document: %w", err)
+		}
+		doc.Format = archive.DocumentFormat(format)
+		rev.Documents = append(rev.Documents, doc)
+	}
+	if err := docRows.Err(); err != nil {
+		return nil, fmt.Errorf("document rows: %w", err)
+	}
+	// Re-attach the entity text the capture flow stores per entity.
+	for i := range rev.Entities {
+		for _, doc := range rev.Documents {
+			if doc.ExternalID == rev.Entities[i].ExternalID {
+				d := doc
+				rev.Entities[i].Text = &d
+				break
+			}
+		}
+	}
+
+	relRows, err := s.pool.Query(ctx,
+		`SELECT from_id, to_id, kind FROM relations WHERE revision_id=$1 ORDER BY id`, id)
+	if err != nil {
+		return nil, fmt.Errorf("query relations: %w", err)
+	}
+	defer relRows.Close()
+	for relRows.Next() {
+		var rel archive.Relation
+		var kind string
+		if err := relRows.Scan(&rel.From, &rel.To, &kind); err != nil {
+			return nil, fmt.Errorf("scan relation: %w", err)
+		}
+		rel.Kind = archive.RelationKind(kind)
+		rev.Relations = append(rev.Relations, rel)
+	}
+	if err := relRows.Err(); err != nil {
+		return nil, fmt.Errorf("relation rows: %w", err)
 	}
 
 	return rev, nil
