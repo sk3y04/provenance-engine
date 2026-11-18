@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 	"github.com/sk3y04/provenance-engine/internal/blobstore"
 	"github.com/sk3y04/provenance-engine/internal/manifest"
 	"github.com/sk3y04/provenance-engine/internal/version"
@@ -221,11 +222,10 @@ func writeJSON(path string, v interface{}) error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := atomicfile.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
-	return os.Rename(tmp, path)
+	return nil
 }
 
 func writeJSONLines(path string, items interface{}) error {
@@ -242,11 +242,10 @@ func writeJSONLines(path string, items interface{}) error {
 		lines = append(lines, string(item))
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+	if err := atomicfile.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
 		return fmt.Errorf("write jsonl: %w", err)
 	}
-	return os.Rename(tmp, path)
+	return nil
 }
 
 // IngestFromOutput archives an output directory's captured manifests into the vault.

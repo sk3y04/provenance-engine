@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 	"github.com/sk3y04/provenance-engine/internal/config"
 )
 
@@ -225,18 +226,14 @@ func save(s Store) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir collections: %w", err)
-	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal collections: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := atomicfile.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write collections: %w", err)
 	}
-	return os.Rename(tmp, path)
+	return nil
 }
 
 func validName(name string) error {

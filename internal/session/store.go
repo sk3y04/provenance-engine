@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 	"github.com/sk3y04/provenance-engine/internal/config"
 )
 
@@ -410,18 +411,11 @@ func (s *Session) saveLocked() error {
 	} else {
 		s.Version++
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	return atomicfile.WriteFile(s.path, data, 0o600)
 }
 
 func pathFor(name string) (string, error) {

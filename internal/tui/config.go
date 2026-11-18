@@ -8,6 +8,8 @@ import (
 	"sync"
 
 	"github.com/charmbracelet/bubbles/textinput"
+
+	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 )
 
 // ---------------------------------------------------------------------------
@@ -110,18 +112,8 @@ func (cs *configStore) saveLocked() {
 	if err != nil {
 		return
 	}
-	dir := filepath.Dir(cs.path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
-	// Write to a temp file then rename for atomicity.
-	tmp := cs.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, cs.path); err != nil {
-		_ = os.Remove(tmp)
-	}
+	// Unique temp file + rename: concurrent writers never share a temp path.
+	_ = atomicfile.WriteFile(cs.path, data, 0o600)
 }
 
 // mergeConfig copies non-empty fields from src into dst.

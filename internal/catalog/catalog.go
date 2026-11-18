@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/sk3y04/provenance-engine/internal/archive"
+	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 )
 
 var mu sync.Mutex
@@ -38,18 +39,14 @@ func SaveCollections(vaultRoot string, cols []archive.ArchiveCollection) error {
 	defer mu.Unlock()
 
 	path := filepath.Join(vaultRoot, "collections.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
-	}
 	data, err := json.MarshalIndent(cols, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := atomicfile.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
-	return os.Rename(tmp, path)
+	return nil
 }
 
 func UpsertCollection(vaultRoot string, col archive.ArchiveCollection) error {
@@ -122,16 +119,12 @@ func loadLocked(vaultRoot string) ([]archive.ArchiveCollection, error) {
 
 func saveLocked(vaultRoot string, cols []archive.ArchiveCollection) error {
 	path := filepath.Join(vaultRoot, "collections.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
-	}
 	data, err := json.MarshalIndent(cols, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := atomicfile.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
-	return os.Rename(tmp, path)
+	return nil
 }
