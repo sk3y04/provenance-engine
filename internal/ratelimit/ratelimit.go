@@ -2,6 +2,7 @@
 package ratelimit
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -100,14 +101,11 @@ func (m *Manager) evictLocked() {
 	for h, e := range m.limiters {
 		list = append(list, kv{host: h, at: e.lastUsed})
 	}
-	// Sort oldest-first so we drop the most stale entries.
-	for i := 0; i < len(list)-1; i++ {
-		for j := i + 1; j < len(list); j++ {
-			if list[j].at.Before(list[i].at) {
-				list[i], list[j] = list[j], list[i]
-			}
-		}
-	}
+	// Sort oldest-first so we drop the most stale entries. sort.Slice keeps
+	// this O(n log n): an O(n^2) sort here runs under mu on every new host
+	// once the cache is at capacity, stalling all concurrent GetLimiter
+	// callers for tens of milliseconds.
+	sort.Slice(list, func(i, j int) bool { return list[i].at.Before(list[j].at) })
 	toDrop := len(m.limiters) - maxLimiters
 	for i := 0; i < toDrop; i++ {
 		delete(m.limiters, list[i].host)
