@@ -1094,13 +1094,27 @@ func validatedFiles(t *at.Torrent, info *metainfo.Info, name string) ([]validate
 	if len(files) != len(rels) {
 		return nil, nil, fmt.Errorf("torrent file count mismatch: %d handles, %d metainfo files", len(files), len(rels))
 	}
+	// BEP 47 padding entries are part of the layout (the client zero-fills them
+	// and they keep pieces aligned) but they are not user files: they are not
+	// listed, cannot be selected, and are never captured. The attribute, not the
+	// name, is what makes an entry padding.
+	entries := info.UpvertedFiles()
 	byPath := make(map[string]*at.File, len(files))
 	out := make([]validatedFile, 0, len(files))
 	for i, rel := range rels {
+		if i < len(entries) && isPaddingFile(entries[i]) {
+			continue
+		}
 		byPath[rel] = files[i]
 		out = append(out, validatedFile{rel: rel, file: files[i]})
 	}
 	return out, byPath, nil
+}
+
+// isPaddingFile reports whether a metainfo entry is a BEP 47 padding entry. The
+// "attr" field is a set of characters; "p" marks padding.
+func isPaddingFile(fi metainfo.FileInfo) bool {
+	return strings.ContainsRune(fi.Attr, 'p')
 }
 
 // resolveSelection maps requested paths onto torrent files. Selection is exact

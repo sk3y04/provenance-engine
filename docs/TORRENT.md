@@ -167,9 +167,14 @@ by a btmh-only magnet lands in its canonical `bt-<v1>` job instead of creating a
 `bt2-` record that would later have to be renamed. A record is enriched with the
 v2 identity that metadata revealed; a recorded hash is never replaced.
 
-Piece layers: BEP 52 distributes them only in the `.torrent` file, and the
-pinned library never obtains them over the wire (`setInfoBytesLocked(…, nil)` on
-the metadata path). A magnet-originated hybrid therefore has **no** piece layers,
+Piece layers: BEP 9 metadata exchange transfers the `info` dictionary only, so a
+magnet-resolved torrent arrives without the top-level `piece layers` table. BEP 52
+does define peer-wire `hash request` / `hashes` / `hash reject` messages for
+piece-layer retrieval, but the pinned library does not implement a client for
+them on this path (`setInfoBytesLocked(…, nil)`). The limitation is therefore in
+the current integration, not in the protocol: Provenance does not obtain the v2
+piece hashes it would need for a v2-only magnet fetch, and that case stays
+inspection-only until proven otherwise. A magnet-originated hybrid therefore has **no** piece layers,
 which is fine because its info dictionary carries v1 piece hashes and the library
 prefers those for verification (`Piece.Storage` takes `v1HashBytes` first). A
 v2-only magnet has no v1 fallback, so `Fetch` fails with
@@ -177,6 +182,22 @@ v2-only magnet has no v1 fallback, so `Fetch` fails with
 .torrent file") before any job record or payload storage is created.
 Inspection still works for it: identity and file list come from the metadata and
 nothing is implied about readiness.
+
+BEP 47 padding entries (`attr` containing `p`) are layout, not content: they are
+excluded from the file listing and cannot be selected or captured, while the
+underlying piece layout still includes them. `isPaddingFile` keys on the
+attribute, never on a `_padding/`-style name.
+
+Independent metainfo interoperability is covered by
+`testdata/hybrid-torrenttools.torrent`, generated with torrenttools v0.6.2 (see
+`testdata/RECIPE.md`). It confirms identities, structure and offline inspection
+against a foreign encoder. It also documents a real limit: torrenttools emits a
+hybrid whose v1 `pieces` cover the continuous layout with no padding entries,
+and the pinned library lays files out piece-aligned for any v2 torrent, so its
+own verification rejects that fixture. That is a generator/interoperability
+limitation, not an adapter path; fetch-level independent interoperability and
+padded hybrids remain unproven until a generator emits pad-aligned hybrid
+metainfo.
 
 A contradictory dual-identity magnet is never accepted. Both hashes are checked
 against the metadata; the library rejects metadata that fails either, so the

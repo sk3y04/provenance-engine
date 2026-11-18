@@ -234,6 +234,13 @@ func infoFromMetainfo(src source, info *metainfo.Info, rels []string) Info {
 		if i >= len(rels) {
 			break
 		}
+		if isPaddingFile(fi) {
+			// BEP 47 padding is layout, not content: it keeps pieces aligned and
+			// is zero-filled locally. Offering it as a file would invite a
+			// selection of bytes that are never fetched.
+			offset += fi.Length
+			continue
+		}
 		list.Files = append(list.Files, File{Path: rels[i], Length: fi.Length, Offset: offset})
 		offset += fi.Length
 		if info.FilesArePieceAligned() && info.PieceLength > 0 {

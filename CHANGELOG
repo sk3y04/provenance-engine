@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the missing-layer guard remains for v2-only torrents. Synthetic identities that
   collide on the library's 20-byte storage key are refused by the conflict check.
 
+### Added
+
+- **BEP 47 padding entries are not user files**: entries whose `attr` contains
+  `p` are excluded from `torrent inspect` output and cannot be selected or
+  captured; the piece layout still accounts for them. An independently generated
+  hybrid fixture (torrenttools v0.6.2, recipe committed in `testdata/`) covers
+  identity and offline inspection against a foreign encoder. The same test
+  documents a limitation rather than hiding it: the generator emits a hybrid
+  whose v1 pieces are not pad-aligned and which the pinned library then rejects
+  at verification, so padded-hybrid fetch and fetch-level independent
+  interoperability remain unproven. The earlier claim that "BEP 52 has no wire
+  transfer for piece layers" was too broad and is corrected in
+  `docs/TORRENT.md`: BEP 9 metadata exchange carries only the info dictionary,
+  while BEP 52 defines `hash request`/`hashes` messages that this integration
+  does not implement.
+
 ### Fixed
 
 - **A failed piece write is now a diagnosable error, not a silent stall**: the
