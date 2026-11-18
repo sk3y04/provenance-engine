@@ -167,15 +167,18 @@ func Classify(rawURL string) (Site, error) {
 	if err != nil {
 		return SiteUnknown, fmt.Errorf("parse url: %w", err)
 	}
-	host := strings.ToLower(u.Host)
+	// Exact host or subdomain only: substring matching would route lookalike
+	// hosts (instagram.com.example.net) to a native extractor that resolves a
+	// different resource than the URL names.
+	host := strings.ToLower(u.Hostname())
 	switch {
-	case strings.Contains(host, "patreon"):
+	case extractor.HostMatchesDomain(host, "patreon.com"):
 		return SitePatreon, nil
-	case strings.Contains(host, "x.com") || strings.Contains(host, "twitter"):
+	case extractor.HostMatchesDomain(host, "x.com") || extractor.HostMatchesDomain(host, "twitter.com"):
 		return SiteTwitter, nil
-	case strings.Contains(host, "reddit"):
+	case extractor.HostMatchesDomain(host, "reddit.com"):
 		return SiteReddit, nil
-	case strings.Contains(host, "instagram"):
+	case extractor.HostMatchesDomain(host, "instagram.com"):
 		return SiteInstagram, nil
 	case extractor.IsAlbumURL(rawURL):
 		return SiteAlbum, nil

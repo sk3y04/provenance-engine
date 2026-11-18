@@ -161,6 +161,9 @@ func ParseRdURL(rawURL string) (RdTarget, error) {
 	if err != nil {
 		return RdTarget{}, fmt.Errorf("parse url: %w", err)
 	}
+	if !HostMatchesDomain(u.Hostname(), "reddit.com") {
+		return RdTarget{}, fmt.Errorf("not a reddit url: %s", rawURL)
+	}
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 	for i, p := range parts {
 		if i+1 < len(parts) {

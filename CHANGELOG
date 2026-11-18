@@ -164,6 +164,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Extractor routing uses exact domains, not substrings**: `dispatcher.Classify`
+  and the platform URL parsers matched hosts with `strings.Contains`, so
+  lookalikes (`instagram.com.evil.net`, `notx.com`, `x.com.evil.net`,
+  `bunkr.cr.evil.net`) were routed to native extractors. Those extractors then
+  resolved a *different real resource* than the URL named instead of letting
+  yt-dlp handle the actual host. Routing and `ParseIgURL`/`ParseTwSource`/
+  `ParseRdURL`/album host tables now require the exact domain or a subdomain
+  (ports and trailing dots normalized).
+- **Instagram shortcode overflow**: `igShortcodeToID` silently overflowed
+  int64 for codes longer than 11 characters (and had a nonsensical >28-char
+  truncation that decoded the wrong prefix). Overlong/invalid codes now return
+  0, so the caller falls back to the server-rendered post page instead of
+  requesting an unrelated post id.
 - **Citation references round-trip**: `citation.Parse` split at the last `@`,
   so entity ids containing `@` (for example `medium.com/@user/...` URLs) failed
   to parse. It now splits at the first `@` and first `#`, rejects empty

@@ -115,8 +115,8 @@ func ParseTwSource(raw string) (TwSource, error) {
 	if err != nil {
 		return TwSource{}, fmt.Errorf("parse twitter source %q: %w", raw, err)
 	}
-	host := strings.ToLower(u.Host)
-	if !strings.Contains(host, "x.com") && !strings.Contains(host, "twitter") {
+	host := strings.ToLower(u.Hostname())
+	if !HostMatchesDomain(host, "x.com") && !HostMatchesDomain(host, "twitter.com") {
 		return TwSource{}, fmt.Errorf("not a twitter/x source: %s", raw)
 	}
 

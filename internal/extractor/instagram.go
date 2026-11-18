@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -94,14 +95,16 @@ func igAppIDFromEnv() string {
 }
 
 func igShortcodeToID(shortcode string) int64 {
-	s := shortcode
-	if len(s) > 28 {
-		s = s[:len(s)-28]
-	}
 	var id int64
-	for _, c := range s {
+	for _, c := range shortcode {
 		idx := strings.IndexRune(igEncodingChars, c)
 		if idx < 0 {
+			return 0
+		}
+		// Media ids are signed 64-bit values; a code whose value would
+		// overflow cannot name a real post. Returning 0 marks it invalid so
+		// the caller falls back to the server-rendered post page.
+		if id > (math.MaxInt64-int64(idx))/64 {
 			return 0
 		}
 		id = id*64 + int64(idx)
@@ -136,8 +139,8 @@ func ParseIgURL(rawURL string) (IgTarget, error) {
 	if err != nil {
 		return IgTarget{}, fmt.Errorf("parse url: %w", err)
 	}
-	host := strings.ToLower(u.Host)
-	if !strings.Contains(host, "instagram") {
+	host := strings.ToLower(u.Hostname())
+	if !HostMatchesDomain(host, "instagram.com") {
 		return IgTarget{}, fmt.Errorf("not an instagram url: %s", rawURL)
 	}
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")

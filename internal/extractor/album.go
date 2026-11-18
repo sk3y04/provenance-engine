@@ -184,7 +184,7 @@ func albURLKind(rawURL string) string {
 	}
 	host := strings.ToLower(strings.TrimSuffix(u.Host, "."))
 	switch {
-	case hostContainsAny(host, albIndexHosts):
+	case hostMatchesAny(host, albIndexHosts):
 		return "index"
 	case albHostIsAlbum(host):
 		p := strings.ToLower(u.Path)
@@ -207,10 +207,12 @@ func IsAlbumURL(rawURL string) bool {
 
 var albFilePrefixRe = regexp.MustCompile(`(^|/)(f|v|i|d)/`)
 
-// hostContainsAny reports whether host contains any entry of list.
-func hostContainsAny(host string, list []string) bool {
+// hostMatchesAny reports whether host is exactly one of list or a subdomain of
+// one of them. Exact/domain matching (not substring) keeps lookalike hosts such
+// as "bunkr.cr.example.net" away from the album extractor.
+func hostMatchesAny(host string, list []string) bool {
 	for _, d := range list {
-		if strings.Contains(host, d) {
+		if HostMatchesDomain(host, d) {
 			return true
 		}
 	}
