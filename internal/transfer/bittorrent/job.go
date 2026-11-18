@@ -1,41 +1,120 @@
 package bittorrent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/anacrolix/torrent/metainfo"
 
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
+	"github.com/sk3y04/provenance-engine/internal/manifest"
 )
 
-// JobFormatVersion identifies the on-disk job record. It is staging state, not
-// archive state: the vault schema is untouched.
-const JobFormatVersion = "provenance/torrent-job+1"
+const (
+	// JobFormatVersion identifies the current on-disk job record. It is
+	// staging state, not archive state: the vault schema is untouched.
+	JobFormatVersion = "provenance/torrent-job+2"
 
-// torrentStateDir holds the adapter's own working files inside staging:
-// metainfo, the job record, and (through the library) the piece-completion
-// database. Captures reference only downloaded files, never these.
-const torrentStateDir = ".provenance/torrent"
+	// jobFormatV1 is the previous record version. It is still readable so a job
+	// started by an older build resumes instead of starting over; it is
+	// rewritten as v2 on the next touch.
+	jobFormatV1 = "provenance/torrent-job+1"
 
-// jobRecord is the durable description of one torrent job. It is deliberately
-// tiny: backend, identity, the immutable selection, and a staging reference.
-// It carries no tracker URLs, passkeys, or peer addresses.
+	// torrentStateDir holds the adapter's own working files inside the job
+	// root: metainfo, the job record and (through the library) the piece
+	// checkpoints and part files.
+	torrentStateDir = ".provenance/torrent"
+)
+
+// JobState models the three things a torrent job can be doing, separately.
+//
+// They are independent on purpose: files can be verified and ready while the
+// capture is still pending (a capture failure leaves the payload reusable), and
+// a capture can be committed while the client keeps seeding. Collapsing them
+// into one status is what makes crash recovery guess.
+type JobState struct {
+	// Payload is PayloadPending until every selected file is hash-verified
+	// complete, then PayloadReady.
+	Payload string `json:"payload"`
+	// Capture is CapturePending until a capture manifest is committed, then
+	// CaptureCommitted.
+	Capture string `json:"capture"`
+	// Seeding is SeedingStopped unless the job is opted into seeding after
+	// capture (Config.KeepSeeding), when it is SeedingActive.
+	Seeding string `json:"seeding"`
+}
+
+// Job state values.
+const (
+	PayloadPending   = "pending"
+	PayloadReady     = "ready"
+	CapturePending   = "pending"
+	CaptureCommitted = "committed"
+	SeedingStopped   = "stopped"
+	SeedingActive    = "seeding"
+)
+
+// resumeRef records how to reopen backend resume state. The backend owns piece
+// checkpoints (.torrent.db) and part files; this adapter deliberately does not
+// keep a second copy of that information, only the pointers to it.
+type resumeRef struct {
+	// MetainfoPath is the exact saved metainfo, relative to the job root.
+	MetainfoPath string `json:"metainfo_path"`
+	// DataDir is where the backend keeps payload and checkpoints, relative to
+	// the job root. "." means the job root itself.
+	DataDir string `json:"data_dir"`
+	// PartFiles records that resume relies on the backend's part-file scheme
+	// (data lands in <name>.part and is renamed on completion).
+	PartFiles bool `json:"part_files"`
+}
+
+// payloadRecord is what verification produced: the selected, complete files
+// with their Provenance-owned SHA-256 digests. The infohash lives on the job,
+// never mixed into the artifact digest.
+type payloadRecord struct {
+	VerifiedAt time.Time `json:"verified_at"`
+	Assets     []Asset   `json:"assets"`
+}
+
+// captureRecord is the committed capture. Key is the idempotency key, not a
+// timestamp: the same job and the same staged bytes always produce the same
+// key, so a restart can find the existing capture.
+type captureRecord struct {
+	Key         string    `json:"key"`
+	Manifest    string    `json:"manifest"`
+	CommittedAt time.Time `json:"committed_at"`
+	// Reconciled marks a capture that was adopted from an existing manifest
+	// rather than written by the run that recorded it.
+	Reconciled bool `json:"reconciled,omitempty"`
+}
+
+// jobRecord is the durable description of one torrent job.
+//
+// It holds identity, the immutable selection, pointers into backend resume
+// state and the three independently-tracked states above. It carries no
+// tracker URLs, passkeys, peer addresses, or absolute local paths.
 type jobRecord struct {
-	Format     string    `json:"format"`
-	JobID      string    `json:"job_id"`
-	Backend    string    `json:"backend"`
-	InfoHash   string    `json:"info_hash"`
-	Source     string    `json:"source"`
-	StagingRef string    `json:"staging_ref"`
-	Selection  []string  `json:"selection"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	Format     string         `json:"format"`
+	JobID      string         `json:"job_id"`
+	Backend    string         `json:"backend"`
+	InfoHash   string         `json:"info_hash"`
+	Source     string         `json:"source"`
+	StagingRef string         `json:"staging_ref"`
+	Selection  []string       `json:"selection"`
+	Resume     resumeRef      `json:"resume"`
+	State      JobState       `json:"state"`
+	Payload    *payloadRecord `json:"payload,omitempty"`
+	Capture    *captureRecord `json:"capture,omitempty"`
+	CreatedAt  time.Time      `json:"created_at"`
+	UpdatedAt  time.Time      `json:"updated_at"`
 }
 
 // jobID derives a stable identifier from the infohash alone, so a restart of
@@ -54,61 +133,239 @@ func (s *Session) jobPath(ih string) string {
 	return s.statePath(jobID(ih) + ".job.json")
 }
 
-// recordJob persists the job, or reloads it and enforces that the selection of
-// an existing job cannot change. Changing what a job means halfway through
-// would make "resume" ambiguous, so a different selection needs a new staging
-// root.
-func (s *Session) recordJob(o *opened, selection []string) (*jobRecord, error) {
-	path := s.jobPath(o.info.InfoHash)
-	want := normalizeSelection(selection)
+// metainfoRel is the job-root-relative metainfo path recorded in a job.
+func metainfoRel(ih string) string {
+	return strings.TrimPrefix(filepath.ToSlash(filepath.Join(torrentStateDir, ih+".torrent")), "./")
+}
 
-	if data, err := os.ReadFile(path); err == nil {
-		var existing jobRecord
-		if uerr := json.Unmarshal(data, &existing); uerr != nil {
-			return nil, fmt.Errorf("read job record: %w", uerr)
-		}
-		if !equalSelection(existing.Selection, want) {
-			return nil, fmt.Errorf("%w: job %s already selected %v, refusing to change it to %v; use a new staging directory",
-				ErrSelectionLocked, existing.JobID, existing.Selection, want)
-		}
-		existing.Format = JobFormatVersion
-		existing.StagingRef = o.info.Name
-		existing.UpdatedAt = time.Now().UTC()
-		if err := writeJob(path, &existing); err != nil {
+// loadOrCreateJob reads the job record for a source, creating it on first use,
+// and enforces that an existing job's selection cannot change. The record is
+// written before any payload work, so an interrupted first run still leaves a
+// durable job behind.
+func (s *Session) loadOrCreateJob(src source, want []string) (*jobRecord, error) {
+	path := s.jobPath(src.infoHash.HexString())
+	job, err := readJob(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if job != nil {
+		if err := s.validateJob(job, src.infoHash); err != nil {
 			return nil, err
 		}
-		return &existing, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("read job record: %w", err)
+		if !equalSelection(job.Selection, want) {
+			return nil, fmt.Errorf("%w: job %s already selected %v, refusing to change it to %v; use a new staging directory",
+				ErrSelectionLocked, job.JobID, job.Selection, want)
+		}
+		job.Format = JobFormatVersion
+		job.Source = src.canonical()
+		return job, s.saveJob(job)
 	}
 
 	now := time.Now().UTC()
-	job := &jobRecord{
-		Format:     JobFormatVersion,
-		JobID:      jobID(o.info.InfoHash),
-		Backend:    Backend,
-		InfoHash:   o.info.InfoHash,
-		Source:     o.src.canonical(),
-		StagingRef: o.info.Name,
-		Selection:  want,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+	job = &jobRecord{
+		Format:    JobFormatVersion,
+		JobID:     jobID(src.infoHash.HexString()),
+		Backend:   Backend,
+		InfoHash:  src.infoHash.HexString(),
+		Source:    src.canonical(),
+		Selection: want,
+		Resume: resumeRef{
+			MetainfoPath: metainfoRel(src.infoHash.HexString()),
+			DataDir:      ".",
+			PartFiles:    true,
+		},
+		State: JobState{
+			Payload: PayloadPending,
+			Capture: CapturePending,
+			Seeding: SeedingStopped,
+		},
+		CreatedAt: now,
 	}
-	if err := writeJob(path, job); err != nil {
-		return nil, err
-	}
-	return job, nil
+	return job, s.saveJob(job)
 }
 
-func writeJob(path string, job *jobRecord) error {
+// validateJob refuses a record that does not describe this torrent in this
+// staging root. The record's paths are treated like any other untrusted input:
+// they must stay inside the job root.
+func (s *Session) validateJob(job *jobRecord, want metainfo.Hash) error {
+	if job.InfoHash != want.HexString() {
+		return fmt.Errorf("job record %s describes torrent %s, not %s", job.JobID, job.InfoHash, want.HexString())
+	}
+	if job.JobID != jobID(job.InfoHash) {
+		return fmt.Errorf("job record id %q does not match torrent %s", job.JobID, job.InfoHash)
+	}
+	if job.Resume.MetainfoPath == "" {
+		job.Resume.MetainfoPath = metainfoRel(job.InfoHash)
+	}
+	if _, err := joinWithin(s.staging, job.Resume.MetainfoPath); err != nil {
+		return err
+	}
+	if job.Resume.MetainfoPath != metainfoRel(job.InfoHash) {
+		return fmt.Errorf("%w: job record points at metainfo %q, expected %q",
+			ErrUnsafePath, job.Resume.MetainfoPath, metainfoRel(job.InfoHash))
+	}
+	if job.Resume.DataDir == "" {
+		job.Resume.DataDir = "."
+	}
+	if _, err := joinWithin(s.staging, job.Resume.DataDir); err != nil {
+		return err
+	}
+	if job.State.Payload == "" {
+		job.State.Payload = PayloadPending
+	}
+	if job.State.Capture == "" {
+		job.State.Capture = CapturePending
+	}
+	if job.State.Seeding == "" {
+		job.State.Seeding = SeedingStopped
+	}
+	return nil
+}
+
+// readJob loads a v2 record, or upgrades a v1 record in memory. A v1 record has
+// no state or resume pointers, so it comes back as "nothing verified yet" and
+// the normal flow re-derives both.
+func readJob(path string) (*jobRecord, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var job jobRecord
+	if err := json.Unmarshal(data, &job); err != nil {
+		return nil, fmt.Errorf("read job record: %w", err)
+	}
+	switch job.Format {
+	case JobFormatVersion:
+	case jobFormatV1, "":
+		job.Format = JobFormatVersion
+		job.Resume = resumeRef{MetainfoPath: metainfoRel(job.InfoHash), DataDir: ".", PartFiles: true}
+		job.State = JobState{Payload: PayloadPending, Capture: CapturePending, Seeding: SeedingStopped}
+		job.Payload = nil
+		job.Capture = nil
+	default:
+		return nil, fmt.Errorf("job record %s has unsupported format %q", path, job.Format)
+	}
+	if job.Selection == nil {
+		job.Selection = []string{}
+	}
+	return &job, nil
+}
+
+func (s *Session) saveJob(job *jobRecord) error {
+	job.UpdatedAt = time.Now().UTC()
+	if job.Selection == nil {
+		job.Selection = []string{}
+	}
 	data, err := json.MarshalIndent(job, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode job record: %w", err)
 	}
-	if err := atomicfile.WriteFile(path, data, 0o600); err != nil {
+	if err := atomicfile.WriteFile(s.jobPath(job.InfoHash), data, 0o600); err != nil {
 		return fmt.Errorf("write job record: %w", err)
 	}
 	return nil
+}
+
+// markPayloadReady records the verified selection. Callers pass assets sorted
+// by path so the capture key is stable.
+func (s *Session) markPayloadReady(job *jobRecord, assets []Asset) error {
+	sorted := append([]Asset(nil), assets...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
+	job.Payload = &payloadRecord{VerifiedAt: time.Now().UTC(), Assets: sorted}
+	job.State.Payload = PayloadReady
+	return s.saveJob(job)
+}
+
+// markPayloadPending drops back to unverified. Used when staged bytes no longer
+// match the record, so the next run re-verifies and repairs instead of trusting
+// a stale attestation.
+func (s *Session) markPayloadPending(job *jobRecord) error {
+	job.State.Payload = PayloadPending
+	return s.saveJob(job)
+}
+
+// markCaptureCommitted records the committed capture against the job.
+func (s *Session) markCaptureCommitted(job *jobRecord, key, manifestPath string, reconciled bool) error {
+	job.Capture = &captureRecord{
+		Key:         key,
+		Manifest:    manifestPath,
+		CommittedAt: time.Now().UTC(),
+		Reconciled:  reconciled,
+	}
+	job.State.Capture = CaptureCommitted
+	return s.saveJob(job)
+}
+
+// markSeeding records whether the client is still available after capture.
+func (s *Session) markSeeding(job *jobRecord, state string) error {
+	if job.State.Seeding == state {
+		return nil
+	}
+	job.State.Seeding = state
+	return s.saveJob(job)
+}
+
+// captureKey is the idempotency key for a job's capture: job identity plus the
+// identity of the selected outputs. It deliberately excludes wall-clock time,
+// the run manifest path and any freshly generated id, so a restart after a
+// committed capture computes exactly the same key and can find the existing
+// capture instead of recording a duplicate.
+func captureKey(id string, assets []Asset) string {
+	sorted := append([]Asset(nil), assets...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "provenance/torrent-capture+1\njob=%s\nfiles=%d\n", id, len(sorted))
+	for _, a := range sorted {
+		_, _ = fmt.Fprintf(h, "%s\x00%d\x00%s\n", a.Path, a.Length, strings.ToLower(a.SHA256))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// findCommittedCapture looks for an existing capture manifest carrying key.
+//
+// The capture manifest is the commit point: it is the artifact archive import
+// reads. Scanning for the key (rather than for a timestamp or a run id) is what
+// makes "crashed after commit, before job update" recoverable.
+func (s *Session) findCommittedCapture(key string) (string, bool) {
+	if key == "" {
+		return "", false
+	}
+	runs, err := manifest.ListRunManifests(s.staging)
+	if err != nil {
+		return "", false
+	}
+	for _, run := range runs {
+		cm, err := manifest.ReadCaptureManifest(run)
+		if err != nil {
+			continue
+		}
+		if cm.CaptureKey != key {
+			continue
+		}
+		rel, err := filepath.Rel(s.staging, run)
+		if err != nil {
+			continue
+		}
+		return filepath.ToSlash(rel), true
+	}
+	return "", false
+}
+
+// adoptCapture turns an existing committed capture into a result without
+// writing a new manifest, and reconciles the job record if it had not caught up.
+func (s *Session) adoptCapture(job *jobRecord, key, manifestPath string, bytesRead int64, warnings []string) (Capture, error) {
+	assets := []Asset{}
+	if job.Payload != nil {
+		assets = job.Payload.Assets
+	}
+	alreadyRecorded := job.State.Capture == CaptureCommitted && job.Capture != nil &&
+		job.Capture.Key == key && job.Capture.Manifest == manifestPath
+	if !alreadyRecorded {
+		if err := s.markCaptureCommitted(job, key, manifestPath, true); err != nil {
+			return Capture{}, err
+		}
+	}
+	return s.captureResult(job, assets, key, manifestPath, bytesRead, warnings, true), nil
 }
 
 // normalizeSelection returns a sorted, de-duplicated copy so that the same

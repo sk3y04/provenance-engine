@@ -141,6 +141,88 @@ The integration test asserts exactly that: a 3-file fixture with 16 KiB pieces
 where piece 0 spans `a.bin` and part of `b.bin`; selecting `b.bin` writes
 `a.bin` too, and the capture contains one item.
 
+## Job state and crash recovery
+
+A job is a durable local record at
+`.provenance/torrent/bt-<infohash>.job.json` (`provenance/torrent-job+2`). It
+holds a stable job ID derived from the infohash, the backend, the immutable
+selection, a pointer to the backend's own resume state (persisted metainfo path,
+data directory, part-file scheme), the three states below, and the idempotency
+key of the committed capture.
+
+The record deliberately does **not** keep a second piece checkpoint: piece
+completion and part files are owned by the torrent backend, and the record only
+names where they live.
+
+### Three independent states
+
+| Dimension | Values | Meaning |
+|-----------|--------|---------|
+| `payload` | `pending` → `ready` | `ready` only after every selected file is complete, hash-verified and the SHA-256 digests are recorded |
+| `capture` | `pending` → `committed` | `committed` once the run manifest is written; a job can sit at payload-ready/capture-pending indefinitely and be retried |
+| `seeding` | `stopped` ↔ `seeding` | only ever `seeding` with `--seed`; never blocks capture |
+
+A job can therefore be *payload ready, capture pending* (a capture failure —
+retry from staging) or *capture committed, seeding* (still serving peers after
+the capture is visible).
+
+### The commit point
+
+`archive import` reads run manifests (`<staging>/.provenance/runs/*.json`), and
+`manifest verify` reads per-item records. The operation that makes a capture
+visible is the atomic rename of the run manifest — so items are written first
+and the run manifest last:
+
+```
+verify bytes → hash → write job.payload (ready)
+            → write items/*.json  (not yet a capture)
+            → write runs/<ts>.json   ← COMMIT
+            → write job.capture (committed)
+```
+
+An item file without a run manifest is invisible to archive import, and a retry
+overwrites it under the same external ID.
+
+### Idempotency key
+
+`capture_key` (on the run manifest) is `sha256("provenance/torrent-capture+1",
+job_id, and each selected file's path, length and SHA-256)`. It contains no
+timestamp, run id, or random value, so the same job and the same staged bytes
+always produce the same key.
+
+On every run, before doing work, the adapter scans existing run manifests for
+that key:
+
+- found, staged bytes still verify → the capture is **adopted** (`reconciled:
+  true`), nothing is written;
+- found, staged bytes no longer verify → the staleness is reported as a warning,
+  the payload attestation is dropped, and the normal resume path repairs the
+  bytes and adopts the same capture;
+- not found → a new capture is committed.
+
+### Crash windows
+
+| Crash point | On restart |
+|---|---|
+| mid-transfer | payload `pending`; retained `.part` data is re-verified and the transfer resumes |
+| after verification, before commit | payload `ready`; capture is written **without opening the swarm** (`BytesRead == 0`) |
+| after commit, before job update | the key is found in the existing manifest and the job is reconciled to it; no duplicate manifest is written |
+| during the capture write (items only) | orphan items are overwritten by the retry under the same external ID; nothing is visible to archive import |
+
+Residual windows this slice does **not** close:
+
+- There is no lock on the job record. Two `fetch` processes on the same staging
+  root can interleave; the torrent backend already assumes one writer per data
+  directory, so run one job per staging root.
+- `capture: committed` is written after the manifest, so the crash window above
+  is real — it is reconciled, not prevented.
+- Reconciliation assumes the capture manifest still exists. A job whose
+  committed manifest was deleted is re-captured from staging (same key, new run
+  file), not reported as an integrity failure.
+- Staged bytes are re-hashed before adopting a capture, so a repeat `fetch` costs
+  a local re-read of the selection. That is deliberate: a correct capture record
+  does not prove the working copy is still correct.
+
 ## Resume and restart
 
 - The exact metainfo is persisted once at
@@ -151,9 +233,8 @@ where piece 0 spans `a.bin` and part of `b.bin`; selecting `b.bin` writes
   verified bytes are reused, corrupted bytes are re-fetched rather than captured.
 - Library part files (`.part`) are left alone on interruption; the next run
   completes and finalizes them.
-- The job record (`.provenance/torrent/bt-<infohash>.job.json`) holds the
-  immutable selection, backend, staging reference and infohash. Re-running with a
-  different selection is refused.
+- The job record holds the immutable selection; re-running with a different
+  selection is refused (`ErrSelectionLocked`).
 
 ## Limits
 
@@ -197,13 +278,21 @@ tracker. Covered:
 | `TestJobSelectionCannotChangeMidJob` | immutable selection, order-insensitive retry |
 | `TestHostileMetainfoPathsRejected` | traversal, empty component, drive letter, hostile torrent name |
 | `TestStagingSymlinkRejected` | symlinked staging directory |
-| path/job unit tests | component validation, containment, peer parsing, kind mapping |
+| `TestCaptureRetryAfterPayloadVerifyDoesNotRefetch` | crash after verification: retry commits the capture from staging with the swarm closed and `BytesRead == 0` |
+| `TestCaptureCommitCrashReconcilesWithoutDuplicate` | crash after the manifest rename: restart adopts the existing capture, exactly one manifest, job reconciled |
+| `TestSeedingDoesNotBlockCaptureCompletion` | capture is committed and readable while `--seed` keeps the client up; cancelling stops seeding without touching the capture |
+| `TestStaleStagedPayloadIsReportedAndRepaired` | a corrupted staged file is reported as a warning, dropped to unverified, repaired and re-adopted under the same key |
+| `TestJobArtifactsDoNotLeakTrackerSecrets` | job record, manifests and items never contain tracker/passkey strings |
+| `job_test.go` | key stability, v1→v2 upgrade, immutable selection, record path confinement, source sanitisation |
+| path unit tests | component validation, containment, peer parsing, kind mapping |
 
 ## Follow-ups
 
 1. Add `THIRD_PARTY_NOTICES` (MPL texts, the missing `go-llsqlite/adapter`
    licence) or ship with `-tags nosqlite`; decide before the first binary
    release that includes this slice.
-2. Durable job queue, retry/reconcile, and status commands (plan PR 2).
+2. A multi-job queue: this slice makes one job durable and recoverable per
+   staging root, but nothing enumerates or schedules jobs, locks a job against
+   concurrent writers, or surfaces job state without running `fetch`.
 3. Optional per-job bandwidth cap, needed before fetching large public swarms.
 4. Verify behaviour against a real swarm with a private tracker, outside CI.

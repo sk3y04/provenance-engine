@@ -450,6 +450,7 @@ provenance archive import ./downloads/release --collection music --vault ~/Vault
 
 - **Selection is not a guarantee about disk contents.** BitTorrent pieces can span file boundaries, so fetching one file may write neighbouring bytes (a shared edge piece). Only the selected, complete, hash-verified files are captured.
 - **Resume.** A second run in the same staging root re-verifies retained pieces before requesting more, so verified bytes are reused and corrupted retained data is re-fetched instead of captured. Persisting the metainfo means a restart needs no peer to begin verifying.
+- **Durable job state.** Each torrent gets a job record with separate payload, capture and seeding states. A capture failure can be retried from the verified staged bytes without contacting the swarm (reported as `payload=ready capture=pending`), and a restart after a capture was committed recognises the existing capture by its idempotency key instead of recording a duplicate (`existing capture reconciled`). The state line is printed after every fetch and included in `--json`.
 - **Selection is immutable per job.** Re-running with a different `--select` set is refused (`ErrSelectionLocked`); use a new staging root.
 - **Uploads while fetching** are enabled (normal reciprocity). Continued seeding after completion is opt-in via `--seed`.
 - **No network surface.** The adapter opens no listener for other tools, exposes no RPC, and has no aria2-compatible interface.

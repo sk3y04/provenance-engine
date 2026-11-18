@@ -67,6 +67,18 @@ var (
 	ErrTransferTimeout   = errors.New("torrent transfer did not complete")
 	ErrNotFinalized      = errors.New("selected file was not finalized on disk")
 	ErrSelectionLocked   = errors.New("job selection is immutable")
+	// ErrStagedPayloadInvalid means the bytes on disk no longer match what the
+	// job verified. The attestation is dropped and the existing re-verify-and-
+	// repair path takes over; it is never captured as-is.
+	ErrStagedPayloadInvalid = errors.New("staged payload no longer matches the verified job")
+)
+
+// Test seams for the two durability boundaries this slice defines. Production
+// code leaves them nil; tests set them to simulate a crash by returning an
+// error at exactly the point where job state and committed capture can diverge.
+var (
+	failAfterPayloadReady  func() error
+	failAfterCaptureCommit func() error
 )
 
 // Config configures a Session. StagingDir is required; everything else has a
@@ -148,9 +160,22 @@ type Capture struct {
 	JobID      string  `json:"job_id"`
 	StagingDir string  `json:"staging_dir"`
 	Assets     []Asset `json:"assets"`
+	// State reports the three job dimensions at the moment of return:
+	// payload readiness, capture completion and seeding.
+	State JobState `json:"state"`
+	// CaptureKey is the idempotency key: job identity plus the identity of the
+	// selected outputs. It is stable across restarts and is what makes a
+	// committed capture recognisable.
+	CaptureKey string `json:"capture_key"`
+	// Reconciled is true when an existing committed capture was adopted instead
+	// of writing a new one.
+	Reconciled bool `json:"reconciled"`
+	// Warnings are non-fatal recovery events, such as a stale payload
+	// attestation that forced a re-verification.
+	Warnings []string `json:"warnings,omitempty"`
 	// BytesRead is useful payload read from peers during this run. A resumed
 	// job that reuses verified bytes reads strictly less than the selection
-	// size; a fully offline restart reads zero.
+	// size; a capture retry that never opens the swarm reads zero.
 	BytesRead int64 `json:"bytes_read"`
 	// ManifestPath is the capture manifest written through
 	// internal/manifest, relative to StagingDir.
@@ -366,6 +391,15 @@ func (s *Session) List(ctx context.Context, rawSource string) (Info, error) {
 // Selection entries are exact, slash-separated paths as reported by List
 // ("<name>/<path>"). An empty selection is rejected: this backend never
 // downloads a whole torrent by accident.
+//
+// A job is durable across processes. Every call reconciles what already exists
+// before doing work, in this order:
+//
+//  1. a committed capture for this job and selection is adopted, so a restart
+//     after a commit never records a duplicate;
+//  2. a verified payload is captured straight from staging, without opening the
+//     swarm, so a capture failure is retried without fetching again;
+//  3. only then is the transfer resumed.
 func (s *Session) Fetch(ctx context.Context, rawSource string, selection []string) (Capture, error) {
 	src, err := parseSource(rawSource)
 	if err != nil {
@@ -380,6 +414,55 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 		defer cancel()
 	}
 
+	job, err := s.loadOrCreateJob(src, normalizeSelection(selection))
+	if err != nil {
+		return Capture{}, err
+	}
+
+	// 1. Committed already? The key is derived from the recorded payload, so
+	// this works even when the previous process died before updating the job.
+	//
+	// Adoption still re-checks the staged bytes: a capture record that is
+	// correct does not mean the working copy on disk still is. A stale payload
+	// is reported as a warning, dropped back to unverified, and repaired by the
+	// normal resume path (which adopts the same capture again afterwards, so no
+	// duplicate is written).
+	var warnings []string
+	if job.Payload != nil {
+		key := captureKey(job.JobID, job.Payload.Assets)
+		if path, ok := s.findCommittedCapture(key); ok {
+			if verr := s.verifyStagedAssets(job.Payload.Assets); verr == nil {
+				return s.adoptCapture(job, key, path, 0, warnings)
+			} else {
+				warnings = append(warnings, verr.Error())
+				if err := s.markPayloadPending(job); err != nil {
+					return Capture{}, err
+				}
+			}
+		}
+	}
+
+	// 2. Payload verified on an earlier run: capture from staging only.
+	if job.State.Payload == PayloadReady && job.Payload != nil && len(job.Payload.Assets) > 0 {
+		if verr := s.verifyStagedAssets(job.Payload.Assets); verr == nil {
+			return s.captureStaged(job, 0, warnings)
+		} else {
+			// The attestation is stale. Report it, drop back to unverified and
+			// let the normal resume path re-verify and repair.
+			warnings = append(warnings, verr.Error())
+			if err := s.markPayloadPending(job); err != nil {
+				return Capture{}, err
+			}
+		}
+	}
+
+	// 3. Transfer.
+	return s.transferAndCapture(ctx, src, job, warnings)
+}
+
+// transferAndCapture runs the torrent backend for the job's selection, records
+// the verified payload, and commits the capture.
+func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRecord, warnings []string) (Capture, error) {
 	metaCtx, cancelMeta := context.WithTimeout(ctx, s.cfg.MetadataTimeout)
 	o, err := s.open(metaCtx, src, false)
 	cancelMeta()
@@ -387,7 +470,7 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 		return Capture{}, err
 	}
 
-	selected, err := o.resolveSelection(selection)
+	selected, err := o.resolveSelection(job.Selection)
 	if err != nil {
 		return Capture{}, err
 	}
@@ -397,9 +480,11 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 	if err := s.stagingChecks(o.stagingRoot); err != nil {
 		return Capture{}, err
 	}
-	job, err := s.recordJob(o, selection)
-	if err != nil {
-		return Capture{}, err
+	if job.StagingRef != o.info.Name {
+		job.StagingRef = o.info.Name
+		if err := s.saveJob(job); err != nil {
+			return Capture{}, err
+		}
 	}
 
 	selectedFiles := make(map[*at.File]struct{}, len(selected))
@@ -427,16 +512,64 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 		return Capture{}, err
 	}
 
-	cap, err := s.capture(o, selected, job.JobID)
+	assets, err := s.hashSelectedAssets(o, selected)
 	if err != nil {
 		return Capture{}, err
 	}
+	if err := s.markPayloadReady(job, assets); err != nil {
+		return Capture{}, err
+	}
+	stats := o.t.Stats()
+	bytesRead := stats.BytesReadUsefulData.Int64()
+
+	// Durability boundary: verified payload recorded, capture not yet committed.
+	if failAfterPayloadReady != nil {
+		if herr := failAfterPayloadReady(); herr != nil {
+			return Capture{}, fmt.Errorf("payload verified, capture not started: %w", herr)
+		}
+	}
+
+	cap, err := s.captureStaged(job, bytesRead, warnings)
+	if err != nil {
+		return Capture{}, err
+	}
+
 	if s.cfg.KeepSeeding {
-		// Opt-in seeding: the caller asked to stay available after the
-		// capture, so hold the client open until they stop us.
+		// Capture is committed and returned below; seeding is a separate state
+		// that must not hold the capture back.
+		if err := s.markSeeding(job, SeedingActive); err != nil {
+			return cap, err
+		}
 		<-ctx.Done()
+		if err := s.markSeeding(job, SeedingStopped); err != nil {
+			return cap, err
+		}
 	}
 	return cap, nil
+}
+
+// captureStaged commits a capture from the job's verified payload. It never
+// touches the torrent client, so a capture retry reuses staged bytes.
+func (s *Session) captureStaged(job *jobRecord, bytesRead int64, warnings []string) (Capture, error) {
+	assets := job.Payload.Assets
+	key := captureKey(job.JobID, assets)
+	if path, ok := s.findCommittedCapture(key); ok {
+		return s.adoptCapture(job, key, path, bytesRead, warnings)
+	}
+	manifestPath, err := s.commitCapture(job, assets, key)
+	if err != nil {
+		return Capture{}, fmt.Errorf("capture: %w", err)
+	}
+	// Durability boundary: capture committed, job state not yet updated.
+	if failAfterCaptureCommit != nil {
+		if herr := failAfterCaptureCommit(); herr != nil {
+			return Capture{}, fmt.Errorf("capture committed, job state not updated: %w", herr)
+		}
+	}
+	if err := s.markCaptureCommitted(job, key, manifestPath, false); err != nil {
+		return Capture{}, err
+	}
+	return s.captureResult(job, assets, key, manifestPath, bytesRead, warnings, false), nil
 }
 
 // open adds the torrent, waits for metadata, persists the exact metainfo once,

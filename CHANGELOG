@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Durable torrent jobs with an idempotent capture handoff**: each torrent job
+  now keeps a versioned record (`provenance/torrent-job+2`) with a stable job
+  ID, backend, immutable selection, pointers into the torrent backend's own
+  resume state (metainfo, data dir, part-file scheme) and three independently
+  tracked states — payload readiness, capture completion and seeding. A verified
+  payload is attested with its selected files and SHA-256 digests, so a capture
+  failure is retried from staging **without reopening the swarm**
+  (`bytes_read == 0`). The capture manifest gained an optional `capture_key`
+  derived from the job ID and the selected output identity (path, length,
+  digest — never a timestamp or run id); every run scans existing manifests for
+  that key, so a restart after a capture was committed but before the job record
+  was updated reconciles the job instead of recording a duplicate. Seeding no
+  longer sits inside the capture path: the capture is committed and visible
+  while `--seed` keeps the client up. Staged bytes that no longer match the
+  attestation are reported as a warning, dropped back to unverified and repaired
+  by the normal resume path. No new piece-checkpoint format, no database, no
+  archive schema change; plain `grab` and optional archiving are unchanged.
+  See `docs/TORRENT.md` for the state model and the remaining crash windows.
+
 - **Selective BitTorrent fetch (`provenance torrent`)**: new
   `internal/transfer/bittorrent` adapter around `github.com/anacrolix/torrent`
   pinned at `v1.62.0` (MPL-2.0; chosen because it is the first stable tag with

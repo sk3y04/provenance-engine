@@ -23,15 +23,21 @@ type CaptureOptions struct {
 }
 
 type CaptureManifest struct {
-	Format       string         `json:"format"`
-	SourceURL    string         `json:"source_url"`
-	Site         string         `json:"site"`
-	DownloadedAt time.Time      `json:"downloaded_at"`
-	OutputDir    string         `json:"output_dir"`
-	Tool         string         `json:"tool"`
-	ToolVersion  string         `json:"tool_version"`
-	Options      CaptureOptions `json:"options"`
-	Items        []CaptureItem  `json:"items"`
+	Format       string    `json:"format"`
+	SourceURL    string    `json:"source_url"`
+	Site         string    `json:"site"`
+	DownloadedAt time.Time `json:"downloaded_at"`
+	OutputDir    string    `json:"output_dir"`
+	Tool         string    `json:"tool"`
+	ToolVersion  string    `json:"tool_version"`
+	// CaptureKey is an optional idempotency key: a stable identity for the
+	// content this capture records, independent of when it was written. A
+	// producer that can retry a capture sets it, so a restart can recognise an
+	// already-committed capture instead of recording a duplicate. Empty for
+	// producers that never retry a capture.
+	CaptureKey string         `json:"capture_key,omitempty"`
+	Options    CaptureOptions `json:"options"`
+	Items      []CaptureItem  `json:"items"`
 }
 
 type CaptureItem struct {

@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -192,6 +194,9 @@ func captureManifests(t *testing.T, staging string) []*manifest.CaptureManifest 
 	t.Helper()
 	runs, err := manifest.ListRunManifests(staging)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		t.Fatalf("list runs: %v", err)
 	}
 	out := make([]*manifest.CaptureManifest, 0, len(runs))
@@ -201,6 +206,42 @@ func captureManifests(t *testing.T, staging string) []*manifest.CaptureManifest 
 			t.Fatalf("read capture manifest %s: %v", run, err)
 		}
 		out = append(out, cm)
+	}
+	return out
+}
+
+// waitFor polls cond until it reports success or the deadline passes.
+func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// jobRecordFor reads the persisted job record from a staging root.
+func jobRecordFor(t *testing.T, staging, infohash string) *jobRecord {
+	t.Helper()
+	path := filepath.Join(staging, filepath.FromSlash(torrentStateDir), jobID(infohash)+".job.json")
+	job, err := readJob(path)
+	if err != nil {
+		t.Fatalf("read job record: %v", err)
+	}
+	return job
+}
+
+// manifestsWithKey returns the capture manifests carrying an idempotency key.
+func manifestsWithKey(t *testing.T, staging, key string) []*manifest.CaptureManifest {
+	t.Helper()
+	var out []*manifest.CaptureManifest
+	for _, cm := range captureManifests(t, staging) {
+		if cm.CaptureKey == key {
+			out = append(out, cm)
+		}
 	}
 	return out
 }

@@ -155,10 +155,19 @@ func runTorrentFetch(ctx context.Context, source string) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(cap)
 	}
-	for _, a := range cap.Assets {
-		_, _ = fmt.Fprintf(os.Stderr, "[provenance] captured %s (%s, sha256 %s)\n",
-			a.Path, manifest.HumanSize(a.Length), a.SHA256)
+	for _, w := range cap.Warnings {
+		_, _ = fmt.Fprintf(os.Stderr, "[provenance] warning: %s\n", w)
 	}
+	if cap.Reconciled {
+		_, _ = fmt.Fprintf(os.Stderr, "[provenance] existing capture reconciled for job %s (no duplicate recorded)\n", cap.JobID)
+	} else {
+		for _, a := range cap.Assets {
+			_, _ = fmt.Fprintf(os.Stderr, "[provenance] captured %s (%s, sha256 %s)\n",
+				a.Path, manifest.HumanSize(a.Length), a.SHA256)
+		}
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "[provenance] job %s: payload=%s capture=%s seeding=%s\n",
+		cap.JobID, cap.State.Payload, cap.State.Capture, cap.State.Seeding)
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] capture manifest: %s\n", cap.ManifestPath)
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] verify with: provenance manifest verify %s\n", cap.StagingDir)
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] archive with: provenance archive import %s --collection NAME\n", cap.StagingDir)

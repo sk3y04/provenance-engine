@@ -78,6 +78,12 @@ func TestFetchCapturesOnlySelectedFiles(t *testing.T) {
 	if cap.JobID != "bt-"+s.infohash() {
 		t.Errorf("job id = %q, want it derived from the infohash", cap.JobID)
 	}
+	if cap.CaptureKey == "" {
+		t.Error("capture key is empty")
+	}
+	if cap.State.Payload != PayloadReady || cap.State.Capture != CaptureCommitted || cap.State.Seeding != SeedingStopped {
+		t.Errorf("state = %+v, want ready/committed/stopped", cap.State)
+	}
 
 	// The shared edge piece writes a.bin to disk. Capturing it would be
 	// wrong: the operator selected one file.
@@ -98,6 +104,9 @@ func TestFetchCapturesOnlySelectedFiles(t *testing.T) {
 	}
 	if cm.Items[0].Sha256 != got.SHA256 {
 		t.Errorf("manifest hash %s != asset hash %s", cm.Items[0].Sha256, got.SHA256)
+	}
+	if cm.CaptureKey != cap.CaptureKey {
+		t.Errorf("manifest capture key %q != result key %q", cm.CaptureKey, cap.CaptureKey)
 	}
 	if !strings.Contains(string(cm.Items[0].RawMetadata), s.infohash()) {
 		t.Errorf("item metadata %s does not record the infohash", cm.Items[0].RawMetadata)
@@ -166,7 +175,11 @@ func TestInterruptedFetchResumesAndReusesVerifiedBytes(t *testing.T) {
 	content := patterned(2<<20, 'r')
 	// 512 KiB/s upload keeps the transfer in flight long enough for the
 	// interruption to be a real one rather than a race with loopback speed.
-	s := newSeederRateLimited(t, "fixture", 32*1024, map[string][]byte{"big.bin": content}, 512<<10)
+	// The torrent is multi-file so the resumed selection is a proper subset.
+	s := newSeederRateLimited(t, "fixture", 32*1024, map[string][]byte{
+		"big.bin":      content,
+		"neighbor.bin": patterned(8000, 'n'),
+	}, 512<<10)
 	selection := []string{"fixture/big.bin"}
 
 	// Pass 1: interrupt once a quarter of the payload has arrived.
@@ -193,6 +206,9 @@ func TestInterruptedFetchResumesAndReusesVerifiedBytes(t *testing.T) {
 	if parts := listPartFiles(t, staging); len(parts) == 0 {
 		t.Fatal("interruption left no .part data; the resume test would prove nothing")
 	}
+	if job := jobRecordFor(t, staging, s.infohash()); job.State.Payload != PayloadPending {
+		t.Errorf("payload state after interruption = %q, want pending", job.State.Payload)
+	}
 
 	// Pass 2: resume with the seeder reachable. Verified bytes must be reused,
 	// so the peer sends less than the whole file.
@@ -211,6 +227,12 @@ func TestInterruptedFetchResumesAndReusesVerifiedBytes(t *testing.T) {
 	}
 	if got := sha256Hex(content); cap2.Assets[0].SHA256 != got {
 		t.Errorf("resumed content hash = %s, want %s", cap2.Assets[0].SHA256, got)
+	}
+	if cap2.State.Payload != PayloadReady || cap2.State.Capture != CaptureCommitted {
+		t.Errorf("state after resume = %+v, want ready/committed", cap2.State)
+	}
+	if cap2.CaptureKey == "" {
+		t.Error("resume wrote a capture without an idempotency key")
 	}
 
 	// Pass 3: no peer at all. Persisted metainfo plus verified retained data
@@ -238,6 +260,17 @@ func TestInterruptedFetchResumesAndReusesVerifiedBytes(t *testing.T) {
 	}
 	if cap3.Assets[0].SHA256 != sha256Hex(content) {
 		t.Errorf("offline capture hash = %s", cap3.Assets[0].SHA256)
+	}
+	// The capture already existed: pass 3 reconciles it rather than writing a
+	// second manifest, and the key matches the one pass 2 committed.
+	if !cap3.Reconciled {
+		t.Error("offline restart wrote a new capture instead of reconciling the existing one")
+	}
+	if cap3.CaptureKey != cap2.CaptureKey {
+		t.Errorf("capture key changed across runs: %s vs %s", cap3.CaptureKey, cap2.CaptureKey)
+	}
+	if n := len(manifestsWithKey(t, staging, cap3.CaptureKey)); n != 1 {
+		t.Errorf("manifests with the job key = %d, want 1", n)
 	}
 }
 
