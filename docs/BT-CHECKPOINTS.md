@@ -2861,6 +2861,12 @@ selected share only.
 
 ## BT-13 — Measured cost of the selected-progress sampler
 
+> **Superseded for numbers:** the benchmarks in this entry timed their fixture setup
+> (no `b.ResetTimer()`), and the 65,536-/262,144-piece cases were storage-less. See
+> BT-14 for corrected timings, a storage-backed 65,536-piece case and the workload
+> limit. The decision here (leave the sampler alone) survives; the regime difference
+> reported below does not.
+
 **Starting SHA** `3b3c27d` (clean). **Benchmarks** `6720b44`, **guards** `434640b`, **this
 checkpoint** follows. **Production code unchanged**: the benchmarks were
 the slice, and the measurement says the sampler is acceptable for the queue's intended
@@ -2985,3 +2991,109 @@ work to a goroutine. Allocations are the second-order concern.
 - Benchmark numbers come from an idle 32-core box; no measurement under concurrent
   transfers or with the live endpoint being polled.
 - The ad-hoc metadata timeout (BT-10f) is untouched and still unexplained.
+
+## BT-14 — Storage-backed many-piece sampling: measured ceiling and workload limit
+
+**Starting SHA** `6cd65f8` (clean). **End SHA** `fbd4e51`. **Production code unchanged** — benchmarks only.
+This closes the gap BT-13 left: its 65,536- and 262,144-piece fixtures used deferred
+storage, so they could not answer what the sampler costs on a *real* many-piece torrent.
+
+### A measurement defect found and fixed first
+
+BT-13's benchmarks called `selectedVerified` in the timed loop without
+`b.ResetTimer()`, so fixture construction (writing and hashing the payload) was charged
+to the measured operation. That inflated every figure and, worse, inflated the
+short-iteration regime far more than the default one — which is where BT-13's "the two
+regimes differ by 2.6–6.5×" came from. `benchSelectedVerified` now restarts the timer
+after setup. With that fix the two regimes agree within about 10 % on the same fixtures
+(512 pieces: 41.5–44.7 µs default vs 40.4–45.9 µs at `-benchtime=500x`), so the regime
+gap is a measurement artefact, not a property of the sampler.
+
+### Fixture construction
+
+- Control: one 32 MiB file, 16 KiB pieces, **2,048 pieces**, real file storage, fully
+  verified (`VerifyDataContext`) before timing.
+- Large case: one 1 GiB file, 16 KiB pieces, **65,536 pieces**, real file storage, fully
+  verified before timing. Written in 1 MiB chunks so building it does not need 1 GiB of
+  RAM; on-disk footprint 1.08 GB in the benchmark's temp dir, removed with the test.
+- Both assert, outside the timed loop: piece count, `selectedVerified == size` (32 MiB /
+  1 GiB), and one file. No peers, no network: the client is the loopback-only
+  `ctlConfig` and never dials; the storage is the real file backend, not deferred.
+- The two storage-less benchmarks are retained but are labelled as such: they walk the
+  same piece count with no storage backing and are a lower bound, not the target case.
+
+### Results (default Go benchmark duration, `-count=3`, `-benchmem`)
+
+| benchmark | pieces | backing | ns/op | B/op | allocs/op |
+|-----------|--------|---------|-------|------|-----------|
+| `Complete512` | 512 | real storage, verified | 41.5–44.7 µs | 48.8 kB | 10 |
+| `Complete2048` (control) | 2,048 | real storage, verified | 231.2–236.0 µs | 245.4 kB | 13 |
+| `Complete65536` (new) | 65,536 | real storage, verified | 5.51–5.79 ms | 13.91 MB | 27 |
+| `Incomplete65536` | 65,536 | none (deferred) | 3.50–4.05 ms | 13.91 MB | 27 |
+| `Incomplete262144` | 262,144 | none (deferred) | 13.69–14.85 ms | 55.64 MB | 33 |
+
+Per piece: ~81–87 ns at 512, ~113–115 ns at 2,048 and ~84–88 ns at 65,536 — flat within
+about 1.4× across a 128× range of piece counts, so the cost is linear in selected piece
+count and there is no cliff at high counts. The storage-less 65,536 case (53–62 ns per
+piece) is cheaper, but it is not the measured target.
+
+Fixed-iteration regime, recorded separately:
+`go test ./internal/transfer/bittorrent/ -run '^$' -bench '^BenchmarkSelectedVerifiedComplete' -benchmem -benchtime=500x -count=3`
+→ 512: 40.4–45.9 µs; 2,048: 214.8–251.7 µs; 65,536: 4.87–5.80 ms (B/op and allocs/op
+unchanged: 48.8 kB/10, 245.4 kB/13, 13.91 MB/27).
+
+### Extrapolation to the 100 ms cadence (per active download)
+
+Labels: these are extrapolations from single-sample cost, not measured production
+behaviour.
+
+- 2,048 pieces: ~0.23 ms per sample → ~2.3 ms and ~2.45 MB allocated per second (~0.23 %
+  of one core).
+- 65,536 pieces: ~5.6 ms per sample → ~56 ms and ~139 MB allocated per second (~5.6 % of
+  one core).
+- 262,144 pieces (storage-less, lower bound): ~14.3 ms per sample → ~143 ms/s, ~556 MB/s.
+
+Not measured: lock contention (`File.State()` holds `cl.rLock` for the walk), effect on
+transfer throughput, behaviour with several concurrent attempts sampling at once, or any
+storage-backed case above 65,536 pieces.
+
+### Decision
+
+Keep the sampler; document a workload limit.
+
+- The intended workload (media torrents, 1–16 MiB pieces, at most a few thousand pieces
+  per file) costs ≤ ~0.24 ms per sample, i.e. ≤ ~0.25 % of the transfer goroutine per
+  active download. That fits and does not justify changing production code.
+- **Workload limit:** the measured comfortable range ends at a few thousand selected
+  pieces. At 65,536 pieces one attempt spends ~5.6 % of a core sampling and allocates
+  ~139 MB/s; with four concurrent attempts that is ~22 % of a core and ~0.5 GB/s of
+  allocation, which is not acceptable headroom. Treat more than ~32,000 selected pieces
+  per attempt as outside the measured envelope, and do not add sampling on top (ETA
+  smoothing, extra rates) until the walk is bounded.
+- **Proposed follow-up (not implemented here):** bound the walk per attempt — cache the
+  last verified count and only re-walk pieces whose state changed, or subscribe to the
+  client's piece-state changes. It must preserve the verified selected-byte semantics
+  (boundary pieces, padding exclusion, resumed data) and stay synchronous inside the
+  attempt, or carry an explicit attempt identity with the A-after-B regression described
+  below.
+
+### Constraints retained
+
+Any future asynchronous sampler needs an explicit **attempt identity** (not just the
+queue entry id) and a regression that rejects a late sample from attempt A after attempt
+B has started for the same entry. Today that is guaranteed by construction: the callback
+runs synchronously inside the attempt's own `Run`, and `liveRemove` (which also drops the
+rate baseline) happens before the next claim.
+
+ETA and stalled-job policy remain out of scope for this checkpoint.
+
+### Commands actually run
+
+- `go test ./internal/transfer/bittorrent/ -run '^$' -bench '^BenchmarkSelectedVerified' -benchmem -count=3`
+  (five cases, the three storage-backed ones included)
+- `go test ./internal/transfer/bittorrent/ -run '^$' -bench '^BenchmarkSelectedVerifiedComplete' -benchmem -benchtime=500x -count=3`
+  (three storage-backed cases)
+- `go test ./internal/transfer/bittorrent/ -run '^TestSelectedVerified' -race -count=2` → ok 1.119 s
+- `git diff --check`
+- Platform: 32-core Linux 6.18.63-gentoo-dist-bin, Go 1.27.3, NVMe-backed `/home` with
+  376 GB free; fixture footprint 1.08 GB per run of the large case, removed afterwards.
