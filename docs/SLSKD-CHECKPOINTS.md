@@ -17,7 +17,8 @@ prepare v0.9.0"). Nothing has been pushed.
 | M3 | `f41cdc5` | queue controls, webhook receiver, boot recovery |
 | M4 | `89448c3` | curated shares, uploads, share-safety guards |
 | docs | `eea0aba` | `docs/SOULSEEK.md`, CLI reference, README, CHANGELOG |
-| review | `06a9e48` | nine defects found reviewing M1–M4, each with a regression |
+| review | `06a9e48` | ten defects found reviewing M1–M4, each with a regression |
+| review fix | `9e0ff4b` | an unknown job/share id reports itself instead of leaking the record path |
 
 ---
 
@@ -57,7 +58,7 @@ permissions under `mode: 755` vs `775`, `_{ticks}` collisions on a real download
 
 ## Review pass (`06a9e48`)
 
-Nine defects, each found by reading the code against the contract rather than by a
+Ten defects, each found by reading the code against the contract rather than by a
 failing gate, and each fixed with a regression that was **watched fail first**:
 
 | # | Defect | Regression | Evidence before the fix |
@@ -71,6 +72,7 @@ failing gate, and each fixed with a regression that was **watched fail first**:
 | 7 | `manifest.RunPath` is second-granular: two jobs finishing in one second overwrote a capture | `TestIngestTwoJobsInOneSecondKeepBothCaptures` | `1 run manifests for two jobs … want 2` |
 | 8 | Re-adding a shrunk folder kept links for deleted files, so slskd kept advertising them | `TestShareAddPrunesLinksForRemovedFiles` | `a link for a deleted source file survived the re-add` |
 | 9 | `QueuePosition` decoded a `position` field; the endpoint returns the updated Transfer, so the place was always `0` | `TestQueuePositionUsesTheTransferShape` | `an absent placeInQueue reported as known: &{Position:0 Known:true …}` |
+| 10 | An unknown job or share id surfaced the record path (`open …/jobs/prov-….json: no such file or directory`) and triggered the media "deleted or unavailable" hint | `TestStoreMissesReadAsNotFound` | `error: open /…/.provenance/slskd/jobs/prov-0000000000000000.json: no such file or directory` |
 
 Two assertions were added on code paths that were already correct, so they were
 proven live by mutating the code and watching them fail:
@@ -103,6 +105,7 @@ exported helpers (`SortedNames`, `PeerUsernames`, `Item.Succeeded`) were removed
 | --- | --- |
 | `go test -race ./...` at `eea0aba` | `EXIT=0` (whole repo; run twice, both green) |
 | `go test -race ./...` at `06a9e48` | `EXIT=0` |
+| `go test -race ./...` at `9e0ff4b` | `EXIT=0` |
 | `go test -race ./internal/slskd/ ./cmd/provenance/` | ok / ok |
 | `go vet ./...` | clean |
 | `gofmt -l .` | empty |
@@ -110,7 +113,7 @@ exported helpers (`SortedNames`, `PeerUsernames`, `Item.Succeeded`) were removed
 | `go mod tidy -diff` | empty (the CI gate that `make test` does not cover) |
 | `make build` | `./provenance` produced |
 
-**Test count:** 131 tests in `internal/slskd`, 12 in the `provenance soulseek` CLI
+**Test count:** 132 tests in `internal/slskd`, 13 in the `provenance soulseek` CLI
 files. The M2 exit gate is `TestEndToEndSearchEnqueuePollIngest`: search → enqueue →
 poll → file on disk → verified capture, all through the public API.
 
@@ -126,6 +129,8 @@ poll → file on disk → verified capture, all through the public API.
 | `soulseek shares files` | 5 paginated entries, Windows separators normalised |
 | `soulseek shares preview <dir>` | `files: 4 … excluded: 1 symlinks: 1` — the planted symlink was counted, not offered |
 | `soulseek uploads list` / `jobs` | `active=0 queued=0 …` / `no jobs` |
+| `soulseek search` again after the review (rebuilt binary) | `1194 files, 31 locked, 3 folders (1.0s)`, ranked |
+| `soulseek position prov-0000…` | `unknown job: prov-0000000000000000`, exit 1, no path and no unrelated hint |
 
 **Not rerun as part of this record:** hosted CI (nothing is pushed), and the
 `render`/TUI suites beyond the repo-wide `-race` run above.
