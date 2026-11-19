@@ -148,6 +148,12 @@ Guardrails applied before the call, not after:
   is returned.
 - Downloads are never placed anywhere but the pinned destination.
 
+A batch can be partly accepted (`207`): slskd queues some files and refuses others.
+A refused file never gets a transfer record, so it is marked refused with slskd's
+reason and the job settles as `FAILED` once nothing is still moving — it never sits
+in `IN_PROGRESS` waiting for a transfer that will never exist. `jobs` shows both the
+files that arrived and the ones that were refused.
+
 ### Job states
 
 | State | Meaning | Next action |
@@ -179,6 +185,11 @@ provenance soulseek clear-completed       # slskd's records only; job history st
 
 `retry --another-source` picks the next ranked alternate from the candidates
 stored with the job, so a dead peer does not require a new search.
+
+`position` reports what the peer actually answered. slskd replies with the updated
+transfer record, so a peer that has not reported a place yet shows nothing instead of
+a misleading `0`; a failed probe is not rate-limited, so a transient error does not
+cost the next attempt.
 
 ### Restart recovery
 
@@ -219,8 +230,15 @@ Verification before `IMPORTED`:
 - the file is non-empty and re-hashed,
 - the run manifest is written, and `manifest.VerifyCaptureDir` accepts it.
 
+A job is imported only when **every** non-refused item is present on disk: a
+partially-arrived job is refused with the missing file names rather than archived as
+if it were complete. Two files with the same name in different folders keep separate
+capture identities.
+
 `IMPORT_FAILED` leaves the staging copy exactly as it was. `--cleanup` deletes it
 **only after** a verified import, and only then clears the slskd transfer record.
+When `--cleanup` is not passed, the stored `--cleanup-staging` preference applies,
+so `ingest`, `watch` and `webhook-listen` behave the same way.
 
 A file slskd renamed on a collision (`FileService.MoveFile` appends `_{ticks}`
 before the extension) is found and imported.
@@ -260,6 +278,9 @@ Defaults that follow from that:
   SSH keys and credential files.
 - Mount the share root `:ro` into slskd, and never mount `/` or a home directory
   into it.
+- Re-adding a folder **prunes** links for files that no longer exist, so deleting a
+  file from a shared collection stops it being advertised; linking alone would have
+  left it shared indefinitely.
 
 `shares status` warns when rules are active but slskd reports zero files, which is
 what `flags.no_share_scan: true` (`#1663`) or a failed scan looks like from here.
