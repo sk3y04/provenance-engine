@@ -91,20 +91,32 @@ func Summarize(transfers []Transfer) UploadSummary {
 	var sum UploadSummary
 	for _, t := range transfers {
 		sum.Bytes += t.Transferred
+		terminal, succeeded := transferOutcome(t.State)
 		switch {
 		case isQueuedLocally(t.State):
 			sum.Queued++
-		case strings.Contains(strings.ToLower(t.State), "inprogress") || strings.Contains(strings.ToLower(t.State), "initializing"):
-			sum.Active++
-		case func() bool { terminal, ok := transferOutcome(t.State); return terminal && ok }():
+		case terminal && succeeded:
 			sum.Completed++
-		case func() bool { terminal, _ := transferOutcome(t.State); return terminal }():
+		case terminal:
 			sum.Failed++
+		case movingState(t.State):
+			sum.Active++
 		default:
 			sum.Queued++
 		}
 	}
 	return sum
+}
+
+// movingState reports the slskd states that mean bytes are moving right now.
+func movingState(state string) bool {
+	for _, part := range transferStates(state) {
+		switch strings.ToLower(part) {
+		case "inprogress", "initializing":
+			return true
+		}
+	}
+	return false
 }
 
 // Cancel stops one upload; remove additionally drops the record.

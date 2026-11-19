@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func newTestJob(t *testing.T, id string) Job {
@@ -272,5 +271,3 @@ func TestNewJobIDShape(t *testing.T) {
 		seen[id] = true
 	}
 }
-
-var _ = time.Now

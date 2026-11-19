@@ -399,6 +399,12 @@ func (m *ShareManager) Add(ctx context.Context, source, alias string) (ShareRule
 		}
 		linked++
 	}
+	// A re-add must stop sharing what was deleted from the source: linking only
+	// ever adds, so a stale link would stay advertised by slskd indefinitely.
+	if _, err := pruneStaleLinks(dest, preview.Files); err != nil {
+		return ShareRule{}, preview, err
+	}
+	linked = len(preview.Files)
 	if err := m.auditTree(dest); err != nil {
 		return ShareRule{}, preview, err
 	}
@@ -481,6 +487,53 @@ func (m *ShareManager) Audit() (AuditResult, error) {
 		return AuditResult{}, errors.New("curated share root is not configured")
 	}
 	return auditShareRoot(m.Root)
+}
+
+// pruneStaleLinks removes every materialised entry that is no longer part of the
+// preview, including a symlink somebody planted, and then the directories it
+// emptied. It removes entries (Lstat semantics), never their targets.
+func pruneStaleLinks(dest string, keep []ShareFile) (int, error) {
+	keepSet := make(map[string]bool, len(keep))
+	for _, f := range keep {
+		keepSet[filepath.ToSlash(f.RelPath)] = true
+	}
+	removed := 0
+	var dirs []string
+	err := filepath.WalkDir(dest, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dest, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			dirs = append(dirs, path)
+			return nil
+		}
+		if keepSet[filepath.ToSlash(rel)] {
+			return nil
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		removed++
+		return nil
+	})
+	if err != nil {
+		return removed, fmt.Errorf("prune stale share links: %w", err)
+	}
+	// Deepest first, so a parent is only considered once its children are gone.
+	sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
+	for _, d := range dirs {
+		if entries, err := os.ReadDir(d); err == nil && len(entries) == 0 {
+			_ = os.Remove(d)
+		}
+	}
+	return removed, nil
 }
 
 func (m *ShareManager) auditTree(dest string) error {

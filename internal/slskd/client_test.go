@@ -70,6 +70,29 @@ func TestClientURLBaseJoining(t *testing.T) {
 	}
 }
 
+// TestClientBaseURLPathIsNotDoubled covers a profile that puts the reverse-proxy
+// prefix in the base URL instead of urlBase: the prefix must be used once, and
+// combined with urlBase only when they differ.
+func TestClientBaseURLPathIsNotDoubled(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		writeJSON(w, 200, map[string]any{"state": "None"})
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{BaseURL: srv.URL + "/slskd/", APIKey: "k"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := c.GetServer(context.Background()); err != nil {
+		t.Fatalf("GetServer: %v", err)
+	}
+	if gotPath != "/slskd/api/v0/server" {
+		t.Fatalf("path = %q, want /slskd/api/v0/server", gotPath)
+	}
+}
+
 // TestClientRejectsMalformedBaseURL keeps an obvious configuration mistake from
 // turning into a confusing transport error at call time.
 func TestClientRejectsMalformedBaseURL(t *testing.T) {

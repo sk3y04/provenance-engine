@@ -236,11 +236,21 @@ type Transfer struct {
 	PercentComplete float64    `json:"percentComplete"`
 }
 
-// QueuePosition is the per-transfer place-in-queue probe.
+// QueuePosition is the result of the per-transfer place-in-queue probe.
+//
+// slskd answers that endpoint with the updated Transfer record, not a bare
+// number, so the place arrives in placeInQueue. Decoding a `position` field would
+// succeed and silently always read zero.
 type QueuePosition struct {
-	Position int    `json:"position"`
-	Username string `json:"username,omitempty"`
-	Filename string `json:"filename,omitempty"`
+	// Position is the peer's reported place in its queue; meaningless unless
+	// Known is true.
+	Position int
+	// Known reports whether the peer has answered.
+	Known bool
+	// State is the transfer state as slskd reports it after the probe.
+	State    string
+	Username string
+	Filename string
 }
 
 // transferStates splits a composite state string ("Completed, TimedOut") into a

@@ -2,7 +2,6 @@ package slskd
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -362,5 +361,3 @@ func TestShareAddRejectsEmptyShare(t *testing.T) {
 		t.Fatal("empty share accepted")
 	}
 }
-
-var _ = errors.Is

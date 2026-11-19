@@ -138,8 +138,8 @@ func TestSettingsValidation(t *testing.T) {
 	if err := s.Validate(); err != nil {
 		t.Fatalf("valid profile rejected: %v", err)
 	}
-	if err := s.ValidateForTest(); err != nil {
-		t.Fatalf("ValidateForTest rejected a valid profile: %v", err)
+	if err := s.ValidateConnection(); err != nil {
+		t.Fatalf("ValidateConnection rejected a valid profile: %v", err)
 	}
 }
 

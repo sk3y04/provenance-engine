@@ -141,8 +141,10 @@ func (s Settings) Validate() error {
 	return nil
 }
 
-// ValidateForTest is Validate plus the path checks a Test Connection needs.
-func (s Settings) ValidateForTest() error {
+// ValidateConnection checks a profile is usable for a connection attempt. It is
+// looser than Validate: a disabled profile may still be tested, and no filesystem
+// path is required to ask slskd whether it is reachable.
+func (s Settings) ValidateConnection() error {
 	if err := s.Validate(); err != nil {
 		return err
 	}
@@ -157,8 +159,12 @@ func (s Settings) ValidateForTest() error {
 
 // Masked returns a copy with both secrets replaced by MaskSentinel.
 func (s Settings) Masked() Settings {
-	s.APIKey = MaskSentinel
-	s.WebhookSecret = MaskSentinel
+	if s.APIKey != "" {
+		s.APIKey = MaskSentinel
+	}
+	if s.WebhookSecret != "" {
+		s.WebhookSecret = MaskSentinel
+	}
 	return s
 }
 

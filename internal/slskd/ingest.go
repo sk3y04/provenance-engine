@@ -12,6 +12,8 @@ package slskd
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,8 +84,18 @@ func (i *Ingestor) Ingest(ctx context.Context, job Job) (Job, error) {
 	if err != nil {
 		return i.failImport(job, err)
 	}
-	if len(found) == 0 {
-		return i.failImport(job, fmt.Errorf("no downloaded files found under %s", dir))
+	expected := 0
+	for _, it := range job.Items {
+		if !it.Rejected {
+			expected++
+		}
+	}
+	if expected == 0 {
+		return i.failImport(job, errors.New("every file in this job was refused by slskd; nothing to import"))
+	}
+	if len(found) != expected {
+		return i.failImport(job, fmt.Errorf("%d of %d downloaded file(s) are not on disk under %s: %s",
+			expected-len(found), expected, dir, strings.Join(missingItems(job, found), ", ")))
 	}
 
 	importRoot := i.ImportRoot
@@ -102,6 +114,13 @@ func (i *Ingestor) Ingest(ctx context.Context, job Job) (Job, error) {
 		Options:      manifest.CaptureOptions{OutputDir: importRoot},
 	}
 
+	// Count basenames first: a job can carry the same track name from two
+	// folders, and a shared capture identity would silently merge them.
+	baseCounts := make(map[string]int, len(job.Items))
+	for _, it := range job.Items {
+		baseCounts[RemoteBaseName(it.RemoteFilename)]++
+	}
+
 	items := make([]manifest.CaptureItem, 0, len(found))
 	hashes := make(map[string]string, len(found))
 	for _, f := range found {
@@ -114,7 +133,7 @@ func (i *Ingestor) Ingest(ctx context.Context, job Job) (Job, error) {
 			return i.failImport(job, fmt.Errorf("file %s is outside the import root %s", f.Path, importRoot))
 		}
 		it := manifest.CaptureItem{
-			ExternalID:     job.ID + ":" + RemoteBaseName(f.Item.RemoteFilename),
+			ExternalID:     captureExternalID(job.ID, f.Item.RemoteFilename, baseCounts),
 			URL:            soulseekFileURL(job, f.Item.RemoteFilename),
 			Title:          RemoteBaseName(f.Item.RemoteFilename),
 			Author:         job.Peer,
@@ -135,8 +154,10 @@ func (i *Ingestor) Ingest(ctx context.Context, job Job) (Job, error) {
 	capture.Items = items
 
 	// The run manifest is the commit point: archive import reads runs/*.json, and
-	// items alone are invisible to it.
-	runPath := manifest.RunPath(importRoot)
+	// items alone are invisible to it. It is named after the job because
+	// manifest.RunPath has one-second granularity, and two jobs finishing in the
+	// same second would otherwise overwrite one capture.
+	runPath := uniqueRunPath(importRoot, job.ID)
 	if err := manifest.WriteCaptureManifest(importRoot, runPath, capture); err != nil {
 		return i.failImport(job, fmt.Errorf("write capture manifest: %w", err))
 	}
@@ -177,8 +198,9 @@ func (i *Ingestor) Ingest(ctx context.Context, job Job) (Job, error) {
 				j.Items[k].ByteSize = f.Size
 				j.Items[k].Sha256 = hashes[f.Item.RemoteFilename]
 				j.Items[k].FailureReason = ""
-				// The capture item path is deterministic per job and file.
-				j.Items[k].CaptureItem = manifest.ItemPath(importRoot, job.ID+":"+RemoteBaseName(f.Item.RemoteFilename))
+				// The capture item path is deterministic per job and file, and
+				// uses the same identity the manifest item was written with.
+				j.Items[k].CaptureItem = manifest.ItemPath(importRoot, captureExternalID(job.ID, f.Item.RemoteFilename, baseCounts))
 			}
 		}
 	})
@@ -187,7 +209,7 @@ func (i *Ingestor) Ingest(ctx context.Context, job Job) (Job, error) {
 	}
 
 	if i.Cleanup {
-		cleaned, err := i.cleanup(ctx, imported)
+		cleaned, err := i.cleanup(ctx, imported, found)
 		if err != nil {
 			// A failed cleanup must not downgrade a verified import; it is
 			// reported as a warning on the job instead.
@@ -238,18 +260,20 @@ func (i *Ingestor) destinationDir(job Job) (string, error) {
 	return abs, nil
 }
 
-// locate finds the on-disk file for each item. slskd renames on collision by
-// appending "_{ticks}" before the extension, so a strict basename match is not
-// enough.
+// stagedFile is one regular file found under the pinned destination.
+type stagedFile struct {
+	rel  string // slash-separated path relative to the destination
+	size int64
+}
+
+// locate finds the on-disk file for each item.
+//
+// slskd preserves the remote folder layout under the pinned destination, but the
+// exact root differs (it may strip a peer-prefixed first segment), and it renames
+// on collision by appending "_{ticks}". Matching therefore walks from the most
+// specific interpretation to the least, and never assigns one file to two items.
 func (i *Ingestor) locate(job Job, dir string) ([]LocatedFile, error) {
-	// A staged file may sit in a nested directory: slskd preserves the remote
-	// folder layout under the pinned destination. Match on the basename but keep
-	// the relative path, or a nested file is read from the wrong location.
-	type staged struct {
-		rel  string
-		size int64
-	}
-	files := map[string]staged{}
+	var staged []stagedFile
 	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -273,54 +297,117 @@ func (i *Ingestor) locate(job Job, dir string) ([]LocatedFile, error) {
 		if err != nil {
 			return err
 		}
-		files[d.Name()] = staged{rel: rel, size: info.Size()}
+		staged = append(staged, stagedFile{rel: filepath.ToSlash(rel), size: info.Size()})
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("enumerate %s: %w", dir, err)
 	}
+	// Deterministic order: two candidates can match the same preference, and a
+	// map iteration would pick a different one each run.
+	sort.Slice(staged, func(a, b int) bool { return staged[a].rel < staged[b].rel })
 
 	out := make([]LocatedFile, 0, len(job.Items))
+	used := make(map[string]bool, len(staged))
 	for _, it := range job.Items {
-		name := RemoteBaseName(it.RemoteFilename)
-		match, ok := matchStagedFile(files, name)
+		if it.Rejected {
+			continue
+		}
+		want := strings.TrimPrefix(filepath.ToSlash(normalizeSep(it.RemoteFilename)), "/")
+		match, ok := pickStaged(staged, want, used)
 		if !ok {
 			continue
 		}
+		name := RemoteBaseName(it.RemoteFilename)
 		if it.Size > 0 && match.size != it.Size {
 			return nil, fmt.Errorf("file %s is %d bytes on disk but slskd reported %d", name, match.size, it.Size)
 		}
 		if match.size == 0 {
 			return nil, fmt.Errorf("file %s is empty on disk", name)
 		}
-		out = append(out, LocatedFile{Item: it, Path: filepath.Join(dir, match.rel), Size: match.size})
+		used[match.rel] = true
+		out = append(out, LocatedFile{Item: it, Path: filepath.Join(dir, filepath.FromSlash(match.rel)), Size: match.size})
 	}
 	return out, nil
 }
 
-// matchStagedFile finds the staged file for an expected basename, accepting the
-// "_{ticks}" collision suffix slskd's FileService.MoveFile adds.
-func matchStagedFile[T any](files map[string]T, name string) (T, bool) {
-	var zero T
-	if v, ok := files[name]; ok {
-		return v, true
+// pickStaged resolves one remote path against the staged files.
+func pickStaged(staged []stagedFile, want string, used map[string]bool) (stagedFile, bool) {
+	for _, f := range staged {
+		if !used[f.rel] && f.rel == want {
+			return f, true
+		}
 	}
-	ext := strings.ToLower(filepath.Ext(name))
-	stem := strings.TrimSuffix(name, filepath.Ext(name))
-	for candidate, v := range files {
-		cExt := strings.ToLower(filepath.Ext(candidate))
-		cStem := strings.TrimSuffix(candidate, filepath.Ext(candidate))
-		if cExt != ext {
+	for _, f := range staged {
+		if !used[f.rel] && strings.HasSuffix(f.rel, "/"+want) {
+			return f, true
+		}
+	}
+	segs := strings.Split(want, "/")
+	for n := len(segs) - 1; n >= 1; n-- {
+		tail := strings.Join(segs[len(segs)-n:], "/")
+		for _, f := range staged {
+			if used[f.rel] {
+				continue
+			}
+			if f.rel == tail || strings.HasSuffix(f.rel, "/"+tail) {
+				return f, true
+			}
+		}
+	}
+	base := segs[len(segs)-1]
+	for _, f := range staged {
+		if used[f.rel] {
 			continue
 		}
-		if tiedSuffix.MatchString(cStem) && strings.HasPrefix(cStem, stem) {
-			return v, true
-		}
-		if tiedSuffix.MatchString(candidate) && strings.HasPrefix(candidate, name) {
-			return v, true
+		if ticksMatch(filepath.Base(filepath.FromSlash(f.rel)), base) {
+			return f, true
 		}
 	}
-	return zero, false
+	return stagedFile{}, false
+}
+
+// ticksMatch accepts the "_{ticks}" rename slskd applies on a name collision.
+func ticksMatch(candidate, want string) bool {
+	if candidate == want {
+		return true
+	}
+	ext := filepath.Ext(want)
+	if filepath.Ext(candidate) != ext {
+		return false
+	}
+	stem := strings.TrimSuffix(want, ext)
+	cStem := strings.TrimSuffix(candidate, ext)
+	return strings.HasPrefix(cStem, stem) && tiedSuffix.MatchString(cStem)
+}
+
+// captureExternalID is stable per job and file. A basename that appears more than
+// once in the job gets a short digest of its remote path, so two albums with the
+// same track name do not share one capture identity.
+func captureExternalID(jobID, remote string, counts map[string]int) string {
+	base := RemoteBaseName(remote)
+	if counts[base] > 1 {
+		sum := sha256.Sum256([]byte(normalizeSep(remote)))
+		ext := filepath.Ext(base)
+		base = strings.TrimSuffix(base, ext) + "-" + hex.EncodeToString(sum[:3]) + ext
+	}
+	return jobID + ":" + base
+}
+
+// missingItems names the items locate could not satisfy.
+func missingItems(job Job, found []LocatedFile) []string {
+	present := make(map[string]bool, len(found))
+	for _, f := range found {
+		present[f.Item.RemoteFilename] = true
+	}
+	var missing []string
+	for _, it := range job.Items {
+		if it.Rejected || present[it.RemoteFilename] {
+			continue
+		}
+		missing = append(missing, RemoteBaseName(it.RemoteFilename))
+	}
+	return missing
 }
 
 // tiedSuffix matches the "_{ticks}" rename slskd applies on a collision.
@@ -354,14 +441,43 @@ func (i *Ingestor) storeUpdate(job Job, mutate func(*Job)) (Job, error) {
 // AttachStore wires the ingestor to a job store.
 func (i *Ingestor) AttachStore(s *JobStore) { i.store = s }
 
-// cleanup deletes the staging copy of a verified import.
-func (i *Ingestor) cleanup(ctx context.Context, job Job) (Job, error) {
-	dir, err := i.destinationDir(job)
+// uniqueRunPath keeps the chronological run name and adds the job id.
+func uniqueRunPath(root, jobID string) string {
+	base := manifest.RunPath(root)
+	return strings.TrimSuffix(base, ".json") + "-" + jobID + ".json"
+}
+
+// cleanup deletes the files this job imported, then the directories they emptied.
+// It never removes the destination wholesale: a custom destination can be shared
+// with another job, and deleting bytes this job did not import is not recoverable.
+func (i *Ingestor) cleanup(ctx context.Context, job Job, found []LocatedFile) (Job, error) {
+	dest, err := i.destinationDir(job)
 	if err != nil {
 		return job, err
 	}
-	if err := os.RemoveAll(dir); err != nil {
-		return job, err
+	dirs := make(map[string]bool, len(found)+1)
+	for _, f := range found {
+		if _, err := ensurePathIsInside(i.Mount, f.Path); err != nil {
+			return job, err
+		}
+		if err := os.Remove(f.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return job, err
+		}
+		dirs[filepath.Dir(f.Path)] = true
+	}
+	dirs[dest] = true
+	list := make([]string, 0, len(dirs))
+	for d := range dirs {
+		list = append(list, d)
+	}
+	// Deepest first: a parent is only considered once its children are gone.
+	sort.Slice(list, func(a, b int) bool {
+		return strings.Count(list[a], string(os.PathSeparator)) > strings.Count(list[b], string(os.PathSeparator))
+	})
+	for _, d := range list {
+		if entries, rerr := os.ReadDir(d); rerr == nil && len(entries) == 0 {
+			_ = os.Remove(d)
+		}
 	}
 	if i.Client != nil {
 		for _, it := range job.Items {
@@ -423,15 +539,4 @@ func kindForExtension(name string) string {
 	default:
 		return "binary"
 	}
-}
-
-// SortedNames is a small helper used by the CLI to render a job's files in a
-// stable order.
-func SortedNames(items []Item) []string {
-	out := make([]string, 0, len(items))
-	for _, it := range items {
-		out = append(out, RemoteBaseName(it.RemoteFilename))
-	}
-	sort.Strings(out)
-	return out
 }

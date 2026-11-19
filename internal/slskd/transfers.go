@@ -177,11 +177,10 @@ func (r *Reconciler) Enqueue(ctx context.Context, req EnqueueRequest) (*EnqueueR
 			j.BatchID = resp.Batch.ID
 		}
 		applyBatchTransfers(j, resp)
-		if len(resp.Failures) > 0 && len(resp.Failures) == len(j.Items) {
-			j.Status = JobFailed
-			j.FailureReason = firstFailure(resp.Failures)
-		} else {
-			j.Status = JobInProgress
+		applyBatchFailures(j, resp.Failures)
+		j.Status = jobStatusFromItems(j)
+		if j.Status == JobFailed {
+			j.FailureReason = failureSummary(j)
 		}
 		return nil
 	})
@@ -256,12 +255,11 @@ func (r *Reconciler) Poll(ctx context.Context) ([]Job, error) {
 // applyTransfers folds one transfer listing into one job.
 func (r *Reconciler) applyTransfers(job Job, transfers []Transfer) (Job, error) {
 	matched := matchTransfers(job, transfers)
-	if len(matched) == 0 && job.Status == JobQueued {
-		// No transfer record yet: slskd accepted the batch but has not created
-		// the transfers. Nothing to learn, nothing to fail.
-		return job, nil
-	}
 	if len(matched) == 0 {
+		// No transfer record: either slskd accepted the batch and has not created
+		// the transfers yet, or its retention dropped them. Either way there is
+		// nothing to fold in and nothing to fail here (recovery owns the second
+		// case).
 		return job, nil
 	}
 	return r.store.Update(job.ID, func(j *Job) error {
@@ -283,31 +281,102 @@ func (r *Reconciler) applyTransfers(job Job, transfers []Transfer) (Job, error) 
 				}
 			}
 		}
-		// Recount from the recorded item state rather than from this listing:
-		// a transfer slskd already dropped must not silently reset progress.
-		succeeded, failed := 0, 0
-		for _, it := range j.Items {
-			if terminal, ok := transferOutcome(it.State); terminal {
-				if ok {
-					succeeded++
-				} else {
-					failed++
-				}
-			}
-		}
-		switch {
-		case len(j.Items) > 0 && succeeded == len(j.Items):
-			j.Status = JobCompletedPendingImport
-		case len(j.Items) > 0 && failed == len(j.Items):
-			j.Status = JobFailed
-			j.FailureReason = firstReason
-		default:
-			if j.Status == JobQueued || j.Status == JobInterrupted {
-				j.Status = JobInProgress
+		// Derive the status from the recorded item states, never from this
+		// listing alone: a transfer slskd already dropped must not silently reset
+		// progress, and a file refused at enqueue has no transfer at all.
+		j.Status = jobStatusFromItems(j)
+		if j.Status == JobFailed {
+			if summary := failureSummary(j); summary != "" {
+				j.FailureReason = summary
+			} else if firstReason != "" {
+				j.FailureReason = firstReason
 			}
 		}
 		return nil
 	})
+}
+
+// applyBatchFailures marks the files slskd refused in a partial (207) batch.
+// Without the marker such a file has no transfer and no state, so the job would
+// wait for it forever.
+func applyBatchFailures(j *Job, failures []EnqueueBatchFailure) {
+	if len(failures) == 0 {
+		return
+	}
+	byName := make(map[string]string, len(failures))
+	for _, f := range failures {
+		byName[itemKey(f.Filename)] = f.Message
+	}
+	for i := range j.Items {
+		msg, ok := byName[itemKey(j.Items[i].RemoteFilename)]
+		if !ok {
+			continue
+		}
+		j.Items[i].Rejected = true
+		if strings.TrimSpace(msg) == "" {
+			msg = "no reason given"
+		}
+		j.Items[i].FailureReason = "slskd refused this file: " + msg
+	}
+}
+
+func itemKey(remote string) string { return strings.ToLower(normalizeSep(remote)) }
+
+// jobStatusFromItems derives one status from every item's recorded state. It is
+// the single place that decides when a job is finished, so a partial batch, a
+// terminal failure and a completed job cannot disagree with each other.
+func jobStatusFromItems(j *Job) JobStatus {
+	if len(j.Items) == 0 {
+		return JobQueued
+	}
+	succeeded, failed, pending := 0, 0, 0
+	for _, it := range j.Items {
+		if it.Rejected {
+			failed++
+			continue
+		}
+		terminal, ok := transferOutcome(it.State)
+		switch {
+		case terminal && ok:
+			succeeded++
+		case terminal:
+			failed++
+		default:
+			pending++
+		}
+	}
+	switch {
+	case succeeded == len(j.Items):
+		return JobCompletedPendingImport
+	case failed == len(j.Items):
+		return JobFailed
+	case pending == 0 && succeeded > 0:
+		// Everything has settled but some files failed: finished, with a partial
+		// result the user has to see.
+		return JobFailed
+	default:
+		return JobInProgress
+	}
+}
+
+// failureSummary names every failed file and why, for the job record.
+func failureSummary(j *Job) string {
+	var parts []string
+	for _, it := range j.Items {
+		name := RemoteBaseName(it.RemoteFilename)
+		switch {
+		case it.Rejected:
+			parts = append(parts, name+": "+it.FailureReason)
+		default:
+			if failed, reason := terminalFailure(it.State); failed {
+				parts = append(parts, name+": "+reason)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "; ")
 }
 
 // matchTransfers correlates transfers with a job, preferring the pinned batch id
@@ -456,7 +525,6 @@ func (r *Reconciler) QueuePosition(ctx context.Context, jobID string) (map[strin
 		r.posMu.Unlock()
 		return nil, ErrPositionThrottled
 	}
-	r.posLast[jobID] = r.now()
 	r.posMu.Unlock()
 
 	out := map[string]int{}
@@ -468,13 +536,18 @@ func (r *Reconciler) QueuePosition(ctx context.Context, jobID string) (map[strin
 		if err != nil {
 			continue
 		}
-		if pos != nil {
+		if pos != nil && pos.Known {
 			out[it.RemoteFilename] = pos.Position
 		}
 	}
 	if len(out) == 0 {
+		// A failed probe costs nothing: the interval exists to spare the peer,
+		// not to lock a user out of retrying a transient error.
 		return nil, errors.New("no queue position is available yet")
 	}
+	r.posMu.Lock()
+	r.posLast[jobID] = r.now()
+	r.posMu.Unlock()
 	return out, nil
 }
 

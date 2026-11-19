@@ -9,6 +9,7 @@ package slskd
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,10 @@ import (
 // configuration supports custom headers, so the secret travels as its own header
 // rather than in a URL, where it would be logged by every proxy on the way.
 const WebhookHeader = "X-Provenance-Webhook-Secret"
+
+// maxWebhookBody bounds a delivery: slskd's payloads are tiny, so a large body is
+// either a bug or an attack.
+const maxWebhookBody = 64 << 10
 
 // Webhook event types that matter here.
 const (
@@ -84,15 +89,21 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	got := r.Header.Get(WebhookHeader)
-	// Constant-time comparison: a length leak is enough to guess a secret one
-	// byte at a time.
-	if subtle.ConstantTimeCompare([]byte(got), []byte(h.Secret)) != 1 {
+	// Compare digests, not the raw strings: ConstantTimeCompare returns 0 for
+	// different lengths, which leaks the secret's length to an attacker.
+	gotDigest := sha256.Sum256([]byte(got))
+	wantDigest := sha256.Sum256([]byte(h.Secret))
+	if subtle.ConstantTimeCompare(gotDigest[:], wantDigest[:]) != 1 {
 		http.Error(w, "invalid webhook secret", http.StatusUnauthorized)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxWebhookBody+1))
 	if err != nil {
 		http.Error(w, "unreadable body", http.StatusBadRequest)
+		return
+	}
+	if int64(len(body)) > maxWebhookBody {
+		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	var payload WebhookPayload

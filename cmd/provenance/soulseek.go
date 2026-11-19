@@ -138,7 +138,10 @@ func soulseekSettingsCmd() *cobra.Command {
 			}
 			// Accept the masked value back without erasing the stored secret.
 			update = update.KeepSecrets(stored)
-			if err := update.Validate(); err != nil {
+			// Validate the effective profile: a headless deployment supplies the
+			// key through PROVENANCE_SLSKD_API_KEY and must be able to enable the
+			// integration without writing a secret to disk.
+			if err := update.WithEnv().Validate(); err != nil {
 				return err
 			}
 			if err := slskd.SaveSettings(path, update); err != nil {
@@ -243,7 +246,7 @@ func slskdClient(ctx context.Context) (*slskd.Client, slskd.Settings, error) {
 	if !s.Enabled {
 		return nil, s, errors.New("the slskd integration is disabled; run `provenance soulseek settings set --enable`")
 	}
-	if err := s.ValidateForTest(); err != nil {
+	if err := s.ValidateConnection(); err != nil {
 		return nil, s, err
 	}
 	c, err := slskd.New(s.ClientConfig())

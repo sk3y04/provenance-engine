@@ -73,7 +73,8 @@ func (s *transferServer) handler() http.Handler {
 			writeJSON(w, 200, list)
 
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/position"):
-			writeJSON(w, 200, map[string]any{"position": 7})
+			place := 7
+			writeJSON(w, 200, map[string]any{"id": "t1", "placeInQueue": place, "state": "Queued, Remotely"})
 
 		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/transfers/downloads/"):
 			s.mu.Lock()

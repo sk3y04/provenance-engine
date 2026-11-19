@@ -492,12 +492,17 @@ func (c *Client) CancelDownload(ctx context.Context, username, id string, remove
 // QueuePosition asks the peer for this transfer's place in its queue. It is
 // rate-limited per transfer by the caller.
 func (c *Client) QueuePosition(ctx context.Context, username, id string) (*QueuePosition, error) {
-	var p QueuePosition
+	var t Transfer
 	path := "/api/v0/transfers/downloads/" + url.PathEscape(username) + "/" + url.PathEscape(id) + "/position"
-	if err := c.get(ctx, "queue position", c.timeout(c.cfg.TransferTimeout, DefaultTransferTimeout), path, nil, &p); err != nil {
+	if err := c.get(ctx, "queue position", c.timeout(c.cfg.TransferTimeout, DefaultTransferTimeout), path, nil, &t); err != nil {
 		return nil, err
 	}
-	return &p, nil
+	p := &QueuePosition{State: t.State, Username: username, Filename: t.Filename}
+	if t.PlaceInQueue != nil {
+		p.Position = *t.PlaceInQueue
+		p.Known = true
+	}
+	return p, nil
 }
 
 // ClearCompletedDownloads removes every completed download record.

@@ -20,6 +20,7 @@ const (
 	DefaultSearchSettleGrace = 5 * time.Second
 	DefaultPollInitial       = time.Second
 	DefaultPollMax           = 3 * time.Second
+	stoppedFetchTimeout      = 5 * time.Second
 )
 
 // SearchOptions configures one search.
@@ -72,19 +73,6 @@ type SearchResult struct {
 	RawFileCount    int
 	LockedFileCount int
 	Groups          []ResultGroup
-}
-
-// PeerUsernames returns the peers in ranked order.
-func (r *SearchResult) PeerUsernames() []string {
-	out := make([]string, 0, len(r.Groups))
-	seen := map[string]bool{}
-	for _, g := range r.Groups {
-		if !seen[g.Username] {
-			seen[g.Username] = true
-			out = append(out, g.Username)
-		}
-	}
-	return out
 }
 
 // SearchCoordinator runs searches one at a time.
@@ -210,6 +198,18 @@ func (sc *SearchCoordinator) Search(ctx context.Context, opts SearchOptions) (*S
 				poll = opts.PollMax
 			}
 		}
+	}
+
+	if result.Stopped {
+		// The poll that preceded the stop cannot have seen responses that
+		// arrived after it. Fetch once more with a detached context so a stopped
+		// search still reports what the peers sent instead of discarding the
+		// final window.
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stoppedFetchTimeout)
+		if final, ferr := sc.client.GetSearch(fetchCtx, searchID, true); ferr == nil && final != nil {
+			current = final
+		}
+		cancel()
 	}
 
 	result.RawFileCount = current.FileCount

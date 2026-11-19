@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -173,13 +175,22 @@ func (h *Health) applyOptionWarnings(opts *Options) {
 		})
 	}
 	if perm := strings.TrimSpace(opts.Transfers.Download.Destination.Permissions.Mode); perm != "" {
-		if !strings.ContainsAny(perm, "15") || strings.Contains(perm, "6") || strings.Contains(perm, "7") && !strings.Contains(perm, "5") {
-			// 666/777-style modes make album directories untraversable or
-			// world-writable; the contract calls for execute-preserving 755/775.
-			if perm == "666" || perm == "777" || perm == "600" {
+		if mode, perr := strconv.ParseUint(perm, 8, 32); perr == nil {
+			bits := os.FileMode(mode)
+			switch {
+			case bits&0o111 == 0:
+				// 644/600/666: no execute bit, so the album directories slskd
+				// creates cannot be traversed by the peer.
 				h.Warnings = append(h.Warnings, Warning{
 					Code:    "#1760",
-					Message: fmt.Sprintf("slskd transfers.download.destination.permissions.mode is %q; without the execute bit album directories cannot be traversed. Use 755 or 775.", perm),
+					Message: fmt.Sprintf("slskd transfers.download.destination.permissions.mode is %q with no execute bit; downloaded album directories cannot be traversed. Use 755 or 775.", perm),
+				})
+			case bits&0o002 != 0:
+				// World-writable: anything on the host can rewrite files a peer is
+				// serving.
+				h.Warnings = append(h.Warnings, Warning{
+					Code:    "#1760",
+					Message: fmt.Sprintf("slskd transfers.download.destination.permissions.mode is %q, which is world-writable. Use 755 or 775.", perm),
 				})
 			}
 		}
@@ -209,7 +220,7 @@ func checkPaths(paths HealthPaths) []string {
 			diags = append(diags, fmt.Sprintf("%s %s is not readable: %v", label, p, err))
 			return
 		}
-		if _, err := f.Readdirnames(1); err != nil && !errors.Is(err, os.ErrNotExist) && err.Error() != "EOF" {
+		if _, err := f.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
 			diags = append(diags, fmt.Sprintf("%s %s cannot be listed: %v", label, p, err))
 		}
 		_ = f.Close()
@@ -230,12 +241,18 @@ func CheckSettingsHealth(ctx context.Context, s Settings) Health {
 			Diagnostics: []string{"the slskd integration is disabled; enable it in settings before testing the connection"},
 		}
 	}
-	if err := s.ValidateForTest(); err != nil {
+	if err := s.ValidateConnection(); err != nil {
 		return Health{State: HealthAuthOrConfig, CheckedAt: time.Now().UTC(), Diagnostics: []string{err.Error()}}
 	}
 	c, err := New(s.ClientConfig())
 	if err != nil {
-		return Health{State: HealthAuthOrConfig, CheckedAt: time.Now().UTC(), Diagnostics: []string{c.Redact(err.Error())}}
+		// New failed, so there is no client to redact with; redact the profile's
+		// own secrets instead. Reaching through the nil client here panicked.
+		return Health{
+			State:       HealthAuthOrConfig,
+			CheckedAt:   time.Now().UTC(),
+			Diagnostics: []string{Redact([]string{s.APIKey, s.WebhookSecret}, err.Error())},
+		}
 	}
 	return CheckHealth(ctx, c, paths)
 }

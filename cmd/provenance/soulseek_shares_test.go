@@ -132,3 +132,14 @@ func TestSoulseekSharesRequireConfiguredRoot(t *testing.T) {
 		t.Fatal("shares list succeeded without a curated share root")
 	}
 }
+
+// TestSoulseekSettingsEnableWithEnvKey proves a headless profile can be enabled
+// without writing the key to disk: validation must consider the effective
+// configuration, not only the file.
+func TestSoulseekSettingsEnableWithEnvKey(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("PROVENANCE_SLSKD_API_KEY", "env-only-key")
+	if _, err := runSoulseek(t, "settings", "set", "--enable", "--base-url", "http://127.0.0.1:5030"); err != nil {
+		t.Fatalf("enabling with an env-supplied key failed: %v", err)
+	}
+}

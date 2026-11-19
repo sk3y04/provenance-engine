@@ -263,7 +263,7 @@ was written; a failure marks it IMPORT_FAILED and leaves the staged bytes
 untouched. --cleanup deletes the staging copy only after a verified import.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, settings, err := slskdClient(cmd.Context())
+			client, settings, err := slskdClient(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -275,12 +275,19 @@ untouched. --cleanup deletes the staging copy only after a verified import.`,
 			if err != nil {
 				return err
 			}
+			// The flag wins when given; otherwise honour the stored preference, so
+			// `ingest`, `watch` and `webhook-listen` agree on cleanup.
+			cleanup := settings.PostImportCleanup
+			if cmd.Flags().Changed("cleanup") {
+				cleanup = flagSlskdCleanup
+			}
 			ing := &slskd.Ingestor{
 				SlskdDownloadsRoot: settings.SlskdDownloadsRoot,
 				Mount:              settings.ProvenanceDownloadsMount,
 				VaultRoot:          flagSlskdVault,
 				Collection:         flagSlskdCollection,
-				Cleanup:            flagSlskdCleanup,
+				Cleanup:            cleanup,
+				Client:             client,
 			}
 			ing.AttachStore(store)
 			jobs, err := ing.IngestPending(cmd.Context(), store)

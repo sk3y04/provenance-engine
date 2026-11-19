@@ -83,10 +83,11 @@ type Item struct {
 	ByteSize      int64  `json:"byteSize,omitempty"`
 	CaptureItem   string `json:"captureItem,omitempty"`
 	FailureReason string `json:"failureReason,omitempty"`
+	// Rejected marks a file slskd refused at enqueue time (a 207 partial
+	// batch). Such a file never gets a transfer record, so without this marker
+	// the job would stay IN_PROGRESS forever waiting for one.
+	Rejected bool `json:"rejected,omitempty"`
 }
-
-// Succeeded reports whether this item's bytes are on disk and verified.
-func (i Item) Succeeded() bool { return i.Sha256 != "" }
 
 // Candidate is an alternative source for the same content, kept so "try another
 // source" does not need a fresh search.
@@ -133,6 +134,9 @@ func (j Job) Pending() bool { return !j.Status.Terminal() }
 // ActiveItem reports whether any item is still moving or not yet observed.
 func (j Job) ActiveItem() bool {
 	for _, it := range j.Items {
+		if it.Rejected {
+			continue
+		}
 		if it.State == "" {
 			return true
 		}
