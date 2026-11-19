@@ -1622,3 +1622,68 @@ Both queue directories were empty afterwards.
 
 BT-09b: priorities within an existing selection - which already-selected files fetch
 first, without changing what the capture contains.
+
+## BT-09b — Priorities within an immutable selection
+
+**Starting SHA** `f2402aa` (clean).
+
+### The persisted override
+
+`Entry.Priorities map[string]string` — path → `high`, absent = the default. It is
+written by `queue priority ENTRY_ID FILE normal|high` and read by the runner when it
+builds the request. `normal` deletes the key; an empty map is omitted from the record
+and from `queue list --json`, so cleared and never-set look identical.
+
+It is deliberately **not** part of `duplicateKey`, `JobKey`, the workspace id or the
+capture key: two entries with the same selection and different priorities are the same
+capture intent.
+
+### Pinned backend mapping
+
+| Provenance | pinned `anacrolix/torrent v1.62.0` |
+|------------|-----------------------------------|
+| `normal` (or absent) | `at.PiecePriorityNormal`, set by the existing `File.Download()` |
+| `high` | `at.PiecePriorityHigh`, set immediately after |
+| unselected file | `at.PiecePriorityNone` (unchanged) |
+
+Overrides are applied after every selected file is wanted and every unselected one is
+suppressed, so raising one file cannot re-want another. The observation point for the
+test is a hook that runs at exactly that moment, before payload requests begin.
+
+### Verified
+
+| test | result |
+|------|--------|
+| `TestQueuePriorityEditsOverrideNotSelection` | `high` persists as one override; `./alpha/a.bin` normalises and clears it; selection, desired, phase, seq, job id and workspace are unchanged; unselected path → `ErrSelectionNotSelected`; `urgent` → `ErrUsage`; traversal path → `ErrUsage`; unresolved entry → `ErrUsage`; completed entry → `ErrUsage` |
+| `TestQueuePriorityRefusedWhileRunnerOwnsQueue` | with ownership held, the edit returns `ErrRunnerActive` and the record (including `UpdatedAt`) is untouched; a competing `Run` is refused; the edit succeeds after release |
+| `TestFilePrioritiesReachBackendBeforeRequests` (bittorrent package) | a 96 KiB + 64 KiB selection over 16 KiB pieces (so a.bin's last piece is shared with b.bin): a.bin = high, b.bin = normal, unselected c.bin = none, before any payload request; both selected files are present afterwards and c.bin is never written; an override naming an unselected file is ignored and does not raise it |
+| `TestQueuePriorityReachesRequest` | the runner carries exactly `{alpha/a.bin: high}` into the real request, the fetch completes, both selected files are captured, the unselected neighbour is not fetched, and editing the completed entry is refused |
+| `TestQueuePrioritySurvivesInterrupt` | a 1 MiB × 2 fetch interrupted mid-transfer: job id, workspace and selection unchanged, override still `high`; explicit start, resume completes, both digests match, exactly **one** run manifest |
+| `TestQueuePriorityReAddAdoptsWithoutRefetch` | remove, re-add the same selection with a different priority: adopts the same capture key, payload digest unchanged, run count unchanged |
+
+CLI smoke: `priority <id> x/a.bin high` reports `selection unchanged: 2 files`;
+`x/c.bin` is refused as `not one of the 2 selected paths`; `normal` clears it and the
+override disappears from `queue list --json`.
+
+### Gates
+
+- `go test ./internal/torrentqueue/ ./internal/transfer/bittorrent/ -race -run
+  'TestQueuePriority|TestFilePriorities' -count=3`
+- `make test` (repo-wide, `-race`), `make lint`, `go vet ./...`, `git diff --check`
+- Results recorded with this entry.
+
+### Non-claims
+
+- **No ordering promise.** The tests prove the backend priority is set before requests
+  and that unselected files stay unrequested; they do not claim a high-priority file
+  finishes first, and no request-order measurement was made.
+- No live reprioritisation: edits are refused while a runner owns the queue, so a
+  running transfer never has its priorities changed underneath it.
+- No priority-based scheduling, no sequential mode, no selection import.
+- Priority is not part of the capture, so it cannot be used to distinguish two
+  captures; a different selection remains a different capture intent, unsolved here.
+
+### Next
+
+BT-09c or BT-10: adding files to an existing job must be an explicit new capture
+intent, not a third priority level.

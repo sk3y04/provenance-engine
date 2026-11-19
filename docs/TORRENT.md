@@ -765,6 +765,38 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
+### Download priorities inside a selection
+
+```
+provenance torrent queue priority queued-000001-ab12cd34 alpha/a.bin high
+provenance torrent queue priority queued-000001-ab12cd34 alpha/a.bin normal
+```
+
+`high` raises the piece priority of the pieces carrying an **already selected** file;
+`normal` clears the override. The table of overrides is stored beside the entry
+(`priorities`), keyed by the exact selected path, and absence means the default the
+selection always had.
+
+- It is an override table, not a second selection. A path that is not in the
+  selection is refused (`path is not in this entry's selection`); the edit cannot add,
+  remove or reorder a file, change the canonical workspace or the capture key, make a
+  completed entry runnable again, or touch `desired`, FIFO order, retry eligibility or
+  seed intent.
+- `normal` deletes the key, and an empty table disappears from `queue list --json`
+  entirely, so old records and cleared records read identically.
+- Edits take runner ownership (as removal does), so they are refused while a runner
+  owns the queue, and a runner cannot start while an edit holds ownership.
+- Unresolved entries, and entries whose selection is not yet recorded, are refused:
+  there is no evidence of membership until the exact paths are known, and editing must
+  not resolve metadata over the network just to answer that question.
+- A completed entry is refused outright. Editing a priority must never reopen,
+  restart or rewrite a published capture.
+- The pinned backend mapping is `at.PiecePriorityHigh` versus `at.PiecePriorityNormal`,
+  applied after every selected file is wanted and every unselected one is suppressed,
+  so raising one file cannot re-want another. It is a **preference**, not a guarantee:
+  no ordering promise is made about which file finishes first, and every selected file
+  is still verified before the capture is published.
+
 ### Removing a queue entry (non-destructive)
 
 ```
