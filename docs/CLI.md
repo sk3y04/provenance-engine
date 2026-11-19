@@ -62,6 +62,20 @@ provenance
 │   ├── inspect <SOURCE>             List files without downloading payload
 │   ├── fetch <SOURCE> --select PATH Download only the selected files
 │   └── status [JOB_ID]              Recorded job state (read-only, no lock)
+├── soulseek                         Soulseek through an external slskd (>= 0.26.0)
+│   ├── settings show|set            Connection profile (secrets masked on read)
+│   ├── health | test                Four-state health probe
+│   ├── search <query>               Ranked peer folders
+│   ├── download <query> --peer U    Enqueue a durable batch download job
+│   ├── jobs                         Durable job history
+│   ├── watch [--once]               Reconcile transfers and import completions
+│   ├── ingest                       Import completed downloads as captures
+│   ├── recover                      Reconcile jobs against slskd and the disk
+│   ├── cancel|retry|position        Queue control
+│   ├── clear-completed              Clear slskd's completed records
+│   ├── webhook-listen               Optional webhook receiver (wakes the reconciler)
+│   ├── shares list|preview|add|remove|status|rescan|files
+│   └── uploads list|cancel|clear-completed
 └── completion <bash|zsh|fish|powershell>
 ```
 
@@ -817,6 +831,47 @@ Encoder selection probes your installed `ffmpeg`: `auto` picks the first availab
 
 ---
 
+## `provenance soulseek`
+
+Integrates Soulseek through an external, unmodified `slskd >= 0.26.0`. Full
+operator documentation, including the contract facts this command set depends on,
+is in `docs/SOULSEEK.md`.
+
+The profile lives at `$XDG_CONFIG_HOME/provenance/slskd-settings.json` (0600) and
+can be overridden per field with `PROVENANCE_SLSKD_*` environment variables.
+Secrets are masked on every read path.
+
+| Command | Purpose |
+|---------|---------|
+| `settings show` | Print the profile; API key and webhook secret show as `********` |
+| `settings set` | Update fields; `--enable`/`--disable`, `--api-key`, `--base-url`, `--url-base`, `--slskd-downloads-root`, `--downloads-mount`, `--curated-share-root`, `--webhook-secret`, `--insecure`, `--cleanup-staging` |
+| `health` | Four-state probe (`HEALTHY`, `SLSKD_UNREACHABLE`, `AUTH_OR_CONFIG_ERROR`, `SOULSEEK_DISCONNECTED`) plus warnings; non-zero exit unless healthy |
+| `test` | Same probe, terse pass/fail |
+| `search <query>` | Ranked peer folders; `--timeout-ms` (milliseconds, default 15000), `--limit`, `--min-speed`, `--ignore peer,...`, `--settle`, `--json` |
+| `download <query>` | Search then enqueue; `--peer` (required), `--dir`, `--file`, `--settle` |
+| `jobs` | Durable job records; `--json` |
+| `watch` | Poll and import until interrupted; `--interval`, `--once`, `--vault`, `--collection` |
+| `ingest` | Import completed jobs; `--vault`, `--collection`, `--cleanup` |
+| `recover` | Cross-check jobs against slskd and the filesystem |
+| `cancel <jobID>` | Cancel transfers and mark the job cancelled; `--remove` |
+| `retry <jobID>` | Re-enqueue as a new job; `--another-source` picks the next ranked peer |
+| `position <jobID>` | Per-transfer queue position, rate-limited per job |
+| `clear-completed` | Remove completed records in slskd only |
+| `webhook-listen` | Serve `/api/integrations/slskd/webhook`; `--addr` |
+| `shares preview <path>` | Exact file count, bytes, extension histogram and exclusions; links nothing |
+| `shares add <path>` | Materialise hardlinks and rescan slskd; `--alias` |
+| `shares remove <ruleID>` | Remove the materialised links and rescan |
+| `shares status` | slskd's view of the shares, plus misconfiguration warnings |
+| `shares files` | Paginated, filterable browse of the shared index; `--page`, `--page-size`, `--filter` |
+| `shares rescan` | Start (or `--cancel`) a share scan |
+| `uploads list` | Active and queued uploads, duplicates collapsed |
+| `uploads cancel <user> <id>` | Cancel one upload; `--remove` |
+| `uploads clear-completed` | Remove completed upload records |
+
+`--settings <path>` on `provenance soulseek` selects a non-default profile.
+
+---
+
 ## Auto-install behavior
 
 The root command's `PersistentPreRunE` calls `extractor.EnsureInstalled()` (installs yt-dlp + ffmpeg) before every subcommand **except**:
@@ -829,6 +884,8 @@ The root command's `PersistentPreRunE` calls `extractor.EnsureInstalled()` (inst
 - `tui`
 - `history`
 - `watch` (for `list`, `add`, `remove` - but **not** `watch run`)
+- every `soulseek` command (it talks to an external slskd over HTTP and never
+  extracts media locally)
 
 ---
 

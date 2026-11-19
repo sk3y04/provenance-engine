@@ -48,7 +48,19 @@ provenance torrent inspect release.torrent
 provenance torrent queue add release.torrent --select "release/track.flac"
 provenance torrent queue start queued-000001-0e3dafa5
 provenance torrent queue run --watch
+
+# Search and download from Soulseek through an external slskd (>= 0.26.0)
+provenance soulseek settings set --base-url http://127.0.0.1:5030 --api-key <key> \
+  --slskd-downloads-root /downloads --downloads-mount /srv/media/downloads --enable
+provenance soulseek search "beethoven symphony flac" --limit 10
+provenance soulseek download "beethoven symphony" --peer someuser
+provenance soulseek watch --vault /srv/vault
 ```
+
+Soulseek support is an integration over an external, unmodified
+[slskd](https://github.com/slskd/slskd) instance: Provenance never stores
+Soulseek credentials, never writes slskd's configuration, and never modifies the
+upstream binary. See [docs/SOULSEEK.md](docs/SOULSEEK.md).
 
 Single binary. No Python, Node, or runtime dependencies beyond [yt-dlp](https://github.com/yt-dlp/yt-dlp) + ffmpeg (auto-installed on first run).
 

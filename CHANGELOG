@@ -1,6 +1,64 @@
 ## [Unreleased]
 
-No unreleased changes.
+Soulseek arrives as an integration over an external, unmodified `slskd >= 0.26.0`
+rather than a second client: searches are serialised, downloads become durable
+jobs with a pinned `externalId`, completed files are imported through the existing
+capture pipeline, and sharing is an explicit, previewed opt-in that materialises
+hardlinks into an isolated root.
+
+### Added
+
+- **`provenance soulseek`** connects to an external `slskd >= 0.26.0` over HTTP
+  with an `X-API-Key` profile stored `0600` (or supplied by `PROVENANCE_SLSKD_*`
+  environment variables) and never writes `slskd`'s configuration. See
+  `docs/SOULSEEK.md`.
+
+- **Four-state health** (`HEALTHY`, `SLSKD_UNREACHABLE`, `AUTH_OR_CONFIG_ERROR`,
+  `SOULSEEK_DISCONNECTED`) with a hard block below `0.26.0`, amber warnings for
+  `0.26.1`/`0.26.2` (`#1891`) and for the `0.26.2` `/options` `403` (`#1905`),
+  and diagnostics for an unreadable download mount.
+
+- **Serialised search**: one in-process single-flight coordinator, a
+  millisecond `searchTimeout` (the upstream documentation says seconds; the
+  binary says milliseconds), a 35-second wall-clock cap that stops a search
+  `slskd` keeps extending, adaptive polling, ranked `(peer, folder)` groups, and
+  a deferred `DELETE` after a settle grace (`#1819`).
+
+- **Durable download jobs** under `<root>/.provenance/slskd/jobs/`: the record is
+  written before the batch is posted, the batch pins `externalId` and
+  `provenance/<jobID>/`, >255-byte and traversing remote paths are refused before
+  the call (`#1818`), and a duplicate grab attaches to the existing job.
+
+- **Immediate terminal classification**: every `Completed, <failure>` state and a
+  bare `Cancelled` ends the job at once with the exact upstream reason, so
+  nothing polls out a 180-second stall.
+
+- **Import through the existing capture pipeline**: `manifest.CaptureItem` plus a
+  run manifest per job, Soulseek provenance in `raw_metadata`, containment checks,
+  symlinks ignored, `_{ticks}` collision renames found, size and hash verified,
+  and optional vault ingestion. `IMPORT_FAILED` keeps the staged bytes.
+
+- **Queue control and recovery**: cancel, retry, `--another-source` over cached
+  alternate peers, rate-limited queue position, clear-completed, boot-time
+  reconciliation against both `slskd` and the filesystem, and `INTERRUPTED` for a
+  job a volatile restart forgot.
+
+- **Optional webhooks** (`webhook-listen`) with a constant-time shared secret,
+  bounded delivery-id deduplication, stale-timestamp rejection and per-event
+  wakeups. Polling remains authoritative.
+
+- **Curated shares**: a pre-share preview (files, bytes, extension histogram,
+  exclusions), hardlink-only materialisation into an isolated root, fail-fast
+  `EXDEV`, `Lstat` audit that refuses a planted symlink, paginated browse of the
+  shared index, and a zero-share warning (`#1663`).
+
+- **Upload visibility**: listing with duplicate `Queued, Locally` records
+  collapsed (`#1609`), cancel/remove and clear-completed.
+
+### Fixed
+
+- Nothing in this release changes existing behaviour; the integration is
+  additive and `package engine` is untouched.
 
 ## [0.9.0] - 2026-11-19
 
