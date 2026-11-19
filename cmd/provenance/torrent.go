@@ -27,6 +27,8 @@ var (
 	flagTorrentJSON      bool
 	flagTorrentSeed      bool
 	flagQueueMaxActive   int
+	flagQueueDownRate    string
+	flagQueueUpRate      string
 	flagTorrentDiscovery string
 )
 
@@ -439,6 +441,14 @@ func queueRunCmd() *cobra.Command {
 			if flagQueueMaxActive < 1 {
 				return fmt.Errorf("--max-active must be at least 1, got %d", flagQueueMaxActive)
 			}
+			downRate, err := parseQueueRate("--download-rate", flagQueueDownRate)
+			if err != nil {
+				return err
+			}
+			upRate, err := parseQueueRate("--upload-rate", flagQueueUpRate)
+			if err != nil {
+				return err
+			}
 			store, err := queueStore()
 			if err != nil {
 				return err
@@ -446,7 +456,12 @@ func queueRunCmd() *cobra.Command {
 			// --timeout bounds each attempt; the queue has no global deadline so one
 			// slow entry cannot consume the whole run.
 			runner := torrentqueue.NewRunner(store, torrentqueue.Adapter{Timeout: flagTorrentTimeout},
-				torrentqueue.Options{MaxActive: flagQueueMaxActive, Log: os.Stdout})
+				torrentqueue.Options{
+					MaxActive:     flagQueueMaxActive,
+					DownloadLimit: downRate,
+					UploadLimit:   upRate,
+					Log:           os.Stdout,
+				})
 			sum, rerr := runner.Run(cmd.Context())
 			if rerr != nil {
 				return rerr
@@ -460,7 +475,25 @@ func queueRunCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVar(&flagQueueMaxActive, "max-active", 1, "Concurrent attempts to run at once (1-32)")
+	cmd.Flags().StringVar(&flagQueueDownRate, "download-rate", "", "Aggregate download budget shared by every attempt, e.g. 2MB (bytes/second; empty means unlimited)")
+	cmd.Flags().StringVar(&flagQueueUpRate, "upload-rate", "", "Aggregate upload budget shared by every attempt, e.g. 512KB (bytes/second; empty means unlimited)")
 	return cmd
+}
+
+// parseQueueRate turns a --download-rate/--upload-rate value into bytes per second.
+// The suffix convention is the one --max-bytes already uses; empty means unlimited.
+func parseQueueRate(flag, raw string) (int64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	n, err := manifest.ParseSize(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", flag, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive size in bytes per second, got %q (omit the flag for unlimited)", flag, raw)
+	}
+	return n, nil
 }
 
 func plural(n int) string {

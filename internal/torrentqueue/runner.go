@@ -33,6 +33,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/sk3y04/provenance-engine/internal/filelock"
 )
 
@@ -52,6 +54,25 @@ var (
 	// superseded (retried, paused and restarted, or cancelled), so applying it
 	// would overwrite a newer user command.
 	errStaleAttempt = errors.New("attempt superseded")
+)
+
+// Burst sizes for the shared rate limiters. Both are explicit and nonzero: the
+// pinned library panics on a zero or too-small burst rather than stalling.
+//
+//   - download: the library truncates each read to the burst and reserves tokens
+//     for it, so the burst must exceed a block read. 256 KiB is far above the
+//     16 KiB block size and bounds how much credit an idle attempt can bank.
+//   - upload: a peer request is reserved as one lump and the library *panics* when
+//     the request is larger than the burst ("upload rate limiter burst size < N").
+//     MaxAllocPeerRequestDataPerConn defaults to 1 MiB, so the burst has to cover
+//     that, which is also the burst upstream gives itself by default.
+const (
+	DownloadBurstBytes = 256 << 10
+	UploadBurstBytes   = 1 << 20
+
+	// MaxRateBytes is the largest accepted rate per direction, in bytes per second.
+	// It exists to reject nonsense and overflow, not to be a meaningful ceiling.
+	MaxRateBytes = 1 << 40
 )
 
 // MaxActiveLimit bounds --max-active. Above this a single foreground drain stops
@@ -76,6 +97,10 @@ type Request struct {
 	// KnownJobID, when set, means the identity is already resolved and the backend
 	// must resume the workspace offline rather than resolve over the network.
 	KnownJobID string
+	// DownloadLimiter and UploadLimiter are the runner's shared budgets. Every
+	// attempt of one runner receives the same pointers; nil means unlimited.
+	DownloadLimiter *rate.Limiter
+	UploadLimiter   *rate.Limiter
 }
 
 // Outcome is what a backend reports after a successful run.
@@ -109,6 +134,12 @@ type Options struct {
 	// MaxActive is the number of concurrent attempts. Zero means the default of 1;
 	// negative is invalid and values above MaxActiveLimit are refused.
 	MaxActive int
+	// DownloadLimit and UploadLimit are the aggregate budgets in bytes per second
+	// shared by every attempt this runner starts. Zero means unlimited, which is
+	// the previous behaviour. The budget is not divided by MaxActive: a lone
+	// attempt may use all of it.
+	DownloadLimit int64
+	UploadLimit   int64
 	// Log receives one line per transition. Nil discards.
 	Log io.Writer
 	// BeforeResultPersist runs after a backend returns and before its result is
@@ -130,6 +161,18 @@ func (o Options) Validate() error {
 	}
 	if o.Backoff < 0 {
 		return errors.New("backoff must not be negative")
+	}
+	if o.DownloadLimit < 0 {
+		return fmt.Errorf("download rate must not be negative, got %d bytes/s", o.DownloadLimit)
+	}
+	if o.UploadLimit < 0 {
+		return fmt.Errorf("upload rate must not be negative, got %d bytes/s", o.UploadLimit)
+	}
+	if o.DownloadLimit > MaxRateBytes {
+		return fmt.Errorf("download rate %d bytes/s is above the supported maximum %d", o.DownloadLimit, int64(MaxRateBytes))
+	}
+	if o.UploadLimit > MaxRateBytes {
+		return fmt.Errorf("upload rate %d bytes/s is above the supported maximum %d", o.UploadLimit, int64(MaxRateBytes))
 	}
 	return nil
 }
@@ -155,16 +198,36 @@ func (o Options) backoff() time.Duration {
 	return 5 * time.Second
 }
 
-// Runner drains a queue with one worker.
+// Runner drains a queue with up to MaxActive workers.
 type Runner struct {
 	store    *Store
 	transfer Transfer
 	opts     Options
+	// downloadLimiter and uploadLimiter are built once per runner and shared by
+	// every attempt, so concurrent jobs contend on one budget instead of each
+	// getting its own.
+	downloadLimiter *rate.Limiter
+	uploadLimiter   *rate.Limiter
+}
+
+// newSharedLimiter builds one limiter for a rate, or nil for unlimited. The burst
+// is explicit because the pinned library panics on a zero burst.
+func newSharedLimiter(bytesPerSecond int64, burst int) *rate.Limiter {
+	if bytesPerSecond <= 0 {
+		return nil
+	}
+	return rate.NewLimiter(rate.Limit(bytesPerSecond), burst)
 }
 
 // NewRunner builds a runner over a store and a backend.
 func NewRunner(store *Store, transfer Transfer, opts Options) *Runner {
-	return &Runner{store: store, transfer: transfer, opts: opts}
+	return &Runner{
+		store:           store,
+		transfer:        transfer,
+		opts:            opts,
+		downloadLimiter: newSharedLimiter(opts.DownloadLimit, DownloadBurstBytes),
+		uploadLimiter:   newSharedLimiter(opts.UploadLimit, UploadBurstBytes),
+	}
 }
 
 // Summary reports what one drain did.
@@ -427,6 +490,10 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sy
 		Selection:  entry.Selection,
 		Discovery:  entry.Discovery,
 		KnownJobID: entry.JobID,
+		// Shared instances, not copies and not rate/MaxActive: a lone job may use
+		// the whole budget.
+		DownloadLimiter: r.downloadLimiter,
+		UploadLimiter:   r.uploadLimiter,
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)

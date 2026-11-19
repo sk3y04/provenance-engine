@@ -725,6 +725,46 @@ queued-000003-…: running (bt-…f)      # so the third can start
   later drain adopts the accepted capture instead of writing a second one or taking
   over a different selection.
 
+### Shared rate budgets
+
+```
+provenance torrent queue run --download-rate 2MB --upload-rate 512KB --max-active 2
+```
+
+One download budget and one upload budget per runner, in **bytes per second**
+(the same suffix convention as `--max-bytes`: `KB`/`MB`/`GB` are powers of 1024).
+Both are shared by every attempt the runner starts, and the budget is **not**
+divided by `--max-active`: a single job may use the whole allowance, and two
+concurrent jobs contend for it. Omitting a flag means unlimited, which is the
+previous behaviour.
+
+- **Where each limiter is installed:** `bittorrent.Config.DownloadLimiter` /
+  `UploadLimiter` are applied in `clientConfig`, the single place this adapter
+  builds a client. An isolated attempt builds at most two clients - the
+  metadata-only resolver and the payload session - and both receive the same
+  instance. A resolved restart builds one. The runner creates the limiters once
+  (`NewRunner`) and passes the pointers through `Request`, so nothing constructs a
+  limiter per attempt or per job.
+- **Bursts are explicit and nonzero.** Download 256 KiB: the library truncates each
+  read to the burst and reserves tokens for it, so the burst must exceed a block
+  read (16 KiB), and a zero burst makes the library panic. Upload 1 MiB: a peer
+  request is reserved as one lump and the library *panics* when the request is
+  larger than the burst, with `MaxAllocPeerRequestDataPerConn` defaulting to 1 MiB -
+  the same burst the library gives itself. A low rate is therefore safe (verified at
+  96 KiB/s), but the first 256 KiB of a fresh transfer is never throttled.
+- **What the budget counts:** the client's payload read path (the download limiter
+  wraps the reader the client reads peer data through) and the chunks written to
+  peers (the upload limiter reserves tokens before each peer request is served).
+  What it does **not** cover, and this is not a whole-process network cap: tracker
+  and DHT traffic, handshakes, keepalives and framing overhead, piece verification
+  reads from disk, and anything outside these clients. Web seeds are disabled by
+  this adapter (`DisableWebseeds`), so no web-seed limiting is claimed.
+- **Flags are not persisted.** A rate is a property of `queue run`, not of the
+  entry: supply it again on every restart. Nothing about the queue record changes.
+- **Not a dial limit and not fairness.** There is no connection-rate limiter, no
+  per-job share and no dynamic adjustment; the budgets apply to the runner's own
+  clients only, in aggregate.
+
 ### What this slice does not do
 
 No seeding after completion, no aggregate bandwidth or peer limits, no priority or

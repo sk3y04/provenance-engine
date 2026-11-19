@@ -142,3 +142,37 @@ func TestTorrentFetchRejectsUnknownDiscoveryBeforeWork(t *testing.T) {
 		t.Errorf("fetch created the staging root %s before rejecting the profile", staging)
 	}
 }
+
+// TestParseQueueRate covers the flag contract: the --max-bytes suffix convention,
+// empty meaning unlimited, and refusal of zero, negative and garbage values.
+func TestParseQueueRate(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want int64
+		bad  bool
+	}{
+		{"", 0, false},
+		{"1MB", 1 << 20, false},
+		{"512kb", 512 << 10, false},
+		{"2G", 2 << 30, false},
+		{"0", 0, true},
+		{"0KB", 0, true},
+		{"-1MB", 0, true},
+		{"fast", 0, true},
+	} {
+		got, err := parseQueueRate("--download-rate", tc.in)
+		if tc.bad {
+			if err == nil {
+				t.Errorf("%q accepted, want an error", tc.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%q: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%q parsed to %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}

@@ -49,6 +49,7 @@ import (
 	at "github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
+	"golang.org/x/time/rate"
 
 	"github.com/sk3y04/provenance-engine/internal/atomicfile"
 	"github.com/sk3y04/provenance-engine/internal/filelock"
@@ -159,6 +160,13 @@ type Config struct {
 	// see that constant for exactly what it closes. An unknown value is
 	// ErrInvalidDiscovery and never falls back to public.
 	Discovery Discovery
+
+	// DownloadLimiter and UploadLimiter are shared across every client this
+	// config builds for one job - the metadata resolver and the payload session
+	// alike - so an aggregate budget covers the whole attempt. nil means the
+	// library default, which is unlimited.
+	DownloadLimiter *rate.Limiter
+	UploadLimiter   *rate.Limiter
 
 	// OnUpdate, when non-nil, receives throttled aggregate progress.
 	OnUpdate func(Update)
@@ -453,10 +461,28 @@ func clientConfig(staging string, cfg Config) *at.ClientConfig {
 		cc.TorrentPeersHighWater = cfg.MaxPeers * 4
 		cc.TorrentPeersLowWater = max(cfg.MaxPeers, 1)
 	}
+	// Shared budgets, installed on every client this adapter builds. A nil limiter
+	// leaves the library default (unlimited) untouched, and a non-nil one is never
+	// copied or re-created: two attempts of one runner must contend on the same
+	// tokens.
+	if cfg.DownloadLimiter != nil {
+		cc.DownloadRateLimiter = cfg.DownloadLimiter
+	}
+	if cfg.UploadLimiter != nil {
+		cc.UploadRateLimiter = cfg.UploadLimiter
+	}
 	// Last, so a profile cannot be undone by a later default.
 	applyClientDiscovery(cc, cfg.Discovery)
+	if clientConfigHook != nil {
+		clientConfigHook(cc)
+	}
 	return cc
 }
+
+// clientConfigHook observes every client configuration this package builds. It is
+// nil in production and exists so a test can prove that one shared limiter reaches
+// both the metadata resolver and the payload session.
+var clientConfigHook func(*at.ClientConfig)
 
 // newClient builds the library client. Limits are conservative; the library
 // defaults assume a long-lived desktop client, not one short job.

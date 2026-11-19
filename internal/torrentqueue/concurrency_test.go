@@ -27,7 +27,9 @@ type gatedTransfer struct {
 	// ignoreCancel makes an attempt ignore context cancellation, which is how a
 	// closing client looks from the scheduler's side: the slot is still held.
 	ignoreCancel bool
-	adopted      map[string]CaptureRef
+	// behavior, when set, decides the outcome instead of waiting on a gate.
+	behavior func(ctx context.Context, req Request) (Outcome, error)
+	adopted  map[string]CaptureRef
 }
 
 func newGatedTransfer() *gatedTransfer {
@@ -66,6 +68,9 @@ func (g *gatedTransfer) Run(ctx context.Context, req Request) (Outcome, error) {
 	g.runs = append(g.runs, req)
 	g.mu.Unlock()
 	g.entered <- id
+	if g.behavior != nil {
+		return g.behavior(ctx, req)
+	}
 
 	gate := g.gate(id)
 	if g.ignoreCancel {

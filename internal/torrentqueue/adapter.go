@@ -30,8 +30,12 @@ func (a Adapter) config(req Request) bittorrent.Config {
 		Timeout:         a.Timeout,
 		MetadataTimeout: a.MetadataTimeout,
 		// Seeding is deliberately out of this slice: a queue entry completes at
-		// its capture and releases the only worker slot.
+		// its capture and releases its slot.
 		KeepSeeding: false,
+		// The runner's shared budgets; nil means unlimited. Every client the
+		// adapter builds (metadata resolver, payload session) inherits them.
+		DownloadLimiter: req.DownloadLimiter,
+		UploadLimiter:   req.UploadLimiter,
 	}
 }
 
