@@ -2578,3 +2578,101 @@ Rerun at this tip: `go test ./internal/torrentqueue/ -run '^TestLiveOverlapDownl
 - The PTY driver (`drive8.py`) is not tracked in this repository, so the terminal
   evidence above cannot be regenerated from a checkout; it ran from a scratch directory
   against the binary built at the time of that run, not against a build of this commit.
+
+## BT-11 — Opt-in watch session (`torrent queue run --watch`)
+
+**Starting SHA** `2a49f84` (clean). **End SHA** `5335d74`.
+
+`queue run` gains a mode, not a new lifecycle: `Options.Watch` is the only new state.
+A plain run still drains and returns; a watch run keeps scanning after either pool goes
+idle. Slot limits, pause, retry/backoff, seed intent, one-runner ownership and the live
+snapshot schema are unchanged, so `queue list`, `queue live --json` and the TUI read the
+same shapes as before.
+
+### How it is implemented
+
+- **Download pool idle** (`internal/torrentqueue/runner.go`): `if active == 0` gains a
+  watch branch that logs one line per idle period, waits `PollInterval` and rescans.
+  `idleWait` is the only pacing — no busy loop, and no in-process wakeup.
+- **Seed pool idle** (`internal/torrentqueue/seed.go`): where a drain returns when
+  nothing is eligible and nothing is pending, a watch session keeps the ticker loop
+  running, so `queue seed` from another process starts serving in the same session.
+- **Pickup mechanism**: every scan calls `store.List()` / `SeedCandidates()` under the
+  store lock, so durability is the transport. Nothing in the runner is notified; a
+  record written by another process is simply visible on the next tick. The documented
+  pickup bound is one `PollInterval` (200 ms by default; it is not a flag) plus claim
+  time.
+- **Shutdown** is the existing path: stop claiming, `shutdown(inflight, done, active)`
+  cancels and joins, the seed pool joins after cancellation, then the deferred
+  `srv.close()` removes the live endpoint. Slot and ownership release therefore still
+  follow `Close`, not the request.
+
+### Commands actually run
+
+- `go test ./internal/torrentqueue/ -run 'TestWatch|TestDrainDoesNotClaim' -count=1 -v`
+  → all five pass: late download 3.56 s, idle pickup 0.62 s, drain compatibility 0.69 s,
+  idle shutdown 0.05 s, held Close 0.66 s.
+- `go test ./internal/torrentqueue/ -race -run '^(TestWatch|TestDrainDoesNotClaim|TestLiveOverlap|TestLiveCloseBarrier|TestLiveStopping|TestQueueRunnerKilled|TestQueueSeed|TestSeedPool|TestRunJoinsClosing)' -count=3 -timeout 1200s`
+  → `ok 108.805s` (watch, drain, the BT-10h overlap, both held-Close barriers and both
+  SIGKILL cases, repeated three times under `-race`).
+- `make test` → exit 0; `make lint` → `0 issues`; `go vet ./...` → clean;
+  `git diff --check` → clean; `gofmt -l .` → empty.
+- Platform: Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3.
+
+### Evidence per acceptance item
+
+1. **Late download while seeding** — `TestWatchClaimsLateDownloadWhileSeeding`. A is
+   completed through the ordinary queue path and verified in the record before its seed
+   intent is enabled. The test first waits for a snapshot that shows A serving, seed
+   slots 1/1, **no download attempt at all** and `downloads.used == 0`, i.e. the pool is
+   idle rather than momentarily quiet. Only then does a separate process run
+   `provenance torrent queue start <B>` (the real binary, built once per test binary).
+   The claim is accepted only if the live `pid` is unchanged and B's download attempt is
+   `running`; the overlap assertion then requires both pools at 1/1 with exactly two
+   attempts and prints them:
+
+   ```
+   WATCH overlap pid=2192986 downloads=1/1 seeds=1/1 attempts=2
+     WATCH attempt entry=queued-000001-743387ad kind=seed phase=serving
+     WATCH attempt entry=queued-000002-dd1c02bd kind=download phase=running
+   ```
+2. **Both pools idle** — `TestWatchIdlePicksUpNewWorkInBothPools`. With an empty queue
+   the session is still alive after ten poll intervals and its endpoint answers with no
+   attempts. A download created by the CLI (`queue add` + `queue start`) is claimed in
+   159 ms at a 20 ms poll; then `queue seed <id>` from the CLI wakes the idle seed pool
+   (`seeds=1/1`, attempt `serving`).
+3. **Drain compatibility** — `TestDrainDoesNotClaimLateDownloadButNextPassDoes`. A plain
+   drain is held waiting on its serving seed; a CLI start of B leaves B at
+   `phase=queued` with no download attempt in the snapshot after 15 poll intervals; the
+   next invocation claims it and completes it (`sum.Completed == 1`).
+4. **Shutdown** — `TestWatchShutdownWhileIdle` (idle cancel: endpoint removed, ownership
+   reacquirable) and `TestWatchShutdownHeldCloseKeepsSlot`, which holds a seed inside
+   `Close` with the BT-10a barrier, then asserts — after an unseed from outside *and*
+   after cancelling the session — that Run has not returned, `LockRunner` is refused, the
+   snapshot still shows one attempt `stopping` and `seeds.used == 1`. Only after
+   `release` does Run return, the endpoint disappear and ownership become free.
+
+### CLI smoke, and what it did not show
+
+`/tmp/tuismoke` watch runs against ad-hoc `one16` seeders confirmed the process-level
+behaviour: the session stayed alive with an empty download pool
+(`runner_held: true`, `idle: watching for eligible work every 200ms`), the exit line was
+`watch ended: …` after SIGINT, and `queue live` failed with "no foreground runner is
+reachable" afterwards. They did **not** produce a clean CLI overlap snapshot: those
+fixtures intermittently failed a download with `timed out waiting for torrent metadata`
+— the BT-10f symptom, still unexplained — and one run left the seed slot unobserved.
+That is why the acceptance evidence above comes from the deterministic in-process tests
+that drive the same CLI operations, and not from the scratch smoke.
+
+### Not covered / limits
+
+- No daemon, service install, socket control or mutation IPC: the session is a foreground
+  process, and stopping it is SIGINT (or process death, which releases the flock).
+- `PollInterval` is not a flag; 200 ms is the only documented cadence and the tests use
+  20 ms to keep the suite fast, so the numbers above are not a latency specification.
+- Pickup is bounded by one interval *per scan*, not a latency SLO: a large queue is
+  re-read on each tick exactly as the drain re-reads it.
+- Watch mode does not add retry semantics: a failed entry still needs `retry`, a blocked
+  one still waits out its backoff (now observable inside one session).
+- The ad-hoc-fixture metadata timeout (BT-10f) is untouched and still unexplained.
+- No TUI change; the TUI still cannot start a runner, and `--watch` is CLI-only.
