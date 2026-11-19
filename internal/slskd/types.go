@@ -243,6 +243,52 @@ type QueuePosition struct {
 	Filename string `json:"filename,omitempty"`
 }
 
+// transferStates splits a composite state string ("Completed, TimedOut") into a
+// normalised set. slskd serialises System.Text.Json flags with comma+space, but
+// parsing tolerates any spacing and casing.
+func transferStates(state string) []string {
+	if strings.TrimSpace(state) == "" {
+		return nil
+	}
+	parts := strings.Split(state, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// transferOutcome classifies a state string: terminal means slskd will never
+// change it again, succeeded means the file arrived.
+func transferOutcome(state string) (terminal, succeeded bool) {
+	for _, s := range transferStates(state) {
+		switch strings.ToLower(s) {
+		case "completed":
+			terminal = true
+		case "succeeded":
+			succeeded = true
+		case "cancelled":
+			terminal = true
+		}
+	}
+	return terminal, succeeded
+}
+
+// terminalFailure reports whether a state is a final failure and returns the
+// exact upstream string as the reason. Checking only for "Completed, Succeeded"
+// leaves rejected/errored transfers polling until a timeout (the 180 s stall
+// bug), so every completed-but-not-succeeded state terminates immediately.
+func terminalFailure(state string) (bool, string) {
+	terminal, succeeded := transferOutcome(state)
+	if !terminal || succeeded {
+		return false, ""
+	}
+	return true, state
+}
+
 // ValidateRemotePath refuses a remote path that cannot be materialised on a
 // Linux filesystem or that tries to escape the download root. slskd retries a
 // >255-byte path segment forever inside incomplete/<user>/<dir>/<file> (#1818),

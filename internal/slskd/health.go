@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -258,4 +259,29 @@ func (h Health) Summary() []string {
 		lines = append(lines, "diagnostic: "+d)
 	}
 	return lines
+}
+
+// ensurePathIsInside is the single containment rule used by the ingestor and the
+// share materialiser: a candidate must resolve inside root, and neither path may
+// be reached through a symlink that escapes it.
+func ensurePathIsInside(root, candidate string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("root path is required")
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	absCandidate, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(absRoot, absCandidate)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s escapes %s", candidate, root)
+	}
+	return absCandidate, nil
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -42,6 +43,11 @@ download jobs and the provenance records of what was imported.`,
 	cmd.AddCommand(soulseekSettingsCmd())
 	cmd.AddCommand(soulseekHealthCmd())
 	cmd.AddCommand(soulseekTestCmd())
+	cmd.AddCommand(soulseekSearchCmd())
+	cmd.AddCommand(soulseekDownloadCmd())
+	cmd.AddCommand(soulseekJobsCmd())
+	cmd.AddCommand(soulseekIngestCmd())
+	cmd.AddCommand(soulseekWatchCmd())
 	return cmd
 }
 
@@ -216,4 +222,25 @@ func slskdSettingsPath() (string, error) {
 		return flagSlskdSettings, nil
 	}
 	return slskd.DefaultSettingsPath()
+}
+
+// slskdClient builds a client from the effective profile. Kept separate so the
+// commands that follow (search, jobs, shares) share one construction path.
+func slskdClient(ctx context.Context) (*slskd.Client, slskd.Settings, error) {
+	_ = ctx
+	s, err := loadSlskdSettings()
+	if err != nil {
+		return nil, slskd.Settings{}, err
+	}
+	if !s.Enabled {
+		return nil, s, errors.New("the slskd integration is disabled; run `provenance soulseek settings set --enable`")
+	}
+	if err := s.ValidateForTest(); err != nil {
+		return nil, s, err
+	}
+	c, err := slskd.New(s.ClientConfig())
+	if err != nil {
+		return nil, s, err
+	}
+	return c, s, nil
 }

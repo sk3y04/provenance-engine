@@ -45,6 +45,63 @@ func TestSearchTimeoutIsSentInMilliseconds(t *testing.T) {
 	}
 }
 
+// TestTransferStateFlagsParsing proves composite states are compared as a set,
+// not as literal strings. The serialiser emits "Completed, TimedOut" with a
+// comma and a space, but the parser must survive any spacing or casing.
+func TestTransferStateFlagsParsing(t *testing.T) {
+	cases := []struct {
+		state     string
+		terminal  bool
+		succeeded bool
+	}{
+		{"Completed, Succeeded", true, true},
+		{"Completed,TimedOut", true, false},
+		{"Completed, TimedOut", true, false},
+		{"COMPLETED ,  errored", true, false},
+		{"Completed, Rejected", true, false},
+		{"Completed, Aborted", true, false},
+		{"Cancelled", true, false},
+		{"Completed, Cancelled", true, false},
+		{"Queued, Remotely", false, false},
+		{"InProgress", false, false},
+		{"Initializing", false, false},
+		{"", false, false},
+	}
+	for _, tc := range cases {
+		terminal, succeeded := transferOutcome(tc.state)
+		if terminal != tc.terminal || succeeded != tc.succeeded {
+			t.Errorf("transferOutcome(%q) = (%v,%v), want (%v,%v)", tc.state, terminal, succeeded, tc.terminal, tc.succeeded)
+		}
+	}
+}
+
+// TestTerminalFailureReason covers the "0s stall" rule: every completed-but-not-
+// succeeded state and a bare Cancelled must classify immediately, with the exact
+// upstream string preserved as the reason.
+func TestTerminalFailureReason(t *testing.T) {
+	for _, state := range []string{
+		"Completed, Rejected",
+		"Completed, TimedOut",
+		"Completed, Errored",
+		"Completed, Aborted",
+		"Completed, Cancelled",
+		"Cancelled",
+	} {
+		failed, reason := terminalFailure(state)
+		if !failed {
+			t.Fatalf("terminalFailure(%q) did not classify as failure", state)
+		}
+		if reason != state {
+			t.Fatalf("terminalFailure(%q) reason = %q, want the exact state", state, reason)
+		}
+	}
+	for _, state := range []string{"Queued, Remotely", "InProgress", "Completed, Succeeded", ""} {
+		if failed, _ := terminalFailure(state); failed {
+			t.Fatalf("terminalFailure(%q) classified as failure", state)
+		}
+	}
+}
+
 // TestVersionParsing pins the dotted-quad version shape slskd reports
 // ("0.26.0.0 (0.26.0.0+e42a525d)") and the semver triple a future release might
 // use.
