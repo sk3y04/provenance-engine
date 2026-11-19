@@ -2858,3 +2858,92 @@ selected share only.
 - The ad-hoc metadata timeout (BT-10f) is untouched and still unexplained; it did show
   up once in an early version of the in-package end-to-end fixture, which is why the
   counting tests use a local client's own piece states instead of a live transfer.
+
+## BT-13 — Measured cost of the selected-progress sampler
+
+**Starting SHA** `3b3c27d` (clean). **Production code unchanged**: the benchmarks were
+the slice, and the measurement says the sampler is acceptable for the queue's intended
+workload. No ETA, stall policy or bandwidth work.
+
+### What was measured, and the fixture construction
+
+`BenchmarkSelectedVerified*` in `internal/transfer/bittorrent/progress_bench_test.go`
+call the real path (`selectedVerified` → `File.State()`), with fixtures built outside the
+timed loop:
+
+- **complete, storage-backed**: a real payload file, 16 KiB pieces, verified with
+  `VerifyDataContext` — 512 and 2,048 pieces (8 MiB and 32 MiB).
+- **incomplete, no payload**: a hand-built metainfo with the requested piece count and a
+  `DeferStorageOpen` spec, so no payload file is created at all (the benchmark asserts
+  the data dir stays empty) — 65,536 and 262,144 pieces (1 GiB / 4 GiB at 16 KiB
+  pieces). This is exactly the "many pieces without a proportional payload" fixture the
+  slice asked for; the cost is that these pieces are zero-value, storage-less states.
+
+### Results
+
+`go test ./internal/transfer/bittorrent/ -run '^$' -bench 'BenchmarkSelectedVerified' -benchtime=500x -count=3`
+(and `-benchtime=200x -count=3` for the 262,144 case; 32-core Linux 6.18.63, Go 1.27.3):
+
+| benchmark | files | pieces | state | ns/op | B/op | allocs/op |
+|-----------|-------|--------|-------|-------|------|-----------|
+| `Complete512` | 1 | 512 | complete, storage-backed | 271–288 k (≈0.28 ms) | 86.9 kB | 96 |
+| `Complete2048` | 1 | 2,048 | complete, storage-backed | 1.12–1.22 M (≈1.17 ms) | 397 kB | 360 |
+| `Incomplete65536` | 1 | 65,536 | incomplete, no storage | 3.92 M | 14.0 MB | 27 |
+| `Incomplete262144` | 1 | 262,144 | incomplete, no storage | 15.9 M | 55.9 MB | 34 |
+
+Per piece: **≈0.53–0.60 µs** on the storage-backed torrents, **≈60 ns** on the
+storage-less ones. The two families differ in two ways at once (complete vs incomplete,
+storage-backed vs not), so the 10× gap cannot be attributed to completeness alone; the
+plausible driver is a real per-piece completion lookup versus a zero-value piece, but
+that is an inference, not a measurement.
+
+### Extrapolation to the 100 ms cadence (labelled as extrapolation)
+
+At 10 samples/s, one active download, using the measured storage-backed slope:
+
+- 512 pieces → ~2.8 ms/s of transfer-goroutine time (0.3 % duty), 0.87 MB/s allocated.
+- 2,048 pieces → ~11.7 ms/s (1.2 % duty), 4.0 MB/s allocated.
+
+The intended workload (media torrents with 1–16 MiB pieces) lands in that range: a
+60 GiB file at 16 MiB pieces is ~3,800 pieces, ~2 ms per sample.
+
+**What is not measured**: the storage-backed path above ~2,048 pieces. If the ~0.55 µs
+per-piece slope held at 65,536 pieces, one sample would be ~36 ms — a third of the
+cadence — but that number is extrapolation across the fixture gap, not a result. Nothing
+here measures client lock contention (`File.State()` holds `cl.rLock` for the whole walk)
+or the transfer's own throughput while sampling; neither is inferred from allocation
+counts.
+
+### Decision
+
+Acceptable for the intended workload, so production code is untouched. The trigger for
+revisiting is concrete: re-measure with a *storage-backed* many-piece fixture before any
+ETA or stall detection adds more sampling; if the slope holds, add a bound (cache the
+last verified count per attempt or walk only changed pieces) rather than moving the same
+work to a goroutine. Allocations are the second-order concern (0.4–0.9 MB per sample at
+realistic sizes).
+
+### Evidence accuracy
+
+- The number is selected-byte verification progress, not network throughput.
+- The first sample of any attempt lacks a rate because it has no baseline; resume is not
+  the cause. Retained data is verified before the wait loop starts
+  (`bittorrent.go:1027-1032`), so verification is not reported as transfer speed, apart
+  from the one trailing piece the library may mark after `VerifyDataContext` returns.
+- Unknown stays distinct from measured zero; this slice did not touch the sampling path.
+
+### Commands
+
+- `go test ./internal/transfer/bittorrent/ -run '^$' -bench 'BenchmarkSelectedVerified' -benchtime=500x -count=3` (and 262,144 at `-benchtime=200x -count=3`)
+- `go test ./internal/transfer/bittorrent/ -run 'TestSelectedVerified' -race -count=2`
+- `make test`, `make lint`, `go vet ./...`, `git diff --check`, `gofmt -l .`
+
+### Limits
+
+- Two fixture geometries only; many-file selections scale with file count × pieces, and
+  no multi-file case was benchmarked.
+- The synthetic fixtures cannot represent complete storage-backed pieces, which is the
+  expensive case.
+- Benchmark numbers come from an idle 32-core box; no measurement under concurrent
+  transfers or with the live endpoint being polled.
+- The ad-hoc metadata timeout (BT-10f) is untouched and still unexplained.

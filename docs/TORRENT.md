@@ -986,7 +986,14 @@ knowing:
 `progress_rate` is a **progress** rate on the selected payload, not network throughput,
 and not the transfer engine's byte counter. It is sampled from the transfer's 100ms
 poll and computed over at least 250ms of baseline, so a sample inside that window keeps
-the previous baseline instead of producing a spike. It is *absent* — not zero — on the
+the previous baseline instead of producing a spike.
+
+Sampling walks every piece covering the selected files (`File.State()`), so its cost is
+linear in the selected piece count: measured ~0.55 µs per piece on a storage-backed
+torrent, i.e. ~1.2 ms per sample for 2,000 pieces (about 1% of the transfer goroutine at
+a 100 ms cadence) and ~0.28 ms for 500 pieces. Torrents with tens of thousands of small
+pieces are outside what has been measured; see the BT-13 checkpoint in
+`BT-CHECKPOINTS.md` for the numbers, the extrapolation and the gap. It is *absent* — not zero — on the
 first sample of an attempt, after a counter rollback (where the baseline restarts), and
 for a new attempt on the same entry. A measured zero (same verified bytes over a full
 window) is reported as `0`. The baseline is per attempt, so a retry never inherits the
