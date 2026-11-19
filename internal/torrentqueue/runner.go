@@ -50,6 +50,8 @@ var (
 	// ErrUsage marks a caller mistake, such as a seed command for an entry that has
 	// not completed a capture.
 	ErrUsage = errors.New("invalid queue operation")
+	// ErrSelectionNotSelected rejects a priority for a path outside the selection.
+	ErrSelectionNotSelected = errors.New("path is not in this entry's selection")
 	// ErrWorkspaceBusy is a retryable condition: the job's workspace is owned by
 	// another process, so this entry is deferred with a bounded backoff.
 	ErrWorkspaceBusy = errors.New("job workspace is busy")
@@ -112,6 +114,10 @@ type Request struct {
 	// attempt of one runner receives the same pointers; nil means unlimited.
 	DownloadLimiter *rate.Limiter
 	UploadLimiter   *rate.Limiter
+	// Priorities carries the entry's download overrides, keyed by selected path.
+	// They are applied before payload requests begin and cannot change the
+	// selection.
+	Priorities map[string]string
 	// PeersPerAttempt and HalfOpenPerAttempt are the per-job peer limits; zero
 	// keeps the adapter default.
 	PeersPerAttempt    int
@@ -584,8 +590,13 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sy
 		DownloadLimiter: r.downloadLimiter,
 		UploadLimiter:   r.uploadLimiter,
 
+		Priorities: map[string]string{},
+
 		PeersPerAttempt:    r.opts.PeersPerJob,
 		HalfOpenPerAttempt: r.opts.HalfOpenPerJob,
+	}
+	for p, lvl := range entry.Priorities {
+		req.Priorities[p] = lvl
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)

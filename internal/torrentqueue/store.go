@@ -199,6 +199,12 @@ type Entry struct {
 	SeedError   string `json:"seed_error,omitempty"`
 	// SeedNotBefore is a bounded backoff after an ineligible workspace.
 	SeedNotBefore time.Time `json:"seed_not_before,omitempty"`
+	// Priorities raises the download preference of files that are ALREADY in
+	// Selection, keyed by exact selected path. It is an override table, not a second
+	// selection: a path here that is not in Selection is rejected, and absence means
+	// the default the selection always had. It is not part of the workspace id, the
+	// capture key or the duplicate key.
+	Priorities map[string]string `json:"priorities,omitempty"`
 	// Note carries a short reconciliation remark, such as "interrupted by runner
 	// shutdown" or "adopted capture published before the queue updated".
 	Note string `json:"note,omitempty"`
@@ -645,6 +651,68 @@ func (s *Store) Remove(id string) (Removal, error) {
 		return res, fmt.Errorf("%w: %s", ErrEntryNotFound, id)
 	}
 	return res, nil
+}
+
+// SelectedPaths returns the exact paths this entry will fetch, or nil when they are
+// not known yet.
+func (e Entry) SelectedPaths() []string { return append([]string(nil), e.Selection...) }
+
+// SetPriority records a download preference for one path already in the selection.
+// `normal` clears the override. It never edits the selection, the desired state, the
+// queue order or seeding intent, and it refuses a completed entry: editing a priority
+// must not reopen, restart or rewrite a published capture.
+func (s *Store) SetPriority(id, path, level string) (Entry, error) {
+	level = strings.ToLower(strings.TrimSpace(level))
+	if level != "normal" && level != "high" {
+		return Entry{}, fmt.Errorf("%w: priority must be normal or high, got %q", ErrUsage, level)
+	}
+	want := strings.TrimPrefix(strings.TrimSpace(path), "./")
+	if want == "" || strings.Contains(want, "..") || filepath.IsAbs(want) {
+		return Entry{}, fmt.Errorf("%w: %q is not a selected relative path", ErrUsage, path)
+	}
+	owner, err := s.LockRunner()
+	if err != nil {
+		return Entry{}, err
+	}
+	defer func() { _ = owner.Release() }()
+
+	var out Entry
+	out, err = s.Update(id, func(e *Entry) error {
+		switch {
+		case e.Unresolved || len(e.Selection) == 0:
+			return fmt.Errorf("%w: the exact selection for %s is not known yet; run it once so the paths are recorded", ErrUsage, id)
+		case e.Phase == PhaseCompleted:
+			return fmt.Errorf("%w: %s already published a capture; its priority cannot be edited", ErrUsage, id)
+		}
+		found := false
+		for _, sel := range e.Selection {
+			if strings.TrimPrefix(sel, "./") == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%w: %q is not one of the %d selected paths", ErrSelectionNotSelected, want, len(e.Selection))
+		}
+		if level == "normal" {
+			if e.Priorities != nil {
+				delete(e.Priorities, want)
+				if len(e.Priorities) == 0 {
+					e.Priorities = nil
+				}
+			}
+			return nil
+		}
+		if e.Priorities == nil {
+			e.Priorities = map[string]string{}
+		}
+		e.Priorities[want] = "high"
+		return nil
+	})
+	if err != nil {
+		return Entry{}, err
+	}
+	return out, nil
 }
 
 // LockRunner takes runner ownership without blocking. Removal uses it so a foreground

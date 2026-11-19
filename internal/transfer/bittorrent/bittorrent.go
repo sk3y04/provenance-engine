@@ -158,6 +158,14 @@ type Config struct {
 	// deadline beyond the caller's context.
 	Timeout time.Duration
 
+	// FilePriorities raises the download preference of individual files that are
+	// already in the selection, keyed by exact staging-relative path. `""` or
+	// "normal" is the default the selection always had; "high" raises the piece
+	// priority of the pieces carrying that file. It can never add, remove or
+	// reorder the selection, and it is a preference, not a guarantee about which
+	// file finishes first: every selected file is still verified before capture.
+	FilePriorities map[string]string
+
 	// KeepSeeding keeps the client alive after a successful capture until the
 	// context is cancelled. Off by default: the slice stops at capture.
 	KeepSeeding bool
@@ -513,6 +521,10 @@ var clientLifecycleHook func(event string)
 // startup is still in progress. Nil in production.
 var clientOpenHook func(*at.Client)
 
+// filePriorityHook observes the backend priority of every file right after selection
+// and overrides are applied and before payload requests begin. Nil in production.
+var filePriorityHook func(map[string]int)
+
 // newClient builds the library client. Limits are conservative; the library
 // defaults assume a long-lived desktop client, not one short job.
 func newClient(staging string, cfg Config) (*at.Client, error) {
@@ -763,6 +775,8 @@ type opened struct {
 	// id is the full identity resolved from the metadata (not the possibly
 	// narrower identity the source string supplied).
 	id Identity
+	// priorities are the caller's download overrides for files in the selection.
+	priorities map[string]string
 
 	// errMu guards writeErr, which records the first storage write failure the
 	// library reports asynchronously. It is read from the completion poll loop
@@ -982,6 +996,22 @@ func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRe
 			continue
 		}
 		f.SetPriority(at.PiecePriorityNone)
+	}
+	// Priorities are applied after every selected file is wanted and every
+	// unselected one is suppressed, so raising one cannot re-want another. Only
+	// files already in the selection can be raised; a path that is not selected is
+	// ignored here rather than being turned into a request.
+	for _, sf := range selected {
+		if o.priorities[sf.rel] == "high" {
+			sf.file.SetPriority(at.PiecePriorityHigh)
+		}
+	}
+	if filePriorityHook != nil {
+		applied := make(map[string]int, len(o.files))
+		for rel, f := range o.byPath {
+			applied[rel] = int(f.Priority())
+		}
+		filePriorityHook(applied)
 	}
 	o.enableTransfer()
 
@@ -1251,6 +1281,7 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 		staging:     s.staging,
 		stagingRoot: stagingRoot,
 		id:          resolved,
+		priorities:  s.cfg.FilePriorities,
 	}
 	// Chunk writes cannot happen before admission enables transfer, so the
 	// handler is installed before any write can be attempted.

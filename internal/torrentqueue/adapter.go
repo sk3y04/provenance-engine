@@ -41,6 +41,8 @@ func (a Adapter) config(req Request) bittorrent.Config {
 		// Seeding is deliberately out of this slice: a queue entry completes at
 		// its capture and releases its slot.
 		KeepSeeding: false,
+		// Download preference within the immutable selection.
+		FilePriorities: req.Priorities,
 		// The runner's shared budgets; nil means unlimited. Every client the
 		// adapter builds (metadata resolver, payload session) inherits them.
 		DownloadLimiter: req.DownloadLimiter,

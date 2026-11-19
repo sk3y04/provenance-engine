@@ -157,7 +157,7 @@ owns the root.`,
 			"picks the work back up. Nothing in this command group deletes payload or data.",
 	}
 	queue.AddCommand(queueAddCmd(), queueListCmd(), queueStartCmd(), queuePauseCmd(), queueRetryCmd(),
-		queueSeedCmd(), queueUnseedCmd(), queueRemoveCmd(), queueRunCmd())
+		queueSeedCmd(), queueUnseedCmd(), queuePriorityCmd(), queueRemoveCmd(), queueRunCmd())
 	cmd.AddCommand(queue)
 
 	return cmd
@@ -478,6 +478,41 @@ func queueUnseedCmd() *cobra.Command {
 				fmt.Fprintf(&b, "%s  seed intent cleared: seed_desired=%s seed_phase=%s\n",
 					entry.ID, entry.SeedDesired, entry.SeedPhase)
 			}
+			return nil
+		},
+	}
+	return cmd
+}
+
+func queuePriorityCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "priority ENTRY_ID FILE normal|high",
+		Short: "Favor an already-selected file when fetching",
+		Long: "Records a download preference for one file that is already in the entry's immutable\n" +
+			"selection. `high` raises that file's piece priority; `normal` clears the override. It\n" +
+			"is a preference, not a guarantee about which file finishes first, and every selected\n" +
+			"file is still verified before the capture is published. The edit cannot add or remove\n" +
+			"a file, change the workspace or capture, or make a completed entry runnable again.",
+		Args: cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			entry, perr := store.SetPriority(args[0], args[1], args[2])
+			if perr != nil {
+				return perr
+			}
+			var b strings.Builder
+			fmt.Fprintf(&b, "%s  %s -> %s (selection unchanged: %d files; desired=%s phase=%s)\n",
+				entry.ID, args[1], strings.ToLower(args[2]), len(entry.Selection), entry.Desired, entry.Phase)
+			for p := range entry.Priorities {
+				fmt.Fprintf(&b, "  high: %s\n", p)
+			}
+			if len(entry.Priorities) > 0 {
+				fmt.Fprintf(&b, "  (seed_desired=%s seed_phase=%s)\n", entry.SeedDesired, entry.SeedPhase)
+			}
+			_, _ = io.WriteString(os.Stdout, b.String())
 			return nil
 		},
 	}
