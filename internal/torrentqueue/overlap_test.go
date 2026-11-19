@@ -19,16 +19,6 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 )
 
-// attemptUploaded returns the live uploaded-byte counter for an entry's seed attempt.
-func attemptUploaded(s LiveSnapshot, entryID string) int64 {
-	for _, a := range s.Attempts {
-		if a.EntryID == entryID && a.Kind == "seed" && a.UploadedBytes != nil {
-			return *a.UploadedBytes
-		}
-	}
-	return 0
-}
-
 // attemptPhase returns the live phase of one entry's attempt of the given kind.
 func attemptPhase(s LiveSnapshot, entryID, kind string) string {
 	for _, a := range s.Attempts {
@@ -41,7 +31,7 @@ func attemptPhase(s LiveSnapshot, entryID, kind string) string {
 
 // waitSnapshot polls the real live endpoint until cond holds, returning the single
 // snapshot that satisfied it.
-func waitSnapshot(t *testing.T, root string, what string, limit time.Duration, cond func(LiveSnapshot) bool) (LiveSnapshot, bool) {
+func waitSnapshot(t *testing.T, root string, limit time.Duration, cond func(LiveSnapshot) bool) (LiveSnapshot, bool) {
 	t.Helper()
 	deadline := time.Now().Add(limit)
 	for time.Now().Before(deadline) {
@@ -130,10 +120,33 @@ func TestLiveOverlapDownloadAndSeed(t *testing.T) {
 			MaxActive: 1, MaxSeeds: 1, PollInterval: 20 * time.Millisecond, Log: nil,
 		}).Run(ctx)
 	}()
-	defer func() { cancel(); <-runDone }()
+
+	// stopRunner cancels the runner and waits for it once, with a bound: a runner that
+	// never exits fails the test instead of hanging until the package timeout. The
+	// deferred call is the safety net for assertion failures, and it never waits a
+	// second time - stopTried is set before runDone is read.
+	stopTried := false
+	stopRunner := func(limit time.Duration) bool {
+		stopTried = true
+		cancel()
+		select {
+		case <-runDone:
+			return true
+		case <-time.After(limit):
+			return false
+		}
+	}
+	defer func() {
+		if stopTried {
+			return
+		}
+		if !stopRunner(60 * time.Second) {
+			t.Errorf("the runner did not exit within 60s of cancellation")
+		}
+	}()
 
 	// --- ONE snapshot with both attempts ----------------------------------------
-	snap, ok := waitSnapshot(t, root, "overlap", 90*time.Second, func(s LiveSnapshot) bool {
+	snap, ok := waitSnapshot(t, root, 90*time.Second, func(s LiveSnapshot) bool {
 		return attemptPhase(s, entryA.ID, "seed") == "serving" &&
 			attemptPhase(s, entryB.ID, "download") == "running" &&
 			s.Seeds.Used == 1 && s.Seeds.Max == 1 &&
@@ -142,6 +155,15 @@ func TestLiveOverlapDownloadAndSeed(t *testing.T) {
 	if !ok {
 		t.Fatalf("no single snapshot showed both attempts; A=%+v B=%+v",
 			mustGet(t, store, entryA.ID), mustGet(t, store, entryB.ID))
+	}
+	// The count is asserted here rather than in the polling predicate: a third attempt
+	// must fail explicitly instead of timing the poll out.
+	if got := len(snap.Attempts); got != 2 {
+		for _, a := range snap.Attempts {
+			t.Logf("  unexpected attempt entry=%s kind=%s phase=%s stopping=%v",
+				a.EntryID, a.Kind, a.Phase, a.Stopping)
+		}
+		t.Fatalf("the snapshot carried %d attempts, want exactly 2", got)
 	}
 	t.Logf("OVERLAP snapshot pid=%d downloads=%d/%d seeds=%d/%d attempts=%d",
 		snap.PID, snap.Downloads.Used, snap.Downloads.Max, snap.Seeds.Used, snap.Seeds.Max, len(snap.Attempts))
@@ -153,17 +175,15 @@ func TestLiveOverlapDownloadAndSeed(t *testing.T) {
 		t.Logf("  OVERLAP attempt entry=%s kind=%s phase=%s stopping=%v uploaded=%d",
 			a.EntryID, a.Kind, a.Phase, a.Stopping, up)
 	}
-	// The seed's uploaded counter stays 0 here: nothing in this fixture leeches from A,
-	// so "serving" means the session passed verification and is listening on its own
-	// slot, not that bytes have been pushed. Bytes were measured separately in BT-08d.1
-	// (aggregate upload budget) and BT-08d.3 (release gate).
+	// The seed's uploaded counter is absent in this snapshot (logged as -1), not a
+	// measured zero: nothing in this fixture leeches from A, so "serving" means the
+	// session passed verification and holds its slot with its own listener, not that
+	// bytes have been pushed. Uploaded bytes were measured separately in BT-08d.1
+	// (aggregate budget) and BT-08d.3 (release gate).
 
 	// --- Clean shutdown ----------------------------------------------------------
-	cancel()
-	select {
-	case <-runDone:
-	case <-time.After(60 * time.Second):
-		t.Fatal("the runner did not shut down after cancellation")
+	if !stopRunner(60 * time.Second) {
+		t.Fatalf("the runner did not shut down after cancellation")
 	}
 	if a := mustGet(t, store, entryA.ID); !a.SeedWanted() {
 		t.Fatalf("interruption cleared seed intent: %+v", a)
