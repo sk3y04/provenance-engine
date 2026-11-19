@@ -169,6 +169,10 @@ type Options struct {
 	HalfOpenPerJob int
 	// Log receives one line per transition. Nil discards.
 	Log io.Writer
+	// BeforeSeedClose runs after a seed has recorded stopping and before its client
+	// is closed. It exists so a test can hold Close at a barrier; it is nil in
+	// production.
+	BeforeSeedClose func(entryID string)
 	// BeforeResultPersist runs after a backend returns and before its result is
 	// persisted. It exists so a test can hold a result at the exact
 	// publish-before-queue-update boundary; it is nil in production.
@@ -529,6 +533,26 @@ func (r *Runner) reconcile() (int, error) {
 				return 0, uerr
 			}
 			r.logf("%s: interrupted -> %s (desired %s)", e.ID, phase, e.Desired)
+		}
+		// A recorded serving/verifying/stopping phase is an observation from a process
+		// that no longer exists: the runner lock was free, so no client can still own
+		// the workspace. Reset it to what intent allows, or the entry would be stuck
+		// uneligible forever and never resume.
+		switch e.SeedPhase {
+		case SeedServing, SeedVerifying, SeedStopping:
+			seedPhase := SeedStopped
+			if e.SeedWanted() {
+				seedPhase = SeedIdle
+			}
+			if _, uerr := r.store.Update(e.ID, func(x *Entry) error {
+				x.SeedPhase = seedPhase
+				x.SeedAttempt = ""
+				x.Note = "seed interrupted by process death; intent kept"
+				return nil
+			}); uerr != nil {
+				return 0, uerr
+			}
+			r.logf("%s: stale seed phase %s -> %s (intent %s)", e.ID, e.SeedPhase, seedPhase, e.SeedDesired)
 		}
 	}
 	return adopted, nil

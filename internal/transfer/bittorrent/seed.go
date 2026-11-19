@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anacrolix/generics"
 	at "github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
@@ -161,13 +162,26 @@ func OpenSeedSession(ctx context.Context, cfg Config, jobID string) (*SeedSessio
 	return s, nil
 }
 
+// seedStoreOpts is the storage a seed session uses for both phases.
+//
+// UsePartFiles is disabled deliberately. With part files enabled the file storage
+// truncates a file to its last complete piece and renames it to *.part as soon as a
+// piece reads back incomplete - so hashing a damaged workspace would DELETE the very
+// bytes it was asked to report on. A seed must never mutate the payload it refuses,
+// and with part files off the storage opens the finalized files in place and only
+// writes when a piece is downloaded, which a seed never does.
+func seedStoreOpts(ws string, pc storage.PieceCompletion) storage.NewFileClientOpts {
+	return storage.NewFileClientOpts{
+		ClientBaseDir:   ws,
+		PieceCompletion: pc,
+		UsePartFiles:    generics.Some(false),
+	}
+}
+
 // verify hashes the workspace in a client that cannot reach a peer in either
 // direction, and records how many pieces it actually checked.
 func (s *SeedSession) verify(ctx context.Context, ws string, cfg Config) error {
-	st := storage.NewFileOpts(storage.NewFileClientOpts{
-		ClientBaseDir:   ws,
-		PieceCompletion: s.pieces,
-	})
+	st := storage.NewFileOpts(seedStoreOpts(ws, s.pieces))
 	cc := clientConfig(ws, cfg)
 	// Network-inert: nothing listens, nothing dials, nothing gossips.
 	cc.AcceptPeerConnections = false
@@ -247,10 +261,7 @@ func (s *SeedSession) start(ctx context.Context) error {
 		return errors.New("seed session is closed")
 	}
 	ws := s.own.staging
-	st := storage.NewFileOpts(storage.NewFileClientOpts{
-		ClientBaseDir:   ws,
-		PieceCompletion: s.pieces,
-	})
+	st := storage.NewFileOpts(seedStoreOpts(ws, s.pieces))
 	cc := clientConfig(ws, s.own.cfg)
 	cc.DefaultStorage = st
 	client, err := at.NewClient(cc)

@@ -218,6 +218,9 @@ func (r *Runner) closeSeed(sess SeedSession, entry Entry, token string) {
 		e.SeedPhase = SeedStopping
 		return nil
 	})
+	if r.opts.BeforeSeedClose != nil {
+		r.opts.BeforeSeedClose(entry.ID)
+	}
 	if err := sess.Close(); err != nil {
 		r.logf("%s: seed close: %v", entry.ID, err)
 	}

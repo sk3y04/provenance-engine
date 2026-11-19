@@ -27,6 +27,17 @@ func TestQueueRunnerHelper(t *testing.T) {
 		t.Fatalf("helper store: %v", err)
 	}
 	opts := Options{MaxActive: 1, PollInterval: 20 * time.Millisecond}
+	if os.Getenv("QUEUE_HELPER_MODE") == "seed-serving" {
+		// A real runner that serves managed seeds until it is killed. It announces the
+		// serving address so the parent can talk to it as a peer.
+		opts.MaxSeeds = 1
+		opts.Log = os.Stderr
+		adapter := &announcingAdapter{Adapter: realAdapter(), marker: os.Getenv("QUEUE_HELPER_MARKER")}
+		if _, rerr := NewRunner(store, adapter, opts).Run(context.Background()); rerr != nil {
+			t.Fatalf("helper seed run: %v", rerr)
+		}
+		return
+	}
 	if mode := os.Getenv("QUEUE_HELPER_MODE"); mode == "hold-after-publish" {
 		marker := os.Getenv("QUEUE_HELPER_MARKER")
 		opts.BeforeResultPersist = func(string) {
@@ -253,4 +264,37 @@ func TestQueueRunnerKilledAfterPublish(t *testing.T) {
 	if !strings.Contains(after.Note, "adopted") {
 		t.Errorf("note = %q, want an adoption explanation", after.Note)
 	}
+}
+
+// announcingAdapter writes the serving address to a marker file, so a parent process
+// can reach the child's seed session as a peer.
+type announcingAdapter struct {
+	Adapter
+	marker string
+}
+
+func (a *announcingAdapter) OpenSeed(entry Entry, req Request) (SeedSession, error) {
+	sess, err := a.Adapter.OpenSeed(entry, req)
+	if err != nil {
+		return nil, err
+	}
+	return &announcedSeed{SeedSession: sess, marker: a.marker}, nil
+}
+
+type announcedSeed struct {
+	SeedSession
+	marker string
+}
+
+func (a *announcedSeed) Serve(ctx context.Context) error {
+	go func() {
+		for i := 0; i < 6000; i++ {
+			if addr := a.SeedSession.Address(); addr != "" {
+				_ = os.WriteFile(a.marker, []byte(addr), 0o644)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	return a.SeedSession.Serve(ctx)
 }
