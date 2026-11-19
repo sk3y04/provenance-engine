@@ -765,6 +765,42 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
+### Peer limits
+
+```
+provenance torrent queue run --peers-per-job 8 --half-open-per-job 4
+```
+
+Two per-attempt limits, installed through the same `clientConfig` path as the
+budgets, so the metadata resolver, the payload session and a persisted-workspace
+reopen all inherit them:
+
+| option | maps to | counted |
+|--------|---------|---------|
+| `--peers-per-job N` | `EstablishedConnsPerTorrent` | established BitTorrent peers **per torrent**, inbound and outbound |
+| `--half-open-per-job N` | `HalfOpenConnsPerTorrent` (and a client-wide floor) | outbound dials whose handshake has not completed, per torrent |
+
+`0` keeps the previous behaviour (`--peers-per-job` defaults to 40 in the adapter,
+`--half-open-per-job` derives `min(peers, 8)`); values outside `1..200` are refused
+before anything is claimed. Flags are not persisted - supply them again on restart.
+
+**What upstream enforces** (pinned `v1.62.0`): `torrent.go` gates the dial loop on
+`len(t.halfOpen) >= HalfOpenConnsPerTorrent || cl.numHalfOpen >= TotalHalfOpenConns`
+(both per torrent and per client), and `t.addConnection` admits a connection by
+closing the torrent's worst existing one when `len(t.conns) >= maxEstablishedConns`
+- so the established count holds at the cap while connections may churn, and inbound
+connections are subject to the same per-torrent count. The library does **not**
+bound sockets that were accepted but not yet associated with a torrent, and does not
+look at tracker or DHT traffic.
+
+**The runner bound.** Each attempt is one client per phase, and the phases do not
+overlap: a magnet attempt opens a resolver client, closes it, then opens the payload
+client (measured, `[open:resolver close:resolver open:payload close:payload]`, peak
+concurrent clients 1). So the honest claim is `max-active x peers-per-job`
+established peers, and `max-active x half-open-per-job` outbound handshakes. This is
+**not** a process-wide socket or file-descriptor limit, and the per-job limits are
+**not** a dynamically shared pool: two jobs may each use their full allowance.
+
 ### What this slice does not do
 
 No seeding after completion, no aggregate bandwidth or peer limits, no priority or

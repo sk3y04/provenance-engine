@@ -1055,3 +1055,81 @@ Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores:
 
 Upload enforcement against a controlled peer, then BT-09 (selection, priorities,
 safe removal). BT-02/04 matrix rows remain unproven and untouched.
+
+## BT-08 (third slice) — Per-job peer bounds
+
+**Starting SHA** `1db7b52` (tree clean, pin `anacrolix/torrent v1.62.0`).
+
+Scope shipped: `queue run --peers-per-job N --half-open-per-job N`, applied through
+`clientConfig`, validated before the runner starts, defaults unchanged. Not shipped:
+managed seeding, a shared peer allocator, a global semaphore around library
+callbacks, RPC/TUI.
+
+### Upstream enforcement, cited
+
+| claim | source |
+|-------|--------|
+| established connections are capped **per torrent** | `client.go:1553-1556` sizes the conn map and sets `maxEstablishedConns` from `EstablishedConnsPerTorrent`; `torrent.go:2614-2634` admits by closing the worst existing conn, and panics if it cannot, so the map never exceeds the cap |
+| inbound and outbound share that count | `t.addConnection` is the single admission point and distinguishes only for eviction preference (`incomingIsBad`/`outgoingIsBad`) |
+| half-open dials are capped per torrent **and** per client | `torrent.go:3626-3627` (`len(t.halfOpen)` vs `HalfOpenConnsPerTorrent`, `cl.numHalfOpen` vs `TotalHalfOpenConns`); `torrent.go:1818/1834` feed the same quantities into dial decisions |
+| accepted-but-unassociated sockets are not counted | no such accounting exists in the accept path; the cap applies once a conn is associated with a torrent |
+
+**Overshoot:** the established map cannot exceed the cap (evict-then-admit), but
+connections can churn under pressure, and the half-open cap is a dial-loop gate, not
+a socket limit.
+
+### The runner bound, and why it holds
+
+An attempt builds at most two clients, and never two at once. Measured with a
+lifecycle hook during a magnet fetch:
+
+```
+client lifecycle: [open:resolver close:resolver open:payload close:payload]
+peak concurrent clients = 1
+```
+
+So the derived bound is `max-active x peers-per-job` established peers and
+`max-active x half-open-per-job` outbound dials. This is not a process-wide socket
+or descriptor limit, and the two jobs do not share a pool.
+
+### Observed
+
+| Test | Measurement |
+|------|-------------|
+| `TestQueuePerJobPeerLimitIsObserved` | two overlapping queue jobs, **2 peers each**, swarms of **3** seeders per torrent: peak established peers across all seeders **4** (the derived bound), both jobs completed |
+| `TestQueueHalfOpenLimitIsObserved` | cap 2, six peers that accept TCP and never handshake: peak concurrently accepted dials **1**, i.e. under the cap; after cancellation the listener sees every socket close and the runner lock is released |
+| `TestQueuePeerLimitPlumbing` | both attempts receive the configured per-job values; `0` keeps the defaults; `-1`, `201`, `5000` refused |
+| `TestClientConfigPeerLimits` | `MaxPeers`/`MaxHalfOpen` map to `EstablishedConnsPerTorrent`/`HalfOpenConnsPerTorrent`, with the client-wide `TotalHalfOpenConns` kept at least the per-torrent cap so the cap stays reachable |
+| `TestResolverAndPayloadClientsDoNotOverlap` | lifecycle ordering and peak concurrency above |
+| `TestCancelledResolutionLeavesNoClient` | a magnet that never resolves (no peers, 300 ms deadline) closes its resolver client, opens no payload client, peak 1 |
+
+Honest limit of the half-open measurement: the observed peak was **1 of an allowed
+2**. The test proves the cap is never exceeded and that cancellation releases the
+dials, but it does **not** prove the cap is reachable under this fixture - the
+library dials more cautiously than the cap here. The cap itself is upstream behaviour
+cited above, not something this slice adds.
+
+### Gates
+
+Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores:
+
+- `go test ./internal/torrentqueue/ -count=1` → `ok 46.350s`
+- `go test ./internal/transfer/bittorrent/ ./cmd/provenance/ -count=1` → `ok 44.965s`, `ok 0.038s`
+- `go vet ./...` clean, `gofmt -l ./cmd ./internal` empty, `golangci-lint run ./...` → `0 issues`, `git diff --check` clean
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok,
+  `internal/torrentqueue 48.278s`, `internal/transfer/bittorrent 61.447s`
+- CLI smoke: `--peers-per-job -1` → `must be between 1 and 200, got -1`;
+  `--peers-per-job 500` and `--half-open-per-job -3` likewise; valid values accepted.
+
+### Carried forward
+
+Aggregate **download** was measured (4,194,304 bytes in 7.647 s, steady-state
+538,331 B/s against a 524,288 B/s cap). **Upload** is wired and pointer-tested but
+its enforcement against real traffic is still **unverified**; managed seeding with
+controlled leechers is the milestone that should close it.
+
+### Next
+
+**BT-08d** — managed seeding with separate slots. Release gate: a completed seed
+cannot consume the last download slot, and two active seeds sharing one upload
+limiter stay within the measured aggregate budget, allowing for the documented burst.
