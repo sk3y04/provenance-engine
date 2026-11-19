@@ -7,12 +7,15 @@ package torrentqueue
 // by a sleep long enough to "probably" work.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -49,7 +52,11 @@ func testCLI(t *testing.T) string {
 			return
 		}
 		bin := filepath.Join(dir, "provenance")
-		cmd := exec.Command("go", "build", "-o", bin, "./cmd/provenance")
+		// Bounded: a hung build must fail the test, not the package timeout. The
+		// child is not built with -race, so only the test process is instrumented.
+		buildCtx, cancelBuild := context.WithTimeout(context.Background(), 180*time.Second)
+		defer cancelBuild()
+		cmd := exec.CommandContext(buildCtx, "go", "build", "-o", bin, "./cmd/provenance")
 		cmd.Dir = "../.."
 		if out, berr := cmd.CombinedOutput(); berr != nil {
 			cliErr = fmt.Errorf("build cli: %v: %s", berr, out)
@@ -70,7 +77,9 @@ func runCLI(t *testing.T, root string, args ...string) string {
 	bin := testCLI(t)
 	full := append([]string{"torrent", "queue"}, args...)
 	full = append(full, "-o", root)
-	cmd := exec.Command(bin, full...)
+	cliCtx, cancelCLI := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelCLI()
+	cmd := exec.CommandContext(cliCtx, bin, full...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("setup: cli %v: %v: %s", args, err, out)
@@ -164,6 +173,54 @@ func completeSeedEntry(t *testing.T, store *Store) Entry {
 	return mustGet(t, store, entry.ID)
 }
 
+// logBuffer captures runner output so a test can synchronise on a completed scan
+// rather than inferring one from an empty snapshot.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) contains(s string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Contains(b.buf.String(), s)
+}
+
+// waitLog waits for a log line, which is the only signal that can distinguish "the
+// scheduler completed an empty scan" from "nothing has been attempted yet".
+func waitLog(t *testing.T, b *logBuffer, want string, limit time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		if b.contains(want) {
+			return
+		}
+		time.Sleep(watchPoll)
+	}
+	t.Fatalf("the runner never logged %q", want)
+}
+
+// breakEntriesDir makes the queue's entry directory unlistable, so the next store
+// read fails the way a real permission or I/O error would. The returned function
+// restores it and is safe to call twice.
+func breakEntriesDir(t *testing.T, root string) func() {
+	t.Helper()
+	dir := filepath.Join(root, ".provenance", "torrent", "queue", "entries")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("setup: mkdir entries: %v", err)
+	}
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatalf("setup: chmod entries: %v", err)
+	}
+	return func() { _ = os.Chmod(dir, 0o755) }
+}
+
 // watchSession is one running session plus the bound around its cancellation.
 type watchSession struct {
 	cancel  context.CancelFunc
@@ -226,9 +283,12 @@ func TestWatchClaimsLateDownloadWhileSeeding(t *testing.T) {
 	torrentPath, peer := matchedFixture(t, 6<<20, 512<<10)
 	entryB := addFileEntry(t, root, torrentPath, peer)
 
-	w := startWatch(t, store, realAdapter(), Options{MaxActive: 1, MaxSeeds: 1, Log: nil})
+	logs := &logBuffer{}
+	w := startWatch(t, store, realAdapter(), Options{MaxActive: 1, MaxSeeds: 1, Log: logs})
 
-	// The download pool must be idle - not merely quiet - while A serves.
+	// An empty snapshot alone is not a scan barrier: wait until the pool has reported
+	// a completed scan that found nothing, then confirm the snapshot agrees.
+	waitLog(t, logs, "idle: watching for eligible work", 60*time.Second)
 	idle, ok := waitSnapshot(t, root, 60*time.Second, func(s LiveSnapshot) bool {
 		if attemptPhase(s, entryA.ID, "seed") != "serving" || s.Seeds.Used != 1 {
 			return false
@@ -388,11 +448,16 @@ func TestDrainDoesNotClaimLateDownloadButNextPassDoes(t *testing.T) {
 	if got := mustGet(t, store, entryB.ID); got.Phase != PhaseQueued {
 		t.Fatalf("a drain claimed a download started after its pool drained: %+v", got)
 	}
-	if snap, perr := liveProbe(t, root); perr == nil {
-		for _, a := range snap.Attempts {
-			if a.EntryID == entryB.ID {
-				t.Fatalf("the drain started B although its download pool had drained: %+v", a)
-			}
+	// An exited runner must not pass this check: require the drain to still be
+	// observable before asserting that it did not claim B.
+	snap, perr := liveProbe(t, root)
+	if perr != nil {
+		dumpEndpoint(t, root)
+		t.Fatalf("the drain was no longer running after B was started: %v", perr)
+	}
+	for _, a := range snap.Attempts {
+		if a.EntryID == entryB.ID {
+			t.Fatalf("the drain started B although its download pool had drained: %+v", a)
 		}
 	}
 
@@ -456,7 +521,11 @@ func TestWatchShutdownHeldCloseKeepsSlot(t *testing.T) {
 	t.Cleanup(func() {
 		sess.release(t, "cleanup")
 		cancel()
-		<-runDone
+		select {
+		case <-runDone:
+		case <-time.After(60 * time.Second):
+			t.Errorf("Run did not exit during cleanup")
+		}
 	})
 
 	waitSeedPhase(t, store, entry.ID, SeedServing, 60*time.Second)
@@ -522,5 +591,204 @@ func TestWatchShutdownHeldCloseKeepsSlot(t *testing.T) {
 			t.Fatalf("ownership still held after Run returned: %v", e)
 		}
 		_ = l.Release()
+	}
+}
+
+// TestSeedPoolEndsOnStoreError drives the seed pool directly: a store it cannot read
+// is a failure, not "no work", so the pool must return and hand the error to the
+// session instead of logging and polling again forever.
+func TestSeedPoolEndsOnStoreError(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("setup: open store: %v", err)
+	}
+	restore := breakEntriesDir(t, root)
+	defer restore()
+
+	fatal := &runFatal{}
+	r := NewRunner(store, realAdapter(), Options{Watch: true, MaxSeeds: 1, PollInterval: watchPoll, Log: nil})
+	var mu sync.Mutex
+	var sum Summary
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.runSeeds(context.Background(), &mu, &sum, fatal)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the seed pool kept polling after a store error")
+	}
+	ferr := fatal.get()
+	if ferr == nil {
+		t.Fatal("the seed pool returned without recording the error")
+	}
+	if !strings.Contains(ferr.Error(), "seed") {
+		t.Fatalf("the pool reported an unrelated error: %v", ferr)
+	}
+	t.Logf("seed pool ended with: %v", ferr)
+}
+
+// TestWatchFatalDownloadErrorJoinsHeldSeed: a fatal download-store error must cancel
+// the seed pool and join it, not return out of Run while a seed still owns a slot.
+func TestWatchFatalDownloadErrorJoinsHeldSeed(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("setup: open store: %v", err)
+	}
+	entry := seedableEntry(t, store)
+	sess := newBarrierSession("W-fatal-download", entry.ID)
+	t.Cleanup(func() { sess.release(t, "cleanup") })
+	opener := &barrierOpener{Adapter: realAdapter(), sess: sess}
+
+	fatalSeen := make(chan error, 1)
+	var runErr error
+	runDone := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer close(runDone)
+		_, runErr = NewRunner(store, opener, Options{
+			Watch: true, MaxActive: 1, MaxSeeds: 1, PollInterval: watchPoll, Log: nil,
+			BeforeFatal: func(err error) {
+				select {
+				case fatalSeen <- err:
+				default:
+				}
+			},
+		}).Run(ctx)
+	}()
+	t.Cleanup(func() {
+		sess.release(t, "cleanup")
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(60 * time.Second):
+			t.Errorf("Run did not exit during cleanup")
+		}
+	})
+
+	waitSeedPhase(t, store, entry.ID, SeedServing, 60*time.Second)
+
+	// Stop the seed and hold its Close: the seed slot stays occupied from here on.
+	if _, serr := store.SetSeedIntent(entry.ID, false); serr != nil {
+		t.Fatalf("unseed: %v", serr)
+	}
+	select {
+	case <-sess.closeIn:
+	case <-time.After(60 * time.Second):
+		t.Fatal("Close was never entered")
+	}
+
+	restore := breakEntriesDir(t, root)
+	t.Cleanup(restore)
+
+	select {
+	case ferr := <-fatalSeen:
+		t.Logf("fatal download error recorded: %v", ferr)
+	case <-runDone:
+		t.Fatalf("Run returned while the seed was still inside Close (err=%v)", runErr)
+	case <-time.After(15 * time.Second):
+		t.Fatal("the download pool never reported the store error")
+	}
+
+	// The fatal error must not shortcut teardown: Run is joining a seed inside Close.
+	select {
+	case <-runDone:
+		t.Fatalf("Run returned while the seed was still inside Close (err=%v)", runErr)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if probe, lerr := store.LockRunner(); lerr == nil {
+		_ = probe.Release()
+		t.Fatal("runner ownership was released while an attempt was closing")
+	}
+	snap, perr := liveProbe(t, root)
+	if perr != nil {
+		dumpEndpoint(t, root)
+		t.Fatalf("live probe after the fatal error: %v", perr)
+	}
+	if len(snap.Attempts) != 1 || !snap.Attempts[0].Stopping || snap.Attempts[0].Phase != "stopping" {
+		t.Fatalf("attempts after the fatal error = %+v", snap.Attempts)
+	}
+	if snap.Seeds.Used != 1 {
+		t.Fatalf("the slot was released before Close returned: %+v", snap.Seeds)
+	}
+	t.Logf("fatal error held: stopping seed still occupies %d/%d, ownership refused", snap.Seeds.Used, snap.Seeds.Max)
+
+	restore()
+	sess.release(t, "explicit")
+	select {
+	case <-runDone:
+	case <-time.After(60 * time.Second):
+		t.Fatal("Run did not return after Close was released")
+	}
+	if runErr == nil {
+		t.Fatal("Run returned success after a fatal store error")
+	}
+	if errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run returned the sibling's cancellation instead of the cause: %v", runErr)
+	}
+	t.Logf("Run returned the injected error: %v", runErr)
+
+	if _, perr := liveProbe(t, root); perr == nil {
+		t.Fatal("the endpoint still answered after Run returned")
+	}
+	if probe, lerr := OpenStore(root); lerr == nil {
+		l, e := probe.LockRunner()
+		if e != nil {
+			t.Fatalf("ownership still held after Run returned: %v", e)
+		}
+		_ = l.Release()
+	}
+}
+
+// TestWatchFatalStoreErrorEndsIdleSession: with no work at all, a store that becomes
+// unreadable must end the session with an error, not leave it polling or return
+// success. Either pool may be the first reporter; both are fatal by design.
+func TestWatchFatalStoreErrorEndsIdleSession(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("setup: open store: %v", err)
+	}
+	logs := &logBuffer{}
+	var runErr error
+	runDone := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer close(runDone)
+		_, runErr = NewRunner(store, realAdapter(), Options{
+			Watch: true, MaxActive: 1, MaxSeeds: 1, PollInterval: watchPoll, Log: logs,
+		}).Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(60 * time.Second):
+			t.Errorf("Run did not exit during cleanup")
+		}
+	})
+
+	waitLog(t, logs, "idle: watching for eligible work", 30*time.Second)
+	restore := breakEntriesDir(t, root)
+	t.Cleanup(restore)
+
+	select {
+	case <-runDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the idle session kept polling after a fatal store error")
+	}
+	if runErr == nil {
+		t.Fatal("Run returned success although the store became unreadable")
+	}
+	if errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run returned a cancellation instead of the cause: %v", runErr)
+	}
+	t.Logf("idle watch ended with: %v", runErr)
+	if _, perr := liveProbe(t, root); perr == nil {
+		t.Fatal("the endpoint still answered after Run returned")
 	}
 }

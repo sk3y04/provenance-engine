@@ -191,6 +191,10 @@ type Options struct {
 	// persisted. It exists so a test can hold a result at the exact
 	// publish-before-queue-update boundary; it is nil in production.
 	BeforeResultPersist func(entryID string)
+	// BeforeFatal runs once, after the first fatal pool error is recorded and
+	// before the sibling pool is cancelled. It exists so a test can observe that
+	// boundary deterministically; it is nil in production.
+	BeforeFatal func(err error)
 }
 
 // Validate rejects a configuration instead of silently clamping it.
@@ -386,6 +390,11 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 
 	limit := r.opts.maxActive()
 	var mu sync.Mutex
+	// Both pools run under runCtx so a fatal store error in either one cancels the
+	// other: a failure must end the session, not leave a sibling polling.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	fatal := &runFatal{cancel: cancelRun, hook: r.opts.BeforeFatal}
 	// The seed pool runs beside the download loop with its own slots. It is started
 	// once and reports done when it has nothing left to serve.
 	seedsOn := r.opts.maxSeeds() > 0
@@ -393,7 +402,7 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 	if seedsOn {
 		go func() {
 			defer close(seedDone)
-			r.runSeeds(ctx, &mu, &sum)
+			r.runSeeds(runCtx, &mu, &sum, fatal)
 		}()
 	} else {
 		close(seedDone)
@@ -416,7 +425,7 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 		if wait {
 			select {
 			case id = <-done:
-			case <-ctx.Done():
+			case <-runCtx.Done():
 				return false
 			}
 		} else {
@@ -434,7 +443,7 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 	for {
 		for take(false) {
 		}
-		if ctx.Err() != nil {
+		if runCtx.Err() != nil {
 			break
 		}
 		// Claim in FIFO order, skipping anything already in flight. A claim that
@@ -444,8 +453,12 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 		for active < limit {
 			entry, ok, nerr := r.nextExcept(inflight, skipped)
 			if nerr != nil {
-				r.shutdown(inflight, done, active)
-				return sum, nerr
+				// A store failure is fatal for the session: record it, cancel the
+				// sibling pool so an idle watch loop cannot keep polling, and fall
+				// through to the join below. Returning here would release runner
+				// ownership while the seed pool could still be serving.
+				fatal.fail(nerr)
+				break
 			}
 			if !ok {
 				break
@@ -456,7 +469,7 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 				skipped[entry.ID] = true
 				continue
 			}
-			attemptCtx, cancel := context.WithCancel(ctx)
+			attemptCtx, cancel := context.WithCancel(runCtx)
 			inflight[claimed.ID] = cancel
 			active++
 			mu.Lock()
@@ -466,6 +479,9 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 				defer func() { done <- e.ID }()
 				r.runEntry(c, e, token, &mu, &sum)
 			}(claimed, claimed.Attempt, attemptCtx)
+		}
+		if fatal.get() != nil {
+			break
 		}
 		if active == 0 {
 			if watch {
@@ -478,7 +494,7 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 					r.logf("idle: watching for eligible work every %s", r.opts.pollInterval())
 					idleLogged = true
 				}
-				if !idleWait(ctx, r.opts.pollInterval()) {
+				if !idleWait(runCtx, r.opts.pollInterval()) {
 					break
 				}
 				continue
@@ -502,9 +518,50 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 	}
 	r.shutdown(inflight, done, active)
 	if seedsOn {
+		// Join the seed pool. A held Close blocks this, which is what keeps the
+		// slot, the endpoint and runner ownership alive until the client is gone.
 		<-seedDone
 	}
+	if err := fatal.get(); err != nil {
+		return sum, err
+	}
 	return sum, nil
+}
+
+// runFatal records the first fatal pool error and cancels the sibling pool, so a
+// store failure in either pool ends the session instead of leaving the other one
+// polling. The first error wins: cancelling a sibling must not replace the cause.
+type runFatal struct {
+	mu     sync.Mutex
+	err    error
+	cancel context.CancelFunc
+	hook   func(error)
+}
+
+// fail records the first error, calls the boundary hook once, then cancels the
+// sibling pool. Later errors are dropped so cancellation cannot mask the cause.
+func (f *runFatal) fail(err error) {
+	f.mu.Lock()
+	first := f.err == nil
+	if first {
+		f.err = err
+	}
+	f.mu.Unlock()
+	if !first {
+		return
+	}
+	if f.hook != nil {
+		f.hook(err)
+	}
+	if f.cancel != nil {
+		f.cancel()
+	}
+}
+
+func (f *runFatal) get() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.err
 }
 
 // idleWait sleeps for one scan interval and reports whether the run is still live.

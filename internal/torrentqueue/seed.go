@@ -42,7 +42,7 @@ func (o Options) maxSeeds() int { return o.MaxSeeds }
 // runSeeds is the seed coordinator. It is one goroutine beside the download loop,
 // claims in queue order, never holds a workspace lock while waiting for a slot, and
 // returns when nothing is left that it is responsible for.
-func (r *Runner) runSeeds(ctx context.Context, mu *sync.Mutex, sum *Summary) {
+func (r *Runner) runSeeds(ctx context.Context, mu *sync.Mutex, sum *Summary, fatal *runFatal) {
 	limit := r.opts.maxSeeds()
 	if limit <= 0 {
 		return
@@ -72,6 +72,7 @@ func (r *Runner) runSeeds(ctx context.Context, mu *sync.Mutex, sum *Summary) {
 		}
 	}
 
+scan:
 	for {
 		reap()
 		if ctx.Err() != nil {
@@ -84,8 +85,10 @@ func (r *Runner) runSeeds(ctx context.Context, mu *sync.Mutex, sum *Summary) {
 			}
 			cands, err := r.store.SeedCandidates(time.Now(), skip)
 			if err != nil {
-				r.logf("seed: cannot read candidates (%v)", err)
-				break
+				// A store failure is not "no work". It ends the session and reaches
+				// the caller instead of being retried on every interval.
+				fatal.fail(fmt.Errorf("seed candidates: %w", err))
+				break scan
 			}
 			started := false
 			for _, entry := range cands {
@@ -127,14 +130,18 @@ func (r *Runner) runSeeds(ctx context.Context, mu *sync.Mutex, sum *Summary) {
 		}
 		if len(active) == 0 {
 			pending, perr := r.store.SeedPending()
-			if perr != nil || !pending {
-				// No eligible seed and nothing pending. A drain ends here: a seed
+			if perr != nil {
+				// Failing to read the store is not "there is no work": it is fatal
+				// for the session, or a watch loop would poll it forever.
+				fatal.fail(fmt.Errorf("seed pending: %w", perr))
+				break scan
+			}
+			if !pending && !r.opts.Watch {
+				// Nothing to serve and nothing pending. A drain ends here: a seed
 				// enabled after the pool emptied belongs to a later invocation. A
-				// watch session keeps scanning instead, so an intent saved by
-				// another process starts serving without a restart.
-				if !r.opts.Watch {
-					return
-				}
+				// watch session keeps scanning, so an intent saved by another
+				// process starts serving without a restart.
+				return
 			}
 		}
 		select {
