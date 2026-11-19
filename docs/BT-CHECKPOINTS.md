@@ -1999,3 +1999,100 @@ manual verification.
   flag or config was added in this slice.
 - Windows: the live endpoint is Unix-only, so the live half is unavailable there by
   design; the durable half still renders.
+
+## BT-10c — Add a torrent from the TUI (paused picker)
+
+**Starting SHA** `6321bff` (clean). No runner is started, no payload or workspace is
+created, and the admission path is shared with the CLI.
+
+### Shared admission
+
+`torrentqueue.Admit(store, raw, mode, peers, selection)` now holds the logic the CLI
+had inline: `PrepareSource` (offline for a `.torrent`, identity-only for a magnet),
+public/restricted record split, and `store.Add`, which still decides duplicates and
+conflicts. `torrent queue add` was rewritten to call it, so the TUI and the CLI cannot
+drift.
+
+### Picker
+
+`a` in the queue view opens: masked source field → async inspection → file list with
+exact relative paths and sizes (padding excluded by the existing projection) → review
+(queue root, `btih:`/`btmh:` identity, discovery profile, count/size, "will be added
+paused") → confirm. `a`/`n`/`space` select all/clear/toggle; an empty selection is
+refused and never widened to "all files"; confirmation is single-flight. A v2-only
+torrent is inspectable but refused for queueing. A late inspection result is dropped by
+request generation, and cancelling bumps the generation so the bounded context closes
+the client.
+
+### A real bug the PTY smoke found
+
+Async messages were never routed to the queue or add views: `Update` dispatched
+non-key messages only through its long type switch, and `updateView` (which had the
+`viewTorrentQueue`/`viewTorrentAdd` cases) is only reached for `tea.KeyMsg`. Model tests
+that call the handlers directly could not see it, and BT-10b's live view would not have
+updated in a real terminal either. Fixed with explicit top-level cases for
+`queueDurableMsg`, `queueLiveMsg`, `queuePollMsg`, `torrentInspectMsg` and
+`torrentAdmitMsg`, plus `TestUpdateRoutesAsyncQueueMessages` so the wiring is covered
+from `Update` from now on.
+
+### Verified — real terminal (PTY) smoke
+
+Driven with `script`/`pty` against the built binary, a fresh root and a 2-file
+`.torrent` fixture:
+
+```
+Pick files — fixture (9 B)
+> [ ] fixture/a.bin        5 B
+  [ ] fixture/b.bin        4 B
+0/2 files selected, 0 B
+…
+Add to queue — review
+queue root:  /tmp/tuismoke/root
+source:      btih:f7fef3d4556b54ff54b6c97abf8bff39bd52107b
+discovery:   public
+selected:    2 of 2 files, 9 B
+state:       will be added paused (nothing starts downloading)
+…
+Torrent queue — /tmp/tuismoke/root
+live status: unavailable (no foreground runner is reachable)
+> queued-000001-24280b79     desired=paused recorded=queued
+```
+
+and the record on disk: `desired=paused phase=queued selection=['fixture/a.bin','fixture/b.bin']`.
+The masked field rendered as `***…` throughout, so the source never appears on screen.
+
+### Verified — model tests
+
+| test | result |
+|------|--------|
+| `TestTorrentAddLocalFixture` | offline inspection, subset selection by exact path, one paused entry, no capture, no runner, no workspace directory |
+| `TestTorrentAddEmptySelection` | refused with a message, no admit command produced |
+| `TestTorrentAddSelectAllAndClear` | `a` selects 2/2, `n` clears |
+| `TestTorrentAddDuplicate` | a second confirm returns the same entry and creates nothing |
+| `TestTorrentAddLateInspectionDiscarded` | a stale generation never populates the picker |
+| `TestTorrentAddCancelInspection` | esc bumps the generation; the in-flight result is dropped |
+| `TestTorrentAddV2OnlyRefused` | inspectable, refused for queueing with a v2-only reason |
+| `TestTorrentAddSecretNeverEchoed` | the masked form, a redacted error, the public entry and the record file all lack the passkey |
+| `TestTorrentAddSingleFlight` | second confirm produces no command |
+| `TestTorrentAddNavigationLargeList` | 500 files, cursor to 400, bounded window, count line intact |
+| `TestTorrentAddMalformedSource` | stays on the form with a redacted error |
+| `TestTorrentAddPersistenceFailureKeepsSelection` | review kept, selection kept, error rendered |
+| `TestUpdateRoutesAsyncQueueMessages` | async messages reach their views through `Update` |
+
+### Protocol-level evidence reused, not re-derived
+
+Magnet inspection is covered in the bittorrent package by
+`TestInspectMagnetRequestsNoPayload` (metadata arrives, zero payload requests),
+`TestInspectMagnetTimeoutAndCancelCleanUp` (cancellation closes the client),
+`TestInspectLocalTorrentBuildsNoClient` and `TestInspectRejectsMalformedV2Identity`.
+This slice adds the TUI wiring and the generation/late-message behaviour on top; it does
+not re-prove the protocol.
+
+### Not covered
+
+- The discovery profile shown in review is recorded on the entry; no TUI test drives a
+  magnet through a controlled loopback peer (that stays protocol-level evidence).
+- Ctrl+d cycles public/tracker/direct, but only public was exercised end to end.
+- No PTY run was attempted with a live runner; the queue view's live half was verified
+  in BT-10b.
+- Windows: the picker itself is portable; nothing here uses the Unix socket.

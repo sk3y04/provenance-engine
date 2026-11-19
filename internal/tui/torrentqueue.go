@@ -20,6 +20,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/sk3y04/provenance-engine/internal/torrentqueue"
+	"github.com/sk3y04/provenance-engine/internal/transfer/bittorrent"
 )
 
 const livePollInterval = 2 * time.Second
@@ -42,6 +43,11 @@ type queueState struct {
 	durableErr string
 	gen        int
 	inflight   int
+	// pendingSelect is the id to highlight once it appears in a durable read, so a
+	// just-added entry is selected without guessing its row.
+	pendingSelect string
+	// discoveryMode remembers the last profile used for an add.
+	discoveryMode bittorrent.Discovery
 }
 
 type queueDurableMsg struct {
@@ -136,6 +142,15 @@ func (m *model) updateQueue(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.queue.entries = msg.entries
 			m.queue.durableErr = ""
 			m.reconcileQueueCursor()
+			if m.queue.pendingSelect != "" {
+				for i, e := range m.queue.entries {
+					if e.ID == m.queue.pendingSelect {
+						m.queue.cursor = i
+						m.queue.pendingSelect = ""
+						break
+					}
+				}
+			}
 		}
 		m.finishQueueRefresh()
 		return m, nil
@@ -190,6 +205,8 @@ func (m *model) updateQueueKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.queue.cursor < total-1 {
 			m.queue.cursor++
 		}
+	case "a":
+		return m.openTorrentAdd()
 	case "r":
 		return m, m.refreshQueue()
 	}
@@ -281,7 +298,7 @@ func (m *model) viewTorrentQueue() string {
 			fmt.Fprintf(&b, "  %-26s %s %s\n", trim(a.EntryID, 26), a.Kind, livePhaseText(a))
 		}
 	}
-	b.WriteString("\n↑/↓ move • r refresh • esc back\n")
+	b.WriteString("\n↑/↓ move • a add torrent • r refresh • esc back\n")
 	return clipLines(b.String(), width)
 }
 

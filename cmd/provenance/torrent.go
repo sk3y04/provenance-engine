@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -186,39 +185,15 @@ func queueAddCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("--discovery: %w", err)
 			}
-			prepared, err := bittorrent.PrepareSource(flagTorrentOut, args[0], mode)
-			if err != nil {
-				return err
-			}
 			store, err := queueStore()
 			if err != nil {
 				return err
 			}
-			source := torrentqueue.Source{Kind: prepared.Kind}
-			if prepared.Kind == "file" {
-				if abs, aerr := filepath.Abs(args[0]); aerr == nil {
-					source.Path = abs
-				} else {
-					source.Path = args[0]
-				}
-			} else {
-				source.Magnet = prepared.Sanitized
-			}
-			entry, duplicate, err := store.Add(torrentqueue.AddRequest{
-				Source:     source,
-				RawSource:  args[0],
-				Peers:      flagTorrentPeer,
-				Discovery:  string(mode),
-				Selection:  normalizeCLISelection(flagTorrentSelect),
-				JobID:      prepared.JobID,
-				InfoHash:   prepared.InfoHash,
-				InfoHashV2: prepared.InfoHashV2,
-				Workspace:  prepared.Workspace,
-				Unresolved: prepared.Unresolved,
-			})
+			admitted, err := torrentqueue.Admit(store, args[0], mode, flagTorrentPeer, normalizeCLISelection(flagTorrentSelect))
 			if err != nil {
 				return err
 			}
+			entry, duplicate, prepared := admitted.Entry, admitted.Duplicate, admitted
 			var b strings.Builder
 			switch {
 			case duplicate:

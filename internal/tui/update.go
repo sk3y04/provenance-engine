@@ -41,6 +41,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleMouseClick(msg.Y)
 		}
 
+	case queueDurableMsg, queueLiveMsg, queuePollMsg:
+		return m.updateQueue(msg)
+
+	case torrentInspectMsg, torrentAdmitMsg:
+		return m.updateTorrentAdd(msg)
+
 	case sessionsLoadedMsg:
 		if msg.err != nil {
 			m.err = msg.err.Error()
@@ -426,6 +432,8 @@ func (m *model) updateView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.updateArchiveImportWeb(msg)
 	case viewTorrentQueue:
 		return m.updateQueue(msg)
+	case viewTorrentAdd:
+		return m.updateTorrentAdd(msg)
 	case viewManifestShow:
 		return m.updateManifestShow(msg)
 	case viewManifestVerify:

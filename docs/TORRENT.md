@@ -765,6 +765,33 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
+### Adding a torrent from the TUI
+
+`a` in the queue view opens a picker: enter a `.torrent` path or a magnet (the field
+is **masked**, so a magnet carrying tracker credentials is never echoed to the screen
+or a log), inspect, tick files, review, confirm.
+
+- Inspection is metadata-only and bounded (2 minutes): a local `.torrent` is parsed
+  offline with no client at all, a magnet gets a short-lived client with no payload
+  storage. Leaving the step or the view cancels it by invalidating the request
+  generation, and a late result can never populate a newer picker.
+- Files are listed with their exact relative paths and sizes, protocol padding is
+  excluded by the existing projection, and selection stores those paths — never row
+  positions or display labels. `a` selects all, `n` clears, `space` toggles.
+- An empty selection is refused with a message; it is never widened to the backend's
+  implicit "all files".
+- The review step shows the queue root, the sanitised identity (`btih:`/`btmh:`), the
+  discovery profile, the selected count and size, and that the entry will be added
+  paused. Confirmation is single-flight: a second enter while the add is pending does
+  nothing.
+- The add goes through the same admission path as `torrent queue add`
+  (`torrentqueue.Admit`), so duplicates and conflicts are decided in one place. A
+  v2-only torrent can be inspected but is refused for queueing: the fetch path cannot
+  resume it.
+- Nothing starts a runner, opens a workspace or writes a payload. On success the queue
+  view reopens with the new entry selected by id; on failure the review step keeps the
+  selection and shows a redacted error.
+
 ### Queue view in the TUI (read-only)
 
 The main menu has a **Torrent queue** entry. It shows the durable queue (entry id,
