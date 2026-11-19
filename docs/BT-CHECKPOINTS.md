@@ -220,3 +220,76 @@ and fake local trackers — no external client, no registry, no swarm — and th
 fake-tracker machinery already exists in `discovery_test.go`. Two BT-02 follow-ups
 stay open: give the lab a readiness barrier so it does not depend on the retry,
 and diagnose the `LocalPeer` exit to unblock direction 3.
+
+---
+
+## BT-03 — Private tracker policy and redaction (partially shipped)
+
+**Starting SHA** `e950a21` (tree clean). **Ending SHA** `79cceb5`.
+
+Not complete: the private-metainfo policy, the tracker-only profile and the
+credential rules are shipped and tested; the tracker profile's **transfer path**
+is not, and is recorded as blocked rather than papered over.
+
+### Changed paths
+
+```
+internal/transfer/bittorrent/discovery.go          DiscoveryTracker + tracker client/spec policy
+internal/transfer/bittorrent/bittorrent.go         ErrPrivateTorrentPolicy, checkPrivateFile/checkPrivatePolicy,
+                                                   Info.Private, enforcement before job creation and after metadata
+internal/transfer/bittorrent/inspect.go            reports private=1
+internal/transfer/bittorrent/private_tracker_test.go  new: policy mapping, refusal, inspect, blocked scenarios
+internal/transfer/bittorrent/discovery_test.go     tracker added to the profile table
+cmd/provenance/torrent.go                          flag help + human "private=1" note
+docs/TORRENT.md                                    profile table, BEP 27 audit, credential rules, tests table
+docs/CLI.md                                        tracker profile and the refusal example
+```
+
+### The BEP 27 audit (pinned v1.62.0)
+
+The library gates **all three** discovery channels for `private=1`:
+`torrent.go dhtAnnouncer` (re-checked every loop, so it also covers metadata
+that arrives later via magnet), `pexconn.go pexConnState.Init`, and
+`client.go TorrentInfohashesAndPort` / `OnLPDAnnouncement`. It does **not** gate
+webseeds, magnet metainfo sources, or inbound connections. Provenance closes the
+first two by policy and disables webseeds in every profile; inbound connections
+are expected for a tracker-only swarm.
+
+### Verified
+
+- Tracker profile mapping: `NoDHT`, `DisablePEX`, `DisableWebseeds`,
+  `NoDefaultPortForwarding` set, `DisableTrackers` untouched, LPD nil, listener
+  left on all interfaces, uTP/IPv6 untouched; spec keeps trackers and strips
+  webseeds, metainfo sources, DHT hints and `x.pe`, with the info bytes
+  bit-identical (`TestTrackerPolicyClientConfigAndSpec`).
+- Private `.torrent` under `public` refused with `ErrPrivateTorrentPolicy`,
+  before any job record, payload directory or tracker contact
+  (`TestPrivateTorrentIsRefusedUnderPublicPolicy`).
+- `torrent inspect` reports `private` for a private fixture and not for a plain
+  one (`TestInspectReportsPrivateFlag`).
+- `go test ./internal/transfer/bittorrent/ ./cmd/provenance/ -count=1` → ok
+  (40.716s / 0.033s); `make lint` → 0 issues; `go vet ./...` → clean; gofmt clean.
+
+### Blocked, with the exact symptom
+
+Three scenarios are skipped in `private_tracker_test.go` because the tracker-only
+profile never starts a transfer in this lab: the torrent reports `peers total=0`
+for the whole deadline **even when the peer is passed with `Peers`**, while the
+same fixture transfers fine under `direct` (which turns uTP and the loopback
+listener off). The announce itself works — a fake tracker records it. Prime
+suspect is the uTP dial to a TCP-only peer dropping the peer permanently, which
+the 5s re-offer then repeats. Until that is diagnosed, nothing about the tracker
+profile's transfer path is claimed.
+
+Also unverified: peers handed out by a tracker response (the fake tracker's
+response shape is not accepted by the pinned client yet), so "peers learned from
+a tracker are dialled" has no test.
+
+### Next
+
+Finish BT-03's transfer path: instrument a tracker-profile fetch in the same way
+the cross-client lab was instrumented (`peer_retry_test.go` proxies, plus the
+library's slogger) to see whether the dial is uTP-first and whether disabling
+uTP for the tracker profile is the right answer or a Config seam is needed. If
+that requires a product knob, it is a separate review gate. **BT-05** (per-job
+storage isolation) remains the next independent ticket if BT-03 stalls.
