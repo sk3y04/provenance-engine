@@ -147,6 +147,13 @@ func (j Job) ActiveItem() bool {
 	return false
 }
 
+// ErrJobNotFound is returned for an unknown job id, so a caller can report the
+// user's mistake instead of an operating-system path.
+var ErrJobNotFound = errors.New("unknown job")
+
+// ErrShareRuleNotFound is the equivalent for share rules.
+var ErrShareRuleNotFound = errors.New("unknown share rule")
+
 var jobIDPattern = regexp.MustCompile(`^prov-[0-9a-f]{16,64}$`)
 
 // ValidJobID reports whether id is a well-formed job id. The check exists to keep
@@ -235,6 +242,11 @@ func (s *JobStore) Get(id string) (Job, error) {
 		return Job{}, fmt.Errorf("invalid job id %q", id)
 	}
 	data, err := os.ReadFile(s.path(id))
+	if errors.Is(err, os.ErrNotExist) {
+		// Never surface the record path: it names the operator's filesystem
+		// layout and reads as a bug rather than "that id does not exist".
+		return Job{}, fmt.Errorf("%w: %s", ErrJobNotFound, id)
+	}
 	if err != nil {
 		return Job{}, err
 	}

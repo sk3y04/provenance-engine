@@ -136,6 +136,9 @@ func (s *ShareStore) List() ([]ShareRule, error) {
 // Get returns one rule by id.
 func (s *ShareStore) Get(id string) (ShareRule, error) {
 	data, err := os.ReadFile(filepath.Join(s.dir(), sanitizeShareID(id)+".json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return ShareRule{}, fmt.Errorf("%w: %s", ErrShareRuleNotFound, id)
+	}
 	if err != nil {
 		return ShareRule{}, err
 	}

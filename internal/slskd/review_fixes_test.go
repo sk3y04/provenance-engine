@@ -3,6 +3,7 @@ package slskd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -464,5 +465,26 @@ func TestIngestCleanupTouchesOnlyThisJobsFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(shared, "other-job.flac")); err != nil {
 		t.Fatalf("cleanup deleted a file it did not import: %v", err)
+	}
+}
+
+// TestStoreMissesReadAsNotFound proves an unknown id reports the user's mistake
+// rather than leaking the record path inside the store root.
+func TestStoreMissesReadAsNotFound(t *testing.T) {
+	store := mustOpenStore(t, t.TempDir())
+	_, err := store.Get("prov-0000000000000000")
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("error = %v, want ErrJobNotFound", err)
+	}
+	if strings.Contains(err.Error(), "prov-0000000000000000.json") {
+		t.Fatalf("error leaked the record path: %q", err)
+	}
+
+	shares, err := OpenShareStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shares.Get("absent"); !errors.Is(err, ErrShareRuleNotFound) {
+		t.Fatalf("share error = %v, want ErrShareRuleNotFound", err)
 	}
 }
