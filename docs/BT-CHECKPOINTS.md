@@ -1772,3 +1772,73 @@ shared between two selected files. That remains unverified and is recorded as su
 Fix the seed-pool exit-while-closing defect (the experiment above), then the same
 snapshot contract can back a TUI queue view. Streaming only if polling proves
 inadequate.
+
+## BT-10a.1 — Reproduction below the IPC layer (BT-10a stays partial)
+
+**Starting SHA** `f029b78` (clean). No production behaviour changed in this slice: the
+regressions below pass against the existing lifecycle, and the IPC-level failure
+survives.
+
+### The trace, as measured
+
+I built the smallest deterministic reproduction the ticket asked for, in three steps,
+each with its own completion signal and a distinct attempt id:
+
+1. `TestSeedPoolJoinsClosingAttempt` — drives `runSeeds` alone with a fake session
+   whose `Close` closes `closeEntered` and then blocks on a barrier. **PASSES**: after
+   `Close` is entered the pool does not return; cancelling the context does not make it
+   return either; it returns only once the barrier is released. The active set does hold
+   the handle — `reap` cannot fire before `done` closes, and `done` closes only after
+   `runSeed` returns.
+2. `TestRunJoinsClosingSeedAttempt` — the same scenario one level up through `Run`,
+   with the live endpoint enabled (Run always starts one). **PASSES**: `Run` does not
+   return while `Close` is held, and a competing `store.LockRunner()` is refused, so
+   runner ownership is still held. This is acceptance A, minus the before-fix half:
+   there is no before-fix failure to show below IPC, because the lifecycle is correct
+   there.
+3. `TestLiveStoppingHeldAtClose` — the IPC scenario. **Still fails**, and the failure
+   is now characterised precisely: the stderr trace shows `close entering` immediately
+   followed by `close returned`, then `seed pool: exiting (active=0 pending=false)`,
+   then `run: joined both pools`. In other words the *session's* `Close` returns
+   without honouring the barrier in that variant, so the attempt legitimately ends and
+   the runner legitimately exits — the endpoint then disappears and the query reports
+   "no runner".
+
+The one difference that survives every other variable: this test runs a *second* Run
+on a root where a first Run already published and closed an endpoint. Step 2 passes
+with the endpoint enabled on a fresh root. That points at endpoint teardown or index
+handling across two Runs on one root — not at the pool's active set, and not at the
+slot accounting, both of which are proven by steps 1 and 2.
+
+### What that means for BT-10a
+
+- Acceptance A is satisfied in the form that matters: joining and ownership are proven
+  deterministically, and the "slot and ownership stay held until Close returns" rule
+  holds below IPC.
+- Acceptance B is **not** satisfied: the test cannot observe a stopping attempt over
+  the socket, so live status is still not proven truthful through `Close`.
+- BT-10a stays **partial**. The release gate — live status remains truthful during
+  `Close` — is not met.
+- No production change was made, because none was justified by a reproduced defect.
+  Adding counters or a detached Close to make the IPC test pass would have masked an
+  unlocated problem, and the ticket's stop rule applies.
+
+### Next experiment (recorded, not run)
+
+Reproduce step 3 with the *first* Run removed: a single fresh root, one completed entry
+with seed intent, the fake opener, and the live endpoint. If that passes, run the
+two-Runs-on-one-root variant and log `startLiveServer`/`srv.close()` with the socket
+path and the index contents at publication and removal. The suspected mechanism is the
+first runner's teardown interacting with the second runner's index file.
+
+### Gates
+
+- `go test ./internal/torrentqueue/ -race -run 'TestSeedPool|TestRunJoins|TestLive|TestQueueSeed' -count=3`
+- `make test`, `make lint`, `go vet ./...`, `git diff --check`
+- No skips added to the join regressions; `TestLiveStoppingHeldAtClose` remains a
+  documented skip with the measured cause above.
+
+### Out of scope, unchanged
+
+TUI, streaming, mutation API, remote listeners, download telemetry, the BT-09b
+shared-edge fixture, and scheduler features unrelated to shutdown.
