@@ -637,9 +637,45 @@ queue start A; queue seed A; queue run --max-seeds 1   # A downloads, then serve
 So `phase=queued` with `desired=run` after a pass has drained is expected, not a lost
 intent: the next `queue run` claims it. To watch a download and a seed active at the
 same time, record both intents before launching the runner — start the download, enable
-the seed, then run once. Making a single pass take new work after the download pool
-drains would change when a pass is finished, and is a runner-lifecycle decision, not a
-TUI detail.
+the seed, then run once. `--watch` (next section) is the opt-in that makes a single
+process keep claiming instead.
+
+### Watch mode (`--watch`)
+
+`queue run --watch` is that opt-in persistent session. Same runner, same store, same
+slot limits, same pause/retry/backoff rules, same read-only live endpoint; the only
+difference is what happens when a pool has nothing to claim — it rescans instead of
+returning.
+
+- **Download pool empty** → rescan every `200ms` (the same interval the runner already
+  uses to re-read pause intent). An entry added and started from another shell, or from
+  the TUI, is claimed on the next scan. A blocked entry becomes claimable when its
+  backoff elapses, without a restart.
+- **Seed pool empty** → it keeps scanning too, so `queue seed` issued by another process
+  starts serving inside the same session.
+- **Both idle** → the process stays alive and keeps publishing its live endpoint;
+  `queue live` and the TUI report a runner with `downloads 0/1   seeds 0/1`.
+
+Pickup needs no IPC and no in-process wakeup: every scan re-reads the store under its
+lock, so a record that another process made durable is visible on the next tick. The
+cost is latency, not correctness — work is picked up within one interval (200ms by
+default) plus claim time; it does not queue behind an active attempt.
+
+Stop it with `SIGINT` (`Ctrl-C`). It stops claiming, cancels and joins the active
+attempts, keeps their slots and the runner ownership until every client has closed, and
+removes the live endpoint only after that. The closing line reads `watch ended: …`
+instead of `drained: …`.
+
+```
+provenance torrent queue run --watch --max-seeds 2   # foreground session
+provenance torrent queue start ID                    # another shell: claimed next scan
+provenance torrent queue seed ID                     # or: starts serving next scan
+```
+
+Plain `queue run` is unchanged and still the default: it drains and returns, and a
+download started after its download pool has emptied stays queued for the next
+invocation. Nothing launches a runner from the TUI — Start saves intent, and only a
+running `queue run` (with or without `--watch`) claims it.
 
 ### Records and state
 

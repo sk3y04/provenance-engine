@@ -150,6 +150,14 @@ type Transfer interface {
 type Options struct {
 	// PollInterval is how often pause intent is re-read while a job runs.
 	PollInterval time.Duration
+	// Watch turns the finite drain into a persistent foreground session: when the
+	// download pool has nothing left to claim the runner keeps scanning instead of
+	// returning, and the seed pool keeps scanning after its last seed finishes, so
+	// work saved by another process later in the session is claimed without a
+	// restart. PollInterval is the rescan cadence in both modes, and the store is
+	// re-read on every scan - there is no in-process wakeup to depend on. Zero
+	// value keeps the drain.
+	Watch bool
 	// Backoff is how long a blocked entry waits before it may be claimed again.
 	Backoff time.Duration
 	// MaxActive is the number of concurrent attempts. Zero means the default of 1;
@@ -393,6 +401,8 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 	done := make(chan string, limit)
 	inflight := map[string]context.CancelFunc{}
 	active := 0
+	watch := r.opts.Watch
+	idleLogged := false
 
 	// take releases the slot of one finished attempt: with wait=false only if one is
 	// already available, otherwise it parks until one finishes (or the run is
@@ -458,6 +468,21 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 			}(claimed, claimed.Attempt, attemptCtx)
 		}
 		if active == 0 {
+			if watch {
+				// Watch mode: an empty queue is an idle session, not an exit. Every
+				// scan re-reads the store under its lock, which is how work written
+				// by another process (CLI or TUI) becomes visible here without a
+				// restart; a blocked entry becomes eligible the same way once its
+				// backoff elapses.
+				if !idleLogged {
+					r.logf("idle: watching for eligible work every %s", r.opts.pollInterval())
+					idleLogged = true
+				}
+				if !idleWait(ctx, r.opts.pollInterval()) {
+					break
+				}
+				continue
+			}
 			if seedsOn {
 				// Downloads drained. With managed seeding requested the runner stays
 				// alive while the seed pool has work and exits when it has none, so
@@ -472,6 +497,7 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 			// single-worker runner.
 			break
 		}
+		idleLogged = false
 		take(true)
 	}
 	r.shutdown(inflight, done, active)
@@ -479,6 +505,19 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 		<-seedDone
 	}
 	return sum, nil
+}
+
+// idleWait sleeps for one scan interval and reports whether the run is still live.
+// It is the watch session's only pacing: no busy loop, and no in-process wakeup.
+func idleWait(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // shutdown cancels every active attempt and waits for the workers to return, so

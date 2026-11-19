@@ -128,7 +128,13 @@ func (r *Runner) runSeeds(ctx context.Context, mu *sync.Mutex, sum *Summary) {
 		if len(active) == 0 {
 			pending, perr := r.store.SeedPending()
 			if perr != nil || !pending {
-				return
+				// No eligible seed and nothing pending. A drain ends here: a seed
+				// enabled after the pool emptied belongs to a later invocation. A
+				// watch session keeps scanning instead, so an intent saved by
+				// another process starts serving without a restart.
+				if !r.opts.Watch {
+					return
+				}
 			}
 		}
 		select {

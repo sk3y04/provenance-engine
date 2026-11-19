@@ -31,6 +31,7 @@ var (
 	flagQueueUpRate      string
 	flagQueuePeers       int
 	flagQueueHalfOpen    int
+	flagQueueWatch       bool
 	flagTorrentDiscovery string
 )
 
@@ -579,7 +580,12 @@ func queueRunCmd() *cobra.Command {
 			"This is not a daemon: when nothing is running and nothing is eligible it returns. A pause\n" +
 			"frees its slot only when the job's client has closed, not when the request is recorded:\n" +
 			"when there is nothing left to do it returns. SIGINT stops the active job, records it as\n" +
-			"an interruption (not a pause) and leaves every entry's intent intact.",
+			"an interruption (not a pause) and leaves every entry's intent intact.\n\n" +
+			"With --watch the same process keeps going: once the download pool has nothing left\n" +
+			"to claim it rescans the queue every 200ms instead of returning, so an entry started\n" +
+			"from another shell or from the TUI is picked up without a restart. It still returns\n" +
+			"only when interrupted, still refuses a second runner, and still holds its slots and\n" +
+			"the live endpoint until every active attempt has closed.",
 		Args: cobra.NoArgs,
 		// A failed entry is an outcome, not a usage error: do not bury it under the
 		// flag table.
@@ -616,14 +622,21 @@ func queueRunCmd() *cobra.Command {
 					PeersPerJob:    flagQueuePeers,
 					HalfOpenPerJob: flagQueueHalfOpen,
 					MaxSeeds:       flagQueueMaxSeeds,
+					Watch:          flagQueueWatch,
 					Log:            os.Stdout,
 				})
 			sum, rerr := runner.Run(cmd.Context())
 			if rerr != nil {
 				return rerr
 			}
-			_, _ = fmt.Fprintf(os.Stdout, "drained: %d completed, %d failed, %d blocked, %d paused, %d claimed\n",
-				sum.Completed, sum.Failed, sum.Blocked, sum.Paused, len(sum.Ran))
+			label := "drained"
+			if flagQueueWatch {
+				// A watch session ends by interruption, so it did not "drain"; the same
+				// counters are still what it reports.
+				label = "watch ended"
+			}
+			_, _ = fmt.Fprintf(os.Stdout, "%s: %d completed, %d failed, %d blocked, %d paused, %d claimed\n",
+				label, sum.Completed, sum.Failed, sum.Blocked, sum.Paused, len(sum.Ran))
 			if sum.Failed > 0 {
 				return fmt.Errorf("queue run: %d entr%s failed; inspect with `torrent queue list`", sum.Failed, plural(sum.Failed))
 			}
@@ -637,6 +650,8 @@ func queueRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&flagQueueUpRate, "upload-rate", "", "Aggregate upload budget shared by every attempt, e.g. 512KB (bytes/second; empty means unlimited)")
 	cmd.Flags().IntVar(&flagQueuePeers, "peers-per-job", 0, "Established peers per torrent per attempt (0 keeps the default of 40; max 200)")
 	cmd.Flags().IntVar(&flagQueueHalfOpen, "half-open-per-job", 0, "Outbound handshakes in progress per torrent per attempt (0 derives it from the peer limit)")
+	cmd.Flags().BoolVar(&flagQueueWatch, "watch", false,
+		"Keep scanning after both pools go idle instead of returning (a foreground session; stop with SIGINT)")
 	return cmd
 }
 
