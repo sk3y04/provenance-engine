@@ -1842,3 +1842,77 @@ first runner's teardown interacting with the second runner's index file.
 
 TUI, streaming, mutation API, remote listeners, download telemetry, the BT-09b
 shared-edge fixture, and scheduler features unrelated to shutdown.
+
+## BT-10a.2 — The Close barrier, isolated (BT-10a gate closed)
+
+**Starting SHA** `e96e437` (clean). No production change: the bisect found a test
+boundary defect, not a lifecycle defect.
+
+### Step 1: make the barrier prove what it claims
+
+Each fake session carries its own test id and logs `open`, `serve-enter`,
+`serve-return`, `close-enter`, `close-return` with the queue entry id and a count of
+Close calls and releases. Two channels: `closeIn` (entry) and `allowRet` (release).
+Only the test — or a `t.Cleanup` fallback that logs `released:cleanup` — closes
+`allowRet`; cancellation never does. The captured trace for one run:
+
+```
+TRACE session=S-fresh entry=queued-000001-16b2e95f event=open call=1
+TRACE session=S-fresh entry=queued-000001-16b2e95f event=serve-enter closes=0 releases=0
+TRACE session=S-fresh entry=queued-000001-16b2e95f event=serve-return closes=0 releases=0
+TRACE session=S-fresh entry=queued-000001-16b2e95f event=close-enter closes=1 releases=0
+   fresh: held Close observed as stopping with slot used 1/1
+TRACE session=S-fresh entry=queued-000001-16b2e95f event=released:explicit closes=1 releases=1
+TRACE session=S-fresh entry=queued-000001-16b2e95f event=close-return closes=1 releases=2
+```
+
+That ordering is exactly `dispatch → serve → cancel → close-enter → (held) →
+close-return → attempt done → pool done → Run returned`. `close-enter` belongs to the
+session the opener handed to the runner, `releases=0` at that point, and the snapshot
+taken while held shows one `stopping` seed with `seeds.used = 1`.
+
+### Step 2: controlled comparison
+
+| variant | result |
+|---------|--------|
+| `TestLiveCloseBarrierFreshRoot` | PASS — endpoint answers while serving, then while `Close` is held: Run has not returned, `LockRunner` is refused, the snapshot shows `stopping` with the slot used; after explicit release Run returns, the endpoint stops answering and ownership is free |
+| `TestLiveCloseBarrierReusedRoot` | PASS — identical, after a prior Run published and cleanly closed an endpoint on that root (the prior Run is confirmed returned and its endpoint unreachable first, and the second Run uses a fresh session, barrier and channels) |
+
+So the "second Run on a reused root" hypothesis is dead too: both variants behave
+identically and correctly.
+
+### Step 3: the gate
+
+`TestLiveStoppingHeldAtClose` is **unskipped** and rewritten on the proven barrier —
+the session's own `Close`, not a hook, and the session the opener returned. It asserts,
+while `Close` is held: the runner has not exited, ownership is not free, the snapshot
+names the same entry id as `stopping` with `seeds.used == 1`; then after explicit
+release: Close returns, Run joins, the endpoint stops answering, ownership frees, and
+the workspace re-opens through `OpenSeedSession`.
+
+The old failure was **not reproduced** and is **superseded**: with a barrier that
+provably belongs to the observed session, the lifecycle and the endpoint are correct in
+every configuration tested. One real fixture bug was found and fixed along the way: the
+ownership assertion in the rewritten test had its condition inverted (`err == nil`
+treated as "still held"), which is the same inversion that made an earlier draft look
+like a lifecycle failure.
+
+### What is proven, and what is not
+
+- Proven: a seed slot stays occupied from dispatch until its client's `Close` returns;
+  Run does not return and does not release runner ownership while a dispatched attempt
+  is closing; the live endpoint keeps answering during a graceful stop and reports
+  `stopping`; it stops answering once Run returns; the workspace is reusable afterwards.
+- Not proven: graceful shutdown ordering under a *real* `SeedSession.Close` that is slow
+  (the barrier is synthetic); mixed download+seed shutdown with both pools occupied at
+  the same instant; process death, unchanged and covered separately by the SIGKILL test.
+- No production code changed, so no new claim is made about the runner beyond what
+  BT-10a already stated.
+
+### Gates
+
+- `go test ./internal/torrentqueue/ -race -run TestLiveStoppingHeldAtClose|TestLiveCloseBarrier -count=3` → ok 3.921s
+- `go test ./internal/torrentqueue/ -race -run 'TestLive|TestSeedPool|TestRunJoins|TestQueueSeed' -count=2` → ok 35.258s
+- `make test`, `make lint`, `go vet ./...`, `git diff --check` → recorded with this entry
+- Platform: Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3. No skips in the seed/live
+  suites; Unix sockets only, as before.

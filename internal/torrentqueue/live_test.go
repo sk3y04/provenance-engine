@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sk3y04/provenance-engine/internal/transfer/bittorrent"
 )
 
 // liveQuery retries only the transient "not published yet" window. A runner that has
@@ -107,11 +109,10 @@ func TestLiveSnapshotOverlappingAttempts(t *testing.T) {
 // session's own Close, not a hook, so the invariant is about the runner's slot
 // accounting rather than about a test seam.
 func TestLiveStoppingHeldAtClose(t *testing.T) {
-	// BLOCKED: see the BT-10a.1 checkpoint. The lifecycle passes below the IPC layer
-	// (TestSeedPoolJoinsClosingAttempt, TestRunJoinsClosingSeedAttempt), but with the
-	// endpoint enabled the runner returns while this test still holds the Close
-	// barrier, so a stopping attempt cannot be observed over the socket.
-	t.Skip("blocked: with the live endpoint enabled the runner returns while Close is held; not reproducible below IPC")
+	// The barrier here is the session's own Close, and it is the session handed to the
+	// runner by the opener - not a hook. The old failure was not reproducible once the
+	// barrier was proven to belong to that exact session (see the TRACE lines in
+	// docs/BT-CHECKPOINTS.md and TestLiveCloseBarrierFreshRoot/ReusedRoot).
 	store, err := OpenStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -122,50 +123,72 @@ func TestLiveStoppingHeldAtClose(t *testing.T) {
 		t.Fatalf("seed intent: %v", serr)
 	}
 
-	sess := newPoolSession()
-	opener := &fakeSeedOpener{Adapter: realAdapter(), next: sess}
+	sess := newBarrierSession("live", entry.ID)
+	t.Cleanup(func() { sess.release(t, "cleanup") })
+	opener := &barrierOpener{Adapter: realAdapter(), sess: sess}
 	ctx, cancel := context.WithCancel(context.Background())
 	runnerDone := make(chan struct{})
 	go func() {
 		defer close(runnerDone)
 		_, _ = NewRunner(store, opener, Options{MaxActive: 1, MaxSeeds: 1, PollInterval: 20 * time.Millisecond, Log: os.Stderr}).Run(ctx)
 	}()
-	defer func() { cancel(); <-runnerDone }()
+	t.Cleanup(func() { cancel(); <-runnerDone })
 
 	waitSeedPhase(t, store, entry.ID, SeedServing, 90*time.Second)
 	if _, serr := store.SetSeedIntent(entry.ID, false); serr != nil {
 		t.Fatalf("unseed: %v", serr)
 	}
 	select {
-	case <-sess.closeEntered:
+	case <-sess.closeIn:
 	case <-time.After(60 * time.Second):
 		t.Fatal("the session never reached Close")
 	}
 
-	snap := liveQuery(t, store.Root())
-	if len(snap.Attempts) != 1 || !snap.Attempts[0].Stopping || snap.Attempts[0].Phase != "stopping" {
-		t.Fatalf("during Close the attempt = %+v, want one stopping seed", snap.Attempts)
-	}
-	if snap.Seeds.Used != 1 {
-		t.Fatalf("a closing attempt released its slot early: %+v", snap.Seeds)
-	}
+	// Close is held: Run is still running, ownership is held, and the live client sees
+	// a stopping seed that still occupies its slot.
 	select {
 	case <-runnerDone:
 		t.Fatal("the runner exited while a seed client was still closing")
 	default:
 	}
+	if probe, lerr := store.LockRunner(); lerr == nil {
+		_ = probe.Release()
+		t.Fatal("runner ownership was free while an attempt was closing")
+	}
+	snap := liveQuery(t, store.Root())
+	if len(snap.Attempts) != 1 || !snap.Attempts[0].Stopping || snap.Attempts[0].Phase != "stopping" {
+		t.Fatalf("during Close the attempt = %+v, want one stopping seed", snap.Attempts)
+	}
+	if snap.Attempts[0].EntryID != entry.ID {
+		t.Fatalf("the live attempt is %s, want %s", snap.Attempts[0].EntryID, entry.ID)
+	}
+	if snap.Seeds.Used != 1 {
+		t.Fatalf("a closing attempt released its slot early: %+v", snap.Seeds)
+	}
 
-	close(sess.closeHold)
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		snap = liveQuery(t, store.Root())
-		if len(snap.Attempts) == 0 && snap.Seeds.Used == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("slot never freed after Close: %+v", snap)
-		}
-		time.Sleep(20 * time.Millisecond)
+	// Explicit release: Close returns, the runner joins, ownership frees and the
+	// endpoint stops answering.
+	sess.release(t, "explicit")
+	select {
+	case <-runnerDone:
+	case <-time.After(60 * time.Second):
+		t.Fatal("Run did not return after Close finished")
+	}
+	if _, perr := liveProbe(t, store.Root()); perr == nil {
+		t.Fatal("the endpoint still answered after Run returned")
+	}
+	probe, lerr := store.LockRunner()
+	if lerr != nil {
+		t.Fatalf("runner ownership was not released after Run returned: %v", lerr)
+	}
+	_ = probe.Release()
+	// The workspace is reusable.
+	ws := workspacePath(t, store, entry)
+	if s2, oerr := bittorrent.OpenSeedSession(context.Background(),
+		bittorrent.Config{StagingDir: ws, Discovery: bittorrent.DiscoveryDirect}, entry.JobID); oerr != nil {
+		t.Fatalf("workspace not reusable after shutdown: %v", oerr)
+	} else {
+		_ = s2.Close()
 	}
 }
 
