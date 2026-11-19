@@ -270,6 +270,8 @@ are expected for a tracker-only swarm.
 - `go test ./internal/transfer/bittorrent/ ./cmd/provenance/ -count=1` → ok;
   `make lint` → 0 issues; `go vet ./...` → clean; gofmt clean.
 - All three tracker-profile scenarios pass (`-count=2` on the private fetch).
+- `make test` (`go test -race ./...`, whole repository) on the committed
+  revision → every package ok, `internal/transfer/bittorrent` 56.430s.
 
 ### Correction: the tracker profile's transfer path is verified
 
