@@ -781,7 +781,8 @@ Gates on `dbb4f3e` (Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores):
 - `go test ./internal/torrentqueue/ -count=3` → `ok 23.196s`
 - `go test ./internal/transfer/bittorrent/ ./cmd/provenance/ -count=1` → `ok 44.019s`, `ok 0.034s`
 - `go test ./internal/torrentqueue/ -run 'TestQueueReal|TestQueueAdopts|TestQueueConflicting|TestQueueBusy' -count=1` → pass
-- `make test` (repo-wide, `-race`) → exit 0, all packages ok
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok,
+  `internal/torrentqueue 25.369s` (the two SIGKILL tests run inside it)
 - `go vet ./...` clean, `gofmt -l ./cmd ./internal` empty, `golangci-lint run ./...` → `0 issues`, `git diff --check` clean
 - CLI smoke (`bt07-smoke`, real binary):
   - `queue add "magnet:?xt=…&tr=http://tracker.example/announce?passkey=SECRET&x.pe=10.9.9.9:6881" --select fixture/a.bin --discovery direct` → `queued-000001-c627a1e8 added paused for bt-cccc…`
@@ -809,3 +810,123 @@ Gates on `dbb4f3e` (Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores):
 runner's single-worker loop, `not_before` backoff, and per-entry recorded profile.
 BT-09's safe removal is the other independent follow-up. The BT-02/04 matrix rows
 remain explicitly unproven and untouched.
+
+## BT-08 (first slice) — Bounded concurrent downloads in the queue runner
+
+**Starting SHA** `7efb359` (tree clean). **Ending SHA** `d3bac30`.
+
+Scope shipped: `queue run --max-active N`, a bounded slot scheduler over the
+existing foreground runner. Default 1; the flag refuses < 1 and > 32. Not shipped,
+by decision: aggregate bandwidth/peer limits, managed seeding, priority beyond FIFO
+eligibility, remote control, TUI, destructive removal.
+
+### Changed paths
+
+- `internal/torrentqueue/runner.go` — coordinator (`take`, `nextExcept`, `claim`,
+  `updateAttempt`, `shutdown`), `Options.MaxActive`/`Validate`, attempt tokens,
+  `Summary.Stale`.
+- `internal/torrentqueue/store.go` — `Entry.Attempt` token, `newAttemptToken`, and a
+  bounded store-lock retry.
+- `internal/torrentqueue/concurrency_test.go` (new) — slot cap, FIFO, invalid
+  limits, pause isolation, stale results, shutdown, busy-with-sibling.
+- `internal/torrentqueue/process_test.go` (new) — two real SIGKILL tests with a
+  re-exec child runner.
+- `internal/torrentqueue/integration_test.go` — two same-name concurrent transfers,
+  one-workspace race, peak-concurrency wrapper.
+- `cmd/provenance/torrent.go` — `--max-active` (default 1, explicit zero and
+  negatives refused by the flag).
+- `docs/TORRENT.md` — "Concurrency (`--max-active`)".
+
+### What a slot is, and when it is released
+
+A slot is **one active attempt**: from resolution (metadata exchange for an
+unresolved magnet) through the backend closing its client and releasing the
+workspace lock. `Runner.Run` dispatches an attempt in a goroutine and treats that
+goroutine's return as the release, so:
+
+| event | slot released? |
+|-------|----------------|
+| pause requested, entry `stopping` | no - the attempt is still closing |
+| capture published | no - the attempt still has to close |
+| attempt returned (success, failure, busy, cancel) | yes |
+| blocked with a future `not_before` | yes - it is not running at all |
+
+### Draining, paused/failed/busy
+
+- Drained = nothing running **and** nothing eligible. Paused (desired), failed
+  (needs `retry`), and blocked-with-future-`not_before` entries are ineligible, so a
+  drain returns instead of polling. Unchanged from BT-07 by design.
+- A busy workspace becomes `blocked` with a backoff and does not stop unrelated
+  entries: the sibling completes in the same drain and the busy entry is attempted
+  exactly once (asserted).
+- On shutdown the coordinator stops claiming, cancels every active attempt, waits
+  for each to return, and only then returns; `Summary` is final at that point.
+
+### Verified (fake backend)
+
+`go test ./internal/torrentqueue/ -count=2` → `ok 48.038s`; `-count=3` for the
+concurrency set:
+
+| Test | Demonstrates |
+|------|--------------|
+| `TestQueueMaxActiveOverlapAndFIFO` | with `MaxActive=2` exactly two attempts overlap, peak concurrency is 2, the two lowest sequence entries are claimed first, and the third starts only after a slot frees |
+| `TestQueueDefaultMaxActiveIsOne` | the zero value still means one worker |
+| `TestQueueInvalidMaxActive` | negative, 33 and 1000 are refused before any claim; the documented limit is accepted; zero means default for in-process callers |
+| `TestQueuePauseOneKeepsSibling` | pausing A cancels only A; B keeps running; A stays `stopping` and keeps its slot while its client is still closing; only after it closes does A become `paused` and the third entry start |
+| `TestQueueStaleResultIsIgnored` | a newer command (pause) replaces the attempt token; the old attempt's result is counted `Stale` and does not overwrite the pause or record a capture |
+| `TestQueueShutdownWithMultipleActive` | both active attempts are cancelled and waited for, both end `run`/`queued` with a shutdown note, the paused entry is untouched, no attempt is still active when `Run` returns, and the runner lock is released |
+| `TestQueueBusyDoesNotBlockSibling` | the busy entry is attempted once, ends `blocked` with a backoff, and the healthy entry completes in the same drain |
+
+### Verified (real backend, loopback seeders)
+
+| Test | Demonstrates |
+|------|--------------|
+| `TestQueueRealConcurrentSameName` | two torrents sharing display name and relative path but not bytes: peak concurrency 2, distinct workspaces, distinct completion databases under each, payloads matching their own fixtures, one run manifest each, distinct capture keys |
+| `TestQueueRealSameWorkspaceRace` | the same torrent submitted as a magnet and as a `.torrent` dedupes to one entry (same job + selection); a differing selection creates a second entry; the loser ends `blocked` (busy) or fails on selection; a later drain never produces a second manifest or capture item, and the job record's selection is unchanged |
+| `TestQueueRealInterruptAndResume`, `TestQueueAdoptsCapturePublishedBeforeQueueUpdate`, `TestQueueConflictingSelectionIsRejected`, `TestQueueBusyWorkspaceBlocksThenRetries` | BT-07 regressions, still green |
+
+### Verified (real process death)
+
+Both use a re-exec child (`TestQueueRunnerHelper`) that runs the real adapter, and
+`SIGKILL` on the child - not an injected error:
+
+| Test | Demonstrates |
+|------|--------------|
+| `TestQueueRunnerKilledMidTransfer` | the child holds the runner lock and has written payload; kill -9; the flock is released by the OS (a held lock, not a file, is ownership); the record still says `running` with no capture; a fresh runner reacquires ownership, reconciles to `queued`, resumes the same workspace, completes with `attempts=2`, exactly one run manifest, payload matching the fixture, and only the interrupted entry claimed; a second, unrelated paused entry stays `paused`/`queued` with 0 attempts |
+| `TestQueueRunnerKilledAfterPublish` | the child publishes the capture and blocks before the queue update (`BeforeResultPersist` marker), then is killed; the record is still `running` with no capture while the workspace holds one manifest; the restart adopts it, claims nothing (`len(sum.Ran)==0`), and leaves exactly one manifest. Reported separately from BT-07's injected-error test, which simulates the same boundary in-process |
+
+### Gates
+
+Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores, on `d3bac30`:
+
+- `go test ./internal/torrentqueue/ -count=2` → `ok 48.038s`
+- `go test ./internal/torrentqueue/ -run '<concurrency|process|real>' -count=1` → pass
+- `go vet ./...` clean, `gofmt -l ./cmd ./internal` empty, `golangci-lint run ./...`
+  → `0 issues`, `git diff --check` clean
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok
+- CLI smoke (`bt08-smoke`, real binary, three unreachable magnets):
+  `--max-active 0` → `error: --max-active must be at least 1, got 0`; `-3` →
+  the same with `-3`; `99` → `max-active 99 is too high: the limit is 32 …`;
+  `--max-active 2 --timeout 2s` → `1: running`, `2: running`, `1: failed`,
+  `3: running`, `2: failed`, `3: failed`, `drained: 3 claimed` - two at a time,
+  the third only after a slot freed.
+
+### Not verified / not claimed
+
+- **Throughput or timing benefits.** Concurrency is proven by observed overlap and
+  slot accounting, not by a benchmark; no claim is made that N workers are N times
+  faster on a shared uplink.
+- **Aggregate bandwidth or peer limits.** Out of scope for this slice; each slot is
+  a full client with its own peers.
+- **Starvation policy.** FIFO among *eligible* entries only; a permanently blocked
+  or repeatedly failing entry is skipped, but there is no ageing or priority.
+- **Kill during a pause-close window, or several kills in a row.** The two process
+  tests cover mid-transfer and post-publication boundaries.
+- **Windows process semantics.** The kill tests use `SIGKILL` on Linux; the flock
+  helper is shared, but no Windows execution was run.
+
+### Next
+
+**BT-08 continuation** (aggregate limits, managed seeding, stall diagnosis) or
+**BT-09** (selection, priorities, safe removal). The BT-02/04 matrix rows remain
+unproven and untouched.
