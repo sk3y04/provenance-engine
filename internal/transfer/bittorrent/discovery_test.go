@@ -106,7 +106,7 @@ func TestParseDiscovery(t *testing.T) {
 			t.Errorf("ParseDiscovery(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
-	for _, bad := range []string{"swarm", "offline", "public,direct", "none", "tracker"} {
+	for _, bad := range []string{"swarm", "offline", "public,direct", "none", "private"} {
 		if _, err := ParseDiscovery(bad); err == nil {
 			t.Errorf("ParseDiscovery(%q) accepted an unknown profile", bad)
 		} else if !errors.Is(err, ErrInvalidDiscovery) {

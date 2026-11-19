@@ -430,7 +430,7 @@ provenance archive import ./downloads/release --collection music --vault ~/Vault
 | `-o`, `--output` | string | `./downloads` | Staging root for `fetch` and `status`; `inspect` does not use it |
 | `--select` | string (repeatable) | *(required for fetch)* | Exact file path from `inspect`; commas also accepted |
 | `--peer` | string (repeatable) | - | Explicit `host:port` peer, for private swarms |
-| `--discovery` | string | `public` | Peer discovery profile: `public` (trackers, DHT, PEX) or `direct` (explicit `--peer` only). Any other value is an error |
+| `--discovery` | string | `public` | Peer discovery profile: `public` (trackers, DHT, PEX), `tracker` (trackers only, required for BEP 27 private torrents) or `direct` (explicit `--peer` only). Any other value is an error |
 | `--max-bytes` | size | `0` (no limit) | Reject a selection larger than this before downloading |
 | `--timeout` | duration | `0` (no limit) | Overall deadline for the fetch |
 | `--seed` | bool | `false` | Keep seeding after capture until interrupted |
@@ -449,6 +449,22 @@ provenance torrent fetch ./release.torrent --select "release/track.flac" \
 
 `public` is the default and behaves like earlier builds: trackers, DHT, PEX and
 the peers given with `--peer`.
+
+`tracker` keeps the announce path and closes everything else: no DHT, PEX, local
+discovery, webseeds or metainfo sources, and magnet-supplied peer addresses are
+ignored. It is what a BEP 27 private swarm needs, and it is required for one — a
+torrent whose metainfo sets `private=1` is refused under `public`:
+
+```
+$ provenance torrent fetch private.torrent --select "album/track.flac"
+Error: private torrent requires an explicit discovery profile: the metainfo sets
+BEP 27 private=1; use --discovery tracker (or --discovery direct with --peer)
+```
+
+`torrent inspect` shows the flag as `"private": true` (and `private` in the human
+list), so the profile can be chosen before a fetch. A private **magnet** can only
+be classified once its metadata arrives, so fetching one under `public` fails at
+that point with a message saying discovery already ran.
 
 `direct` uses **only** the peers given with `--peer`. It does not announce to or
 scrape trackers, create a DHT (so there is no bootstrap lookup), advertise or

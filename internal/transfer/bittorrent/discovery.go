@@ -30,6 +30,19 @@ const (
 	// NAT-PMP port mapping is never requested.
 	DiscoveryPublic Discovery = "public"
 
+	// DiscoveryTracker is the tracker-only profile, the shape a BEP 27 private
+	// swarm needs: the torrent's own trackers are the only peer source, so DHT,
+	// PEX and local service discovery are all off. Webseeds and metainfo
+	// sources are off too — a private swarm's operator can see any request a
+	// client makes, and neither is a peer the tracker handed out. The listener
+	// stays on all interfaces so tracker-provided peers can reach it; unlike
+	// direct, inbound connections are expected.
+	//
+	// It is a peer-discovery policy, not a declaration of the torrent's privacy:
+	// it is allowed for a public torrent as a stricter choice, and it is required
+	// for a private one (see ErrPrivateTorrentPolicy).
+	DiscoveryTracker Discovery = "tracker"
+
 	// DiscoveryDirect uses only the peers the caller named. Trackers are not
 	// announced to or scraped, no DHT is created, PEX is neither advertised nor
 	// accepted, no webseed or metainfo source is added, and magnet-supplied
@@ -52,16 +65,22 @@ func ParseDiscovery(raw string) (Discovery, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", string(DiscoveryPublic):
 		return DiscoveryPublic, nil
+	case string(DiscoveryTracker):
+		return DiscoveryTracker, nil
 	case string(DiscoveryDirect):
 		return DiscoveryDirect, nil
 	}
-	return "", fmt.Errorf("%w: %q (want %q or %q)", ErrInvalidDiscovery, raw, DiscoveryPublic, DiscoveryDirect)
+	return "", fmt.Errorf("%w: %q (want %q, %q or %q)", ErrInvalidDiscovery, raw,
+		DiscoveryPublic, DiscoveryTracker, DiscoveryDirect)
 }
 
 // String renders the profile, never empty.
 func (d Discovery) String() string {
-	if d == DiscoveryDirect {
+	switch d {
+	case DiscoveryDirect:
 		return string(DiscoveryDirect)
+	case DiscoveryTracker:
+		return string(DiscoveryTracker)
 	}
 	return string(DiscoveryPublic)
 }
@@ -90,6 +109,18 @@ func (d Discovery) IsDirect() bool { return d == DiscoveryDirect }
 //     no `tcp6`/`udp6` socket is opened, so an inbound connection can only come
 //     from the local host.
 func applyClientDiscovery(cc *at.ClientConfig, d Discovery) {
+	if d == DiscoveryTracker {
+		// Tracker-only: keep the announce path, close everything else. The
+		// listener is left as the library configured it, because peers the
+		// tracker returns have to be able to connect back.
+		cc.NoDHT = true
+		cc.DisablePEX = true
+		cc.DisableWebseeds = true
+		cc.DisableWebtorrent = true
+		cc.NoDefaultPortForwarding = true
+		cc.LocalServiceDiscovery = nil
+		return
+	}
 	if !d.IsDirect() {
 		return
 	}
@@ -119,10 +150,12 @@ func applyClientDiscovery(cc *at.ClientConfig, d Discovery) {
 // piece layers describe the torrent's identity and content, and a discovery
 // policy has no business editing them.
 func applySpecDiscovery(spec *at.TorrentSpec, d Discovery) {
-	if spec == nil || !d.IsDirect() {
+	if spec == nil || !d.IsDirect() && d != DiscoveryTracker {
 		return
 	}
-	spec.Trackers = nil
+	if d.IsDirect() {
+		spec.Trackers = nil
+	}
 	spec.Webseeds = nil
 	spec.Sources = nil
 	spec.DhtNodes = nil

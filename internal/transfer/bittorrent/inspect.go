@@ -235,6 +235,7 @@ func infoFromMetainfo(src source, info *metainfo.Info, rels []string) Info {
 		InfoHashV2:  src.id.V2Hex(),
 		Name:        info.BestName(),
 		TotalLength: info.TotalLength(),
+		Private:     isPrivateInfo(info),
 		Files:       make([]File, 0, len(rels)),
 		Source:      src.canonical(),
 	}

@@ -105,6 +105,11 @@ var (
 	// try again once the owner exits (or releases the root by closing its
 	// Session).
 	ErrStagingBusy = errors.New("staging root is busy")
+	// ErrPrivateTorrentPolicy means the torrent sets BEP 27's private=1 and the
+	// run's discovery profile is not one that may handle it. A private swarm's
+	// peers come from its tracker (or from addresses the caller passes), never
+	// from discovery, so the profile has to say so before anything is dialled.
+	ErrPrivateTorrentPolicy = errors.New("private torrent requires an explicit discovery profile")
 )
 
 // Test seams for the two durability boundaries this slice defines. Production
@@ -189,6 +194,9 @@ type Info struct {
 	Name        string `json:"name"`
 	TotalLength int64  `json:"total_length"`
 	Files       []File `json:"files"`
+	// Private is BEP 27's private=1 flag: the torrent's peers may only come
+	// from its trackers (or from addresses the caller passes).
+	Private bool `json:"private,omitempty"`
 	// Source is the sanitised source reference (a magnet URI carrying only
 	// the v1 infohash, never trackers or passkeys).
 	Source string `json:"source"`
@@ -556,6 +564,43 @@ func (s *Session) admitSpec(spec *at.TorrentSpec) {
 	applySpecDiscovery(spec, s.cfg.Discovery)
 }
 
+// isPrivateInfo reports BEP 27's private=1 flag on a parsed info dictionary.
+func isPrivateInfo(info *metainfo.Info) bool {
+	return info != nil && info.Private != nil && *info.Private
+}
+
+// checkPrivatePolicy refuses a private torrent under a profile that would leave
+// discovery to chance. The pinned library does gate DHT, PEX and local discovery
+// for a private torrent (see docs/TORRENT.md), but that is the library's
+// behaviour, not our policy: relying on it silently is exactly what makes a
+// private swarm leak when the pin changes. The caller has to choose tracker-only
+// (or direct, when every peer is passed by hand).
+func checkPrivatePolicy(info *metainfo.Info, d Discovery) error {
+	if !isPrivateInfo(info) {
+		return nil
+	}
+	if d == DiscoveryTracker || d.IsDirect() {
+		return nil
+	}
+	return fmt.Errorf("%w: the metainfo sets BEP 27 private=1; use --discovery tracker (or --discovery direct with --peer)",
+		ErrPrivateTorrentPolicy)
+}
+
+// checkPrivateFile applies the private-torrent policy to a local .torrent before
+// any job state exists. It re-reads the file under the same size cap parseSource
+// already enforced.
+func (s *Session) checkPrivateFile(src source) error {
+	mi, err := metainfo.LoadFromFile(src.path)
+	if err != nil {
+		return fmt.Errorf("load %s: %w", filepath.Base(src.path), err)
+	}
+	info, err := mi.UnmarshalInfo()
+	if err != nil {
+		return fmt.Errorf("parse info of %s: %w", filepath.Base(src.path), err)
+	}
+	return checkPrivatePolicy(&info, s.cfg.Discovery)
+}
+
 // checkVerifiable refuses a torrent whose pieces can never be verified with the
 // data on hand. BitTorrent v2 piece hashes live in the .torrent's top-level
 // "piece layers" table, and BEP 9 metadata exchange transfers only the info
@@ -695,6 +740,15 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 	}
 	if len(selection) == 0 {
 		return Capture{}, ErrSelectionRequired
+	}
+	// A local .torrent states its privacy up front, so a profile that may not
+	// handle it is refused before a job record, a lock file or a dial exists.
+	// (The resume and magnet paths are checked again once the client holds the
+	// info, because neither has the metainfo yet at this point.)
+	if src.kind == "file" {
+		if err := s.checkPrivateFile(src); err != nil {
+			return Capture{}, err
+		}
 	}
 	if s.cfg.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -978,6 +1032,8 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 				return nil, fmt.Errorf("%s: identity %s changed while it was read", filepath.Base(src.path), got)
 			} else if _, verr := validateInfoPaths(&info); verr != nil {
 				return nil, verr
+			} else if perr := checkPrivatePolicy(&info, s.cfg.Discovery); perr != nil {
+				return nil, perr
 			}
 			spec := at.TorrentSpecFromMetaInfo(mi)
 			s.admitSpec(spec)
@@ -1024,6 +1080,9 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 	if !resolved.Compare(src.id) {
 		return nil, fmt.Errorf("metadata identity %s does not match source %s", resolved, src.id)
 	}
+	if err := checkPrivatePolicy(t.Info(), s.cfg.Discovery); err != nil {
+		return nil, fmt.Errorf("%w (discovery already ran while the metadata was being fetched, so this magnet cannot be treated as private retroactively)", err)
+	}
 	if err := s.checkVerifiable(resolved, t.Metainfo()); err != nil {
 		return nil, err
 	}
@@ -1052,6 +1111,7 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 		InfoHash:    src.infoHash.HexString(),
 		Name:        name,
 		TotalLength: info.TotalLength(),
+		Private:     isPrivateInfo(info),
 		Files:       make([]File, 0, len(files)),
 		Source:      src.canonical(),
 	}

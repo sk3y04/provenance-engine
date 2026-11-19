@@ -53,7 +53,7 @@ you are authorized to download.`,
 	}
 	cmd.PersistentFlags().StringVarP(&flagTorrentOut, "output", "o", "./downloads", "Staging directory for fetch and status (inspect does not use it)")
 	cmd.PersistentFlags().StringArrayVar(&flagTorrentPeer, "peer", nil, "Explicit peer address host:port (repeatable, for private swarms)")
-	cmd.PersistentFlags().StringVar(&flagTorrentDiscovery, "discovery", "public", "Peer discovery profile: public (trackers, DHT, PEX) or direct (explicit --peer only)")
+	cmd.PersistentFlags().StringVar(&flagTorrentDiscovery, "discovery", "public", "Peer discovery profile: public (trackers, DHT, PEX), tracker (trackers only), or direct (explicit --peer only)")
 	cmd.PersistentFlags().StringVar(&flagTorrentMaxBytes, "max-bytes", "", "Reject a selection larger than this, e.g. 4GB")
 	cmd.PersistentFlags().DurationVar(&flagTorrentTimeout, "timeout", 0, "Overall transfer deadline, e.g. 30m (default: no limit)")
 	cmd.PersistentFlags().BoolVar(&flagTorrentSeed, "seed", false, "Keep seeding the completed torrent until interrupted")
@@ -173,6 +173,9 @@ func runTorrentInspect(ctx context.Context, source string, stdout io.Writer) err
 	}
 	_, _ = fmt.Fprintf(os.Stderr, "[provenance] %s — %d file(s), %s total\n",
 		info.Name, len(info.Files), manifest.HumanSize(info.TotalLength))
+	if info.Private {
+		_, _ = fmt.Fprintf(os.Stderr, "[provenance] private=1 (BEP 27): fetch with --discovery tracker, or direct with --peer\n")
+	}
 	for i, f := range info.Files {
 		_, _ = fmt.Fprintf(stdout, "%2d. %10s  %s\n", i+1, manifest.HumanSize(f.Length), f.Path)
 	}

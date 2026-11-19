@@ -119,19 +119,71 @@ default and preserves the behaviour of earlier builds; `direct` is the
 explicit-peers-only profile. The value is validated before anything else
 happens, and an unknown value is an error — there is no fallback.
 
-| Branch | `public` | `direct` |
-|--------|----------|----------|
-| Explicit `--peer` addresses | dialled | dialled (the only source) |
-| Tracker announce / scrape (magnet `tr=`, `.torrent` announce/announce-list) | yes | **no** |
-| DHT (and its bootstrap lookup) | yes | **no** — no DHT server is created |
-| PEX (advertising and accepting) | yes | **no** |
-| Webseeds (magnet `ws=`, `.torrent` url-list) | no (pinned off since the first slice) | no, and the URLs are stripped from the spec |
-| Metainfo sources (magnet `xs=`/`as=`, HTTP fetch) | library default | **no** — stripped from the spec |
-| Peer addresses inside a magnet (`x.pe`) | dialled | **no** — stripped from the spec |
-| Local service discovery (BEP 14 multicast) | off (opt-in, never enabled) | off |
-| UPnP / NAT-PMP port mapping | off | off |
-| Listener | all interfaces | `127.0.0.1` only; IPv6 and uTP off |
-| Inbound connections | accepted | loopback only |
+| Branch | `public` | `tracker` | `direct` |
+|--------|----------|-----------|----------|
+| Explicit `--peer` addresses | dialled | dialled | dialled (the only source) |
+| Tracker announce / scrape (magnet `tr=`, `.torrent` announce/announce-list) | yes | **yes** (the only source) | **no** |
+| DHT (and its bootstrap lookup) | yes | **no** | **no** — no DHT server is created |
+| PEX (advertising and accepting) | yes | **no** | **no** |
+| Webseeds (magnet `ws=`, `.torrent` url-list) | no (pinned off since the first slice) | no, and the URLs are stripped from the spec | no, and the URLs are stripped from the spec |
+| Metainfo sources (magnet `xs=`/`as=`, HTTP fetch) | library default | **no** — stripped from the spec | **no** — stripped from the spec |
+| Peer addresses inside a magnet (`x.pe`) | dialled | **no** — stripped from the spec | **no** — stripped from the spec |
+| Local service discovery (BEP 14 multicast) | off (opt-in, never enabled) | off | off |
+| UPnP / NAT-PMP port mapping | off | off | off |
+| Listener | all interfaces | all interfaces | `127.0.0.1` only; IPv6 and uTP off |
+| Inbound connections | accepted | accepted (tracker peers must reach us) | loopback only |
+
+`tracker` is the shape a BEP 27 private swarm needs: the torrent's own trackers
+are the only peer source. It is a peer-discovery policy, not a statement about
+the torrent — allowed for a public torrent as a stricter choice, and required
+for a private one.
+
+### Private torrents (BEP 27)
+
+The pinned library already refuses the three discovery channels for a torrent
+whose info dictionary sets `private=1`:
+
+| Path | Where the pin gates it |
+|------|------------------------|
+| DHT announce and peer lookup | `torrent.go` `dhtAnnouncer` re-checks `isPrivate()` every loop, including after a magnet's metadata arrives |
+| PEX, both directions | `pexconn.go` `pexConnState.Init` returns before enabling the extension |
+| Local service discovery, both directions | `client.go` `TorrentInfohashesAndPort` and `OnLPDAnnouncement` skip private torrents |
+
+It does **not** gate: webseeds (`url-list`), metainfo sources (`xs=`/`as=` on a
+magnet), or inbound connections. Provenance closes the first two by policy in
+both `tracker` and `direct`, and disables webseeds in every profile.
+
+Because that library behaviour is not our contract, Provenance decides it
+explicitly instead of inheriting it:
+
+- A local `.torrent` that sets `private=1` is **refused** under `public`
+  (`ErrPrivateTorrentPolicy`) before a job record, a lock or a dial exists. The
+  error names `tracker` and `direct` as the profiles that may handle it.
+- A **magnet** cannot be classified before its metadata arrives, so a private
+  magnet fetched under `public` fails once the metadata shows `private=1`, with
+  a message saying discovery already ran while the metadata was being fetched
+  and cannot be undone. Such a swarm has to be fetched with `--discovery
+  tracker` (or `direct` with explicit peers) from the start.
+- `torrent inspect` reports `private` in its file listing, so the profile can be
+  chosen before anything is dialled.
+
+### Tracker credentials and resume state
+
+A private swarm's announce URLs usually carry a passkey. The rules the adapter
+keeps:
+
+- The **job record** stores the source as a bare identity (`magnet:?xt=urn:btih:…`),
+  never a tracker URL. The same is true of capture manifests and capture items.
+- The **persisted metainfo** at `.provenance/torrent/<hash>.torrent` is the
+  permission-restricted original/resume copy: it is written `0600` and it does
+  carry the announce list, because a resume has to announce again on the same
+  terms. It is not a public artifact.
+- A `direct` run persists a metainfo with no announce list at all, so resume
+  state from a direct run carries no credentials (see "Discovery profiles").
+
+The audit is a test (`TestTrackerCredentialsStayOutOfJobAndCapture`), not a
+claim: it plants a synthetic passkey in the announce URL and walks every file a
+fetch produces.
 
 ### How it is enforced
 
@@ -789,6 +841,7 @@ loopback endpoints. Covered:
 | `inspect_test.go` | local `.torrent` inspected with a client-construction counter stuck at 0; magnet inspection resolves metadata while the seeder reports 0 payload bytes and 0 chunks written; no temp dir survives; inspection leaves an existing staging root byte-identical; rejection before storage open for unknown selection, path collision and symlinked payload path (storage spy count 0), and exactly one open on the admitted path; metadata timeout and cancellation clean up; v2/hybrid refused for inspect and fetch |
 | `ownership_process_test.go` → `TestInspectDoesNotNeedStagingOwnership` | a separate process inspects a magnet while another process owns the staging root, writes nothing there, and does not disturb ownership |
 | `status_process_test.go` (real CLI, real processes) | `torrent status` against a root owned by a seeding process returns promptly with the recorded capture, leaves the tree unchanged, and does not disturb ownership (a competing fetch is still busy); after `SIGKILL` of that owner, status reports the last recorded state as recorded while a lock file still exists, and a later fetch acquires the root and reconciles |
+| `private_tracker_test.go` | BEP 27: the tracker profile's client config and spec (trackers kept, everything else stripped, identity untouched); a private `.torrent` refused under `public` with no job record, no payload and no tracker contact; `inspect` reporting `private`; three tracker-profile scenarios (private fetch, tier failover, passkey audit) that are skipped with the reason recorded — see "Private torrents" |
 | `discovery_test.go` | profile parsing and validation; the client-config mapping for both profiles; the spec sanitisation (and that it leaves identity bytes untouched); a direct client opens no UDP socket and binds loopback only, against a public client as control; a live tracker tripwire that announces when trackers are enabled and is never touched in direct mode (fetch, inspect, resume and repair); a webseed tripwire that serves a real ranged download when enabled and is never touched in direct mode; magnet `x.pe` ignored in direct mode; resume state stripped of trackers and webseed URLs in direct mode but not in public; invalid profiles refused before the staging root or a temp client exists |
 | `cmd/provenance` torrent tests | `--discovery` is inherited by `inspect`/`fetch`, an unknown value is rejected naming both valid values, and `fetch` refuses it before creating the staging root |
 | path unit tests | component validation, containment, peer parsing, kind mapping |
