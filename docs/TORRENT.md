@@ -182,8 +182,9 @@ keeps:
   state from a direct run carries no credentials (see "Discovery profiles").
 
 The audit is a test (`TestTrackerCredentialsStayOutOfJobAndCapture`), not a
-claim: it plants a synthetic passkey in the announce URL and walks every file a
-fetch produces.
+claim: it plants a synthetic passkey in the announce URL, proves the URL was
+really used by the announce the local tracker receives, and then walks every
+file the fetch produced. Only the 0600 metainfo copy contains it.
 
 ### How it is enforced
 
@@ -841,7 +842,7 @@ loopback endpoints. Covered:
 | `inspect_test.go` | local `.torrent` inspected with a client-construction counter stuck at 0; magnet inspection resolves metadata while the seeder reports 0 payload bytes and 0 chunks written; no temp dir survives; inspection leaves an existing staging root byte-identical; rejection before storage open for unknown selection, path collision and symlinked payload path (storage spy count 0), and exactly one open on the admitted path; metadata timeout and cancellation clean up; v2/hybrid refused for inspect and fetch |
 | `ownership_process_test.go` → `TestInspectDoesNotNeedStagingOwnership` | a separate process inspects a magnet while another process owns the staging root, writes nothing there, and does not disturb ownership |
 | `status_process_test.go` (real CLI, real processes) | `torrent status` against a root owned by a seeding process returns promptly with the recorded capture, leaves the tree unchanged, and does not disturb ownership (a competing fetch is still busy); after `SIGKILL` of that owner, status reports the last recorded state as recorded while a lock file still exists, and a later fetch acquires the root and reconciles |
-| `private_tracker_test.go` | BEP 27: the tracker profile's client config and spec (trackers kept, everything else stripped, identity untouched); a private `.torrent` refused under `public` with no job record, no payload and no tracker contact; `inspect` reporting `private`; three tracker-profile scenarios (private fetch, tier failover, passkey audit) that are skipped with the reason recorded — see "Private torrents" |
+| `private_tracker_test.go` | BEP 27: the tracker profile's client config and spec (trackers kept, everything else stripped, identity untouched); a private `.torrent` refused under `public` with no job record, no payload and no tracker contact; `inspect` reporting `private`; a private torrent fetched under the tracker profile through a peer announced to a local tracker; announce-list tier failover (dead tier, then the live one); a synthetic passkey audit that walks every file a fetch produces |
 | `discovery_test.go` | profile parsing and validation; the client-config mapping for both profiles; the spec sanitisation (and that it leaves identity bytes untouched); a direct client opens no UDP socket and binds loopback only, against a public client as control; a live tracker tripwire that announces when trackers are enabled and is never touched in direct mode (fetch, inspect, resume and repair); a webseed tripwire that serves a real ranged download when enabled and is never touched in direct mode; magnet `x.pe` ignored in direct mode; resume state stripped of trackers and webseed URLs in direct mode but not in public; invalid profiles refused before the staging root or a temp client exists |
 | `cmd/provenance` torrent tests | `--discovery` is inherited by `inspect`/`fetch`, an unknown value is rejected naming both valid values, and `fetch` refuses it before creating the staging root |
 | path unit tests | component validation, containment, peer parsing, kind mapping |

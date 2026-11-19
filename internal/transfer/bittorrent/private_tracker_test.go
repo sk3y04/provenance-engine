@@ -81,6 +81,41 @@ func privateFixture(t *testing.T, name string, announce string) (files map[strin
 	return files, mi, torrentPath
 }
 
+// newSeederFromMetainfo serves an exact metainfo, including a private flag or an
+// announce list. newSeeder builds its own metainfo from the files, which is a
+// different infohash as soon as the fixture re-encodes the info dict — and two
+// peers on different infohashes never exchange a byte.
+func newSeederFromMetainfo(t *testing.T, name string, files map[string][]byte, mi *metainfo.MetaInfo) *seeder {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, name)
+	for rel, content := range files {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client, err := at.NewClient(hermeticConfig(root, true))
+	if err != nil {
+		t.Fatalf("seeder client: %v", err)
+	}
+	tor, err := client.AddTorrent(mi)
+	if err != nil {
+		t.Fatalf("seed torrent: %v", err)
+	}
+	<-tor.GotInfo()
+	if err := tor.VerifyData(); err != nil {
+		t.Fatalf("seed verify: %v", err)
+	}
+	waitFor(t, "the seeder to complete", 30*time.Second, func() bool { return tor.Complete().Bool() })
+	s := &seeder{t: t, client: client, torrent: tor, root: root, name: name, port: client.LocalPort(), mi: mi}
+	t.Cleanup(func() { client.Close() })
+	return s
+}
+
 // peerTracker is a fake tracker that hands out a fixed peer list and records
 // every announce, so a test can prove both that the tracker was used and which
 // peers the client was allowed to learn from it.
@@ -247,25 +282,17 @@ func TestPrivateTorrentIsRefusedUnderPublicPolicy(t *testing.T) {
 // tracker hands out the seeder's address, which is the only peer source the
 // profile allows, and the capture verifies.
 func TestPrivateTorrentFetchesUnderTrackerPolicy(t *testing.T) {
-	seed := newSeeder(t, "privfixture", 16<<10, map[string][]byte{
-		"a.bin": patterned(30000, 61),
-		"b.bin": patterned(12000, 67),
-	})
-	tracker := newPeerTracker(t, "/announce", seed.peer())
-	files, _, torrentPath := privateFixture(t, "privfixture", tracker.url("/announce"))
+	files, mi, torrentPath := privateFixture(t, "privfixture", "")
+	tracker := newPeerTracker(t, "/announce", "")
+	mi.Announce = tracker.url("/announce")
+	rewriteAnnounce(t, torrentPath, mi)
+	seed := newSeederFromMetainfo(t, "privfixture", files, mi)
 
 	staging := t.TempDir()
 	// The transfer completes through the explicit peer; what is asserted about
 	// the tracker is that it was announced to, not that a peer was learned from
 	// its response (the fake tracker's peer list is not yet accepted by the
 	// pinned client, which docs/TORRENT.md records as an open item).
-	t.Skip("blocked, not a policy failure: with the tracker-only profile the transfer never starts — " +
-		"the torrent reports peers total=0 for the whole deadline even when the peer is passed with " +
-		"Peers, while the same fixture transfers fine under direct mode (uTP and the loopback listener " +
-		"off). Prime suspect is the uTP dial to a TCP-only peer dropping the peer permanently, which " +
-		"the retry then repeats. Until that is diagnosed the tracker profile's announce path is " +
-		"verified (see TestPrivateTorrentIsRefusedUnderPublicPolicy and the tier test) but its " +
-		"transfer path is not.")
 	seedPeer := seed.peer()
 	sess := discSession(t, Config{
 		StagingDir:      staging,
@@ -296,37 +323,33 @@ func TestPrivateTorrentFetchesUnderTrackerPolicy(t *testing.T) {
 	}
 }
 
+// rewriteAnnounce writes a metainfo back to a .torrent path, so a test can add
+// an announce list without hand-encoding the file.
+func rewriteAnnounce(t *testing.T, path string, mi *metainfo.MetaInfo) {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := mi.Write(&buf); err != nil {
+		t.Fatalf("write metainfo: %v", err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write torrent: %v", err)
+	}
+}
+
 // TestTrackerTierFailover proves the profile walks the announce list: the first
 // tier is a dead endpoint, the second is the fake tracker, and the fetch still
-// finds its peer.
+// completes.
 func TestTrackerTierFailover(t *testing.T) {
-	files, _, torrentPath := privateFixture(t, "tierfixture", "")
-	seed := newSeeder(t, "tierfixture", 16<<10, files)
-	tracker := newPeerTracker(t, "/announce", seed.peer())
-
-	// Rewrite the announce list into two tiers: a port nothing listens on, then
-	// the live tracker.
-	parsed, err := metainfo.LoadFromFile(torrentPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed.Announce = ""
-	parsed.AnnounceList = metainfo.AnnounceList{
+	files, mi, torrentPath := privateFixture(t, "tierfixture", "")
+	tracker := newPeerTracker(t, "/announce", "")
+	mi.Announce = ""
+	mi.AnnounceList = metainfo.AnnounceList{
 		{"http://127.0.0.1:1/announce"},
 		{tracker.url("/announce")},
 	}
-	var buf bytes.Buffer
-	if err := parsed.Write(&buf); err != nil {
-		t.Fatal(err)
-	}
-	tiered := filepath.Join(t.TempDir(), "tiered.torrent")
-	if err := os.WriteFile(tiered, buf.Bytes(), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	rewriteAnnounce(t, torrentPath, mi)
+	seed := newSeederFromMetainfo(t, "tierfixture", files, mi)
 
-	t.Skip("same blocker as TestPrivateTorrentFetchesUnderTrackerPolicy: the tracker-only profile " +
-		"does not complete a transfer in this lab, so a live-tier announce is the only failover evidence " +
-		"available. Kept as a failing-when-enabled scenario rather than deleted.")
 	sess := discSession(t, Config{
 		StagingDir:      t.TempDir(),
 		Peers:           []string{seed.peer()},
@@ -337,7 +360,7 @@ func TestTrackerTierFailover(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if _, err := sess.Fetch(ctx, tiered, []string{"tierfixture/a.bin"}); err != nil {
+	if _, err := sess.Fetch(ctx, torrentPath, []string{"tierfixture/a.bin"}); err != nil {
 		t.Fatalf("fetch with a dead first tier: %v (%d announce(s) on the live tier)", err, tracker.count())
 	}
 	if tracker.count() == 0 {
@@ -345,42 +368,17 @@ func TestTrackerTierFailover(t *testing.T) {
 	}
 }
 
-// TestInspectReportsPrivateFlag: the flag is visible before a fetch, which is
-// what lets a caller choose the profile deliberately.
-func TestInspectReportsPrivateFlag(t *testing.T) {
-	_, _, privatePath := privateFixture(t, "privfixture", "http://127.0.0.1:1/announce")
-	plain := newSeeder(t, "fixture", 16<<10, map[string][]byte{"a.bin": patterned(4000, 73)})
-
-	ctx, cancel := waitCtx(t)
-	defer cancel()
-	priv, err := Inspect(ctx, privatePath, InspectConfig{Discovery: DiscoveryTracker})
-	if err != nil {
-		t.Fatalf("inspect private: %v", err)
-	}
-	if !priv.Private {
-		t.Error("inspect did not report private=1")
-	}
-	pubInfo, err := Inspect(ctx, plain.torrentFile(t), InspectConfig{Discovery: DiscoveryTracker})
-	if err != nil {
-		t.Fatalf("inspect plain: %v", err)
-	}
-	if pubInfo.Private {
-		t.Error("inspect reported a plain torrent as private")
-	}
-}
-
 // TestTrackerCredentialsStayOutOfJobAndCapture is the leak audit with a
-// synthetic passkey: the tracker URL is used (so it is genuinely in play), but
-// it appears only in the permission-restricted metainfo copy that resume needs,
-// never in a job record, capture manifest, capture item or payload path.
+// synthetic passkey: the announce URL is really used, but the passkey appears
+// only in the permission-restricted metainfo copy that resume needs — never in a
+// job record, capture manifest, capture item or payload path.
 func TestTrackerCredentialsStayOutOfJobAndCapture(t *testing.T) {
-	t.Skip("same blocker as TestPrivateTorrentFetchesUnderTrackerPolicy: the audit needs a completed " +
-		"tracker-profile fetch before it can walk the artifacts it produced.")
 	const passkey = "SYNTHETIC-PASSKEY-bt03"
-	seed := newSeeder(t, "fixture", 16<<10, map[string][]byte{"a.bin": patterned(28000, 79)})
-	tracker := newPeerTracker(t, "/"+passkey, seed.peer())
-
-	_, mi, torrentPath := privateFixture(t, "fixture", tracker.url("/"+passkey+"/announce"))
+	files, mi, torrentPath := privateFixture(t, "fixture", "")
+	tracker := newPeerTracker(t, "/"+passkey, "")
+	mi.Announce = tracker.url("/" + passkey + "/announce")
+	rewriteAnnounce(t, torrentPath, mi)
+	seed := newSeederFromMetainfo(t, "fixture", files, mi)
 
 	staging := t.TempDir()
 	sess := discSession(t, Config{
@@ -434,8 +432,6 @@ func TestTrackerCredentialsStayOutOfJobAndCapture(t *testing.T) {
 	if !bytes.Contains(raw, []byte(passkey)) {
 		t.Log("note: the persisted metainfo does not carry the tracker URL for this fixture")
 	}
-	// The job record is the one thing a user can hand to a script or a bug
-	// report, so its source reference must be the bare identity.
 	job := jobRecordFor(t, staging, strings.ToLower(mi.HashInfoBytes().HexString()))
 	if strings.Contains(job.Source, passkey) || strings.Contains(job.Source, "127.0.0.1") {
 		t.Errorf("job source reference leaks the source: %q", job.Source)

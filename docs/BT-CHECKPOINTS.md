@@ -267,6 +267,164 @@ are expected for a tracker-only swarm.
   (`TestPrivateTorrentIsRefusedUnderPublicPolicy`).
 - `torrent inspect` reports `private` for a private fixture and not for a plain
   one (`TestInspectReportsPrivateFlag`).
+- `go test ./internal/transfer/bittorrent/ ./cmd/provenance/ -count=1` → ok;
+  `make lint` → 0 issues; `go vet ./...` → clean; gofmt clean.
+- All three tracker-profile scenarios pass (`-count=2` on the private fetch).
+
+### Correction: the tracker profile's transfer path is verified
+
+An earlier revision of this checkpoint recorded the tracker profile as blocked,
+with uTP dialling as the prime suspect. That was wrong, and a probe settled it:
+a client with uTP on or off, on all interfaces or on loopback, transfers a
+TCP-seeded fixture in every combination. The real cause was the tests' own
+fixture — `newSeeder` builds metainfo from the files, while `privateFixture`
+re-encodes the info dict to add `private=1`, so the two peers were on different
+infohashes and could never exchange a byte. The seeder now serves the exact
+fixture metainfo (`newSeederFromMetainfo`), and all three scenarios pass:
+private fetch under the tracker profile, announce-list tier failover, and the
+passkey audit.
+
+Still unverified: peers returned *in* a tracker response (the fake tracker's
+response shape is not accepted by the pinned client yet), so "a peer learned from
+a tracker is dialled" has no test — the tracker's role is proven by its announce
+log, and transfers use an explicit peer.
+
+### Next eligible ticket
+
+**BT-02** (cross-client reference lab). Prerequisite check first: this box's
+docker registry pulls are blocked (see the `provenance-product` notes), so pinned
+Transmission/qBittorrent/libtorrent images may not be obtainable; a locally
+installed pinned client or a source build would be the fallback. If BT-02's
+tooling cannot be obtained without a registry pull, **BT-03** (private tracker
+policy and redaction) is the next independent ticket — it needs only local
+metainfo and fake local trackers.
+---
+
+## BT-02 — Cross-client reference lab (partially shipped)
+
+**Starting SHA** `1b805f1` (tree clean). **Ending SHA** `e1b1efe`, plus `c1311c9`
+for the adapter fix the lab produced.
+
+This ticket is **not complete**. One direction is verified; three rows are
+blocked or explicitly unsupported, with the measurement behind each recorded in
+`docs/CROSSCLIENT.md`. Commit history is split so the product change can be read
+on its own: `c1311c9` is the adapter fix, `e1b1efe` is the lab and its document.
+
+### Changed paths
+
+```
+internal/transfer/bittorrent/crossclient_lab_test.go  new: docker/qBittorrent plumbing, opt-in and self-skipping
+internal/transfer/bittorrent/crossclient_test.go      new: the scenario tests (1 verified, 2 skipped with evidence)
+internal/transfer/bittorrent/peer_retry_test.go        new: deterministic retry tests (proxy that drops handshakes)
+internal/transfer/bittorrent/bittorrent.go             waitForInfo/waitComplete re-offer explicit peers
+docs/CROSSCLIENT.md                                    new: isolation model, matrix, what it does not prove
+```
+
+No `go.mod`/`go.sum` change.
+
+### What the lab is
+
+An opt-in harness (`PROVENANCE_TEST_BITTORRENT_CROSSCLIENT=1`) that runs pinned
+qBittorrent v5.3.0 / libtorrent 2.1.2.0 in a container — image pinned by digest,
+never pulled — on a dedicated bridge with masquerading disabled (measured: the
+container cannot reach the internet; host↔container works), `--dns 127.0.0.1`,
+DHT/PEX/LSD/uTP/UPnP off, no trackers anywhere, disposable data.
+
+### Verified
+
+- **Row 1, 3/3 runs**: qBittorrent seeds a ragged four-file v1 torrent
+  (`a.bin` 5000, `empty.bin` 0, `b.bin` 40000, `c.bin` 9000 at 16 KiB pieces, so
+  files share edge pieces); Provenance fetches two files with
+  `--discovery direct --peer`, matches both SHA-256 digests, captures neither
+  neighbour, writes one capture manifest, then restarts with **no peers** and
+  reconciles the same capture key with `BytesRead == 0`. Encoder, peer-wire and
+  selective-storage interop on one row.
+- **The adapter fix**: the first attempts failed ~half the time because
+  qBittorrent reports a torrent complete before libtorrent accepts peer
+  connections, and the library never retries a peer whose handshake failed.
+  After re-offering peers while disconnected, 1/3 became 3/3. Two deterministic
+  tests cover it, neither of which uses docker.
+- `go test ./internal/transfer/bittorrent/ -count=1` → ok 40.550s;
+  `make lint` → 0 issues; `make vet` → clean; `gofmt -l` → empty.
+- `make test` (`go test -race ./...`, whole repository) on the committed
+  revision → every package ok, `internal/transfer/bittorrent` 55.491s.
+
+### Not verified (explicit)
+
+- **Direction 3** (Provenance seeds → qBittorrent downloads over a magnet `x.pe`
+  hint): blocked. On the host network namespace qBittorrent's second start exits
+  with `LocalPeer: failed to connect to server.` before the WebUI binds. The
+  scenario exists but is skipped with that evidence.
+- **Row 2** (a peer that stores only the selected file): measured and
+  unsupported by construction. qBittorrent reports `stalledDL progress=0.333
+  amount_left=32768` and never completes, because the selected file shares
+  piece 0 and piece 2 with the files it does not hold. This is the ragged-edge
+  case the fixture exists to create, not a bug in either client.
+- **v2-only / hybrid / BEP 47 padding / MSE**: no cross-client exercise. No
+  independent v2 generator is installed here, and the foreign fixture in
+  `testdata/` is not pad-aligned, so it never reaches the peer wire.
+
+### Limits
+
+Everything is loopback or a host-local bridge; no NAT, no loss, no real swarm.
+Container isolation is a docker bridge and configuration, not a packet filter.
+The lab pins qBittorrent's encryption to plaintext so a handshake failure is
+attributable, which is also why MSE interop is an unsupported row.
+
+### Next eligible ticket
+
+**BT-03** (private tracker policy and redaction). It needs only local metainfo
+and fake local trackers — no external client, no registry, no swarm — and the
+fake-tracker machinery already exists in `discovery_test.go`. Two BT-02 follow-ups
+stay open: give the lab a readiness barrier so it does not depend on the retry,
+and diagnose the `LocalPeer` exit to unblock direction 3.
+
+---
+
+## BT-03 — Private tracker policy and redaction (partially shipped)
+
+**Starting SHA** `e950a21` (tree clean). **Ending SHA** `79cceb5`.
+
+Not complete: the private-metainfo policy, the tracker-only profile and the
+credential rules are shipped and tested; the tracker profile's **transfer path**
+is not, and is recorded as blocked rather than papered over.
+
+### Changed paths
+
+```
+internal/transfer/bittorrent/discovery.go          DiscoveryTracker + tracker client/spec policy
+internal/transfer/bittorrent/bittorrent.go         ErrPrivateTorrentPolicy, checkPrivateFile/checkPrivatePolicy,
+                                                   Info.Private, enforcement before job creation and after metadata
+internal/transfer/bittorrent/inspect.go            reports private=1
+internal/transfer/bittorrent/private_tracker_test.go  new: policy mapping, refusal, inspect, blocked scenarios
+internal/transfer/bittorrent/discovery_test.go     tracker added to the profile table
+cmd/provenance/torrent.go                          flag help + human "private=1" note
+docs/TORRENT.md                                    profile table, BEP 27 audit, credential rules, tests table
+docs/CLI.md                                        tracker profile and the refusal example
+```
+
+### The BEP 27 audit (pinned v1.62.0)
+
+The library gates **all three** discovery channels for `private=1`:
+`torrent.go dhtAnnouncer` (re-checked every loop, so it also covers metadata
+that arrives later via magnet), `pexconn.go pexConnState.Init`, and
+`client.go TorrentInfohashesAndPort` / `OnLPDAnnouncement`. It does **not** gate
+webseeds, magnet metainfo sources, or inbound connections. Provenance closes the
+first two by policy and disables webseeds in every profile; inbound connections
+are expected for a tracker-only swarm.
+
+### Verified
+
+- Tracker profile mapping: `NoDHT`, `DisablePEX`, `DisableWebseeds`,
+  `NoDefaultPortForwarding` set, `DisableTrackers` untouched, LPD nil, listener
+  left on all interfaces, uTP/IPv6 untouched; spec keeps trackers and strips
+  webseeds, metainfo sources, DHT hints and `x.pe`, with the info bytes
+  bit-identical (`TestTrackerPolicyClientConfigAndSpec`).
+- Private `.torrent` under `public` refused with `ErrPrivateTorrentPolicy`,
+  before any job record, payload directory or tracker contact
+  (`TestPrivateTorrentIsRefusedUnderPublicPolicy`).
+- `torrent inspect` reports `private` for a private fixture and not for a plain
+  one (`TestInspectReportsPrivateFlag`).
 - `go test ./internal/transfer/bittorrent/ ./cmd/provenance/ -count=1` → ok
   (40.716s / 0.033s); `make lint` → 0 issues; `go vet ./...` → clean; gofmt clean.
 
@@ -287,9 +445,8 @@ a tracker are dialled" has no test.
 
 ### Next
 
-Finish BT-03's transfer path: instrument a tracker-profile fetch in the same way
-the cross-client lab was instrumented (`peer_retry_test.go` proxies, plus the
-library's slogger) to see whether the dial is uTP-first and whether disabling
-uTP for the tracker profile is the right answer or a Config seam is needed. If
-that requires a product knob, it is a separate review gate. **BT-05** (per-job
-storage isolation) remains the next independent ticket if BT-03 stalls.
+**BT-05** (per-job storage isolation and migration) is the next independent
+ticket: full identities already map to job ids, so the namespace work can start.
+One BT-03 follow-up remains: make the fake tracker's announce response acceptable
+to the pinned client so "peers learned from the tracker are dialled" gets a test
+of its own.
