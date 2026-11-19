@@ -765,6 +765,35 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
+### Managed seeding (internal, first proof)
+
+`OpenSeedSession` (`internal/transfer/bittorrent/seed.go`) serves one isolated
+workspace: it reopens from the persisted metainfo, verifies the local data and then
+allows upload. There is **no queue integration, no CLI command and no seed slot** in
+this slice, and nothing calls it yet.
+
+Eligibility, all enforced before a client is allowed to serve:
+
+| requirement | refusal |
+|-------------|---------|
+| a job record with a published capture whose manifest is present | `ErrSeedIneligible` |
+| a selection covering every file entry in the torrent | `ErrSeedSelective` - a boundary piece would expose bytes that were never attested |
+| local data that verifies completely | `ErrSeedDataIncomplete`, with the missing-piece count |
+
+Two library facts this rests on, both verified against the pinned source:
+
+- `VerifyDataContext` is **synchronous** per piece (`piece.go`): it queues a check
+  and waits for `numVerifies` to advance, so piece states afterwards are the truth.
+  `Complete()` is a cached flag that lags that pass and, for damaged data, never
+  becomes true - waiting on it is how an earlier attempt hung.
+- A torrent admitted through the adapter's normal `admitSpec` carries
+  `DeferStorageOpen` and `DisallowDataDownload`, and in that state **the piece-hashing
+  loop never runs**, so verification waits forever. The seed path therefore applies
+  only `applySpecDiscovery`, and disallows download *after* verifying.
+
+Verification updates the backend's piece completion state; this is not the read-only
+BT-06 recheck.
+
 ### Peer limits
 
 ```

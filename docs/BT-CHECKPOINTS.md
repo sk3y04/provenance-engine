@@ -1133,3 +1133,91 @@ controlled leechers is the milestone that should close it.
 **BT-08d** — managed seeding with separate slots. Release gate: a completed seed
 cannot consume the last download slot, and two active seeds sharing one upload
 limiter stay within the measured aggregate budget, allowing for the documented burst.
+
+## BT-08d.1 — One seed session serves verified data, and refuses damage
+
+**Starting SHA** `6fe9f5b` (clean; the earlier BT-08d attempt was reverted).
+
+Scope: a workspace-scoped `OpenSeedSession` plus a control harness. No queue state,
+no CLI, no seed slots, no aggregate-rate claim.
+
+### The harness first
+
+`seedctl_test.go` is two plain library clients, a complete metainfo and fixed bytes.
+It exists because the previous attempt's failure was diagnosed from a goroutine dump
+(seed_test.go:109) rather than from an observed event, and every wait here therefore
+names its phase and prints state instead of blocking on a channel.
+
+| Waits | behaviour |
+|-------|-----------|
+| readiness | no bare channel receive: `AddTorrent` with complete metainfo must yield `tor.Info()` immediately, and the test fails with the observed state if it does not |
+| completion | bounded poll of *piece states*, with a failure message listing the piece histogram, active peers, half-open attempts, bytes read and the `Complete()` flag |
+| worker exit | the control's own errors are fatal at the point they occur, so a startup failure surfaces as itself |
+
+Two findings came out of building it:
+
+- `Complete()` is a **cached flag that lags a direct verification pass**. After
+  `VerifyDataContext` returned with all 14 pieces marked complete, `Complete()` still
+  read false; waiting on it is exactly how the earlier attempt burned its timeout.
+  The harness and the seed session both read piece states instead.
+- A `metainfo.MetaInfo` taken from a live torrent carries an empty, non-nil
+  `PieceLayers` table; handing it to another client fails with `no piece root set for
+  file …`. Normalise it to nil when empty (the same trap recorded in BT-05).
+
+### What the session does, and the trap it avoids
+
+`OpenSeedSession(ctx, cfg, jobID)` takes `cfg.StagingDir` as the **workspace**
+directory, requires a published capture with a present manifest, requires the
+selection to cover every file entry, reopens the workspace through `openWorkspaceAt`
+(lock + storage + client), adds the torrent from the persisted metainfo with upload
+disallowed, and verifies with `VerifyDataContext`.
+
+The trap: `admitSpec` - the adapter's normal admission path - sets
+`DeferStorageOpen` and `DisallowDataDownload`, and **in that state the piece-hashing
+loop never runs**, so `VerifyDataContext` waits on a signal that cannot arrive. The
+seed path applies `applySpecDiscovery` only, verifies, and disallows download
+afterwards. That single difference is what turned a 150-second hang into a 9 ms
+refusal.
+
+### Verified
+
+| Test | Result |
+|------|--------|
+| `TestControlLoopbackTransfer` | plain seeder → plain leecher, 225,280 bytes, exact bytes and digests, 3/3 runs |
+| `TestSeedSessionServesVerifiedWorkspace` | the seed reports all 8 pieces verified, serves 122,880 bytes, and a fresh leecher verifies every piece and matches the fixture digests |
+| `TestSeedSessionRefusesDamagedWorkspace` | one byte flipped at the same length: refusal in **9 ms** (`1 of 8 pieces are not on disk`), no fetch, manifest bytes unchanged, workspace lock free afterwards |
+| `TestSeedSessionRefusesSelectiveWorkspace` | 1-of-2 selection: `ErrSeedSelective`, lock free |
+| `TestSeedSessionCancelDuringVerification` | cancelled context: returns `context.Canceled`, lock free |
+
+Gates on this revision (Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores):
+
+- `go test ./internal/transfer/bittorrent/ -race -run 'TestControlLoopbackTransfer|TestSeedSession' -count=3` → `ok 4.626s`
+- `go test ./internal/transfer/bittorrent/ -count=1` → `ok 46.809s`
+- `go vet ./...` clean, `gofmt -l ./cmd ./internal` empty, `golangci-lint run ./...` → `0 issues`, `git diff --check` clean
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok. The first run failed on
+  a peer-limit assertion from BT-08c, not on this slice: `TestQueuePerJobPeerLimitIsObserved`
+  saw an instantaneous peak of 5 against a bound of 4 because the metadata resolver's
+  socket is still visible on a seeder for a few milliseconds after that client closes.
+  Fixed in `0d284a8`: a count that repeats across samples must stay within
+  `max-active x per-job`, and the instantaneous maximum may exceed it by at most one
+  in-teardown socket. `-race -count=6` green afterwards.
+
+### Not claimed
+
+- **No queue integration**: no seed intent, no seed slots, no `seed`/`unseed`
+  commands, and the "a live seed never blocks the last download slot" gate is
+  untested because the feature does not exist yet.
+- **No aggregate upload measurement.** Two seeds and two leechers against one shared
+  limiter is BT-08d.2; upload enforcement remains **unverified** as carried forward
+  from BT-08b/c.
+- **Selective seeding** is refused, not implemented, so shared-edge-piece serving is
+  untested by construction.
+- **Process death** is not exercised here; cancellation during verification is.
+- The session is internal and has no caller: serving a workspace is proven, but
+  nothing in the product offers it yet.
+
+### Next
+
+BT-08d.2: two seed sessions, two controlled leechers, one shared upload limiter, and
+a measured envelope beyond the burst. Only then BT-08d.3 (persisted intent, separate
+slots, the last-download-slot test).
