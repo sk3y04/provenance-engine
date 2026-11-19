@@ -188,6 +188,8 @@ DHT/PEX/LSD/uTP/UPnP off, no trackers anywhere, disposable data.
   tests cover it, neither of which uses docker.
 - `go test ./internal/transfer/bittorrent/ -count=1` → ok 40.550s;
   `make lint` → 0 issues; `make vet` → clean; `gofmt -l` → empty.
+- `make test` (`go test -race ./...`, whole repository) on the committed
+  revision → every package ok, `internal/transfer/bittorrent` 55.491s.
 
 ### Not verified (explicit)
 
