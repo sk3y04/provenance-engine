@@ -269,6 +269,17 @@ type Session struct {
 	// never corrupt the handle.
 	ownMu sync.Mutex
 	owner *filelock.Lock
+
+	// isolated marks a workspace session: its whole root is one job, so paths are
+	// job-scoped and some names are reserved for the adapter's own namespace.
+	isolated bool
+	// workspaceID is the canonical identity the workspace is keyed by. It is the
+	// only identity a record in that workspace may describe.
+	workspaceID Identity
+	// ownStorage is the workspace's storage (payload base plus completion
+	// database). The library does not close a caller-provided DefaultStorage, so
+	// the session owns it and closes it after the client stops.
+	ownStorage storage.ClientImplCloser
 }
 
 // lockPath is the stable sidecar for this root's ownership. filelock appends
@@ -397,6 +408,12 @@ func (s *Session) Close() error {
 			err = errors.Join(err, e)
 		}
 	}
+	// After the client stops: releasing the completion database while a worker
+	// still holds it would leave the file locked.
+	if s.ownStorage != nil {
+		err = errors.Join(err, s.ownStorage.Close())
+		s.ownStorage = nil
+	}
 	return errors.Join(err, s.releaseOwnership())
 }
 
@@ -484,6 +501,10 @@ type source struct {
 	infoHash metainfo.Hash
 	magnet   string
 	path     string
+	// mi carries a metainfo resolved before the workspace existed (an isolated
+	// magnet). It is only set for kind "metainfo"; the bytes are the exact ones
+	// the peer sent and are what admission and persistence work from.
+	mi *metainfo.MetaInfo
 }
 
 func (s source) canonical() string {
@@ -725,6 +746,16 @@ func (o *opened) storageError() error {
 //     swarm, so a capture failure is retried without fetching again;
 //  3. only then is the transfer resumed.
 func (s *Session) Fetch(ctx context.Context, rawSource string, selection []string) (Capture, error) {
+	src, err := parseSource(rawSource)
+	if err != nil {
+		return Capture{}, err
+	}
+	return s.fetchSource(ctx, src, selection)
+}
+
+// fetchSource is Fetch after parsing: the same pipeline, also reachable with an
+// in-memory metainfo that an isolated workspace resolved before it existed.
+func (s *Session) fetchSource(ctx context.Context, src source, selection []string) (Capture, error) {
 	// Everything below runs under exclusive staging ownership taken in New, so
 	// the job read, the reconciliation decision and the capture commit cannot
 	// interleave with another Session over this root. runMu only serializes
@@ -732,10 +763,6 @@ func (s *Session) Fetch(ctx context.Context, rawSource string, selection []strin
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 	if err := s.checkOpen(); err != nil {
-		return Capture{}, err
-	}
-	src, err := parseSource(rawSource)
-	if err != nil {
 		return Capture{}, err
 	}
 	if len(selection) == 0 {
@@ -1017,6 +1044,33 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 			if err != nil {
 				return nil, errors.New("add magnet: " + sanitizeSourceText(err.Error(), src.magnet))
 			}
+		case "metainfo":
+			if src.mi == nil {
+				return nil, errors.New("internal: metainfo source without metainfo")
+			}
+			info, ierr := src.mi.UnmarshalInfo()
+			if ierr != nil {
+				return nil, fmt.Errorf("parse resolved metainfo: %w", ierr)
+			}
+			got, ierr := requireIdentity(src.mi, &info)
+			if ierr != nil {
+				return nil, ierr
+			}
+			if !got.SameTorrent(src.id) {
+				return nil, fmt.Errorf("resolved metainfo describes %s, expected %s", got, src.id)
+			}
+			if perr := checkPrivatePolicy(&info, s.cfg.Discovery); perr != nil {
+				return nil, perr
+			}
+			if _, verr := validateInfoPaths(&info); verr != nil {
+				return nil, verr
+			}
+			spec := at.TorrentSpecFromMetaInfo(src.mi)
+			s.admitSpec(spec)
+			t, _, err = s.client.AddTorrentSpec(spec)
+			if err != nil {
+				return nil, fmt.Errorf("add resolved torrent: %w", err)
+			}
 		case "file":
 			mi, lerr := metainfo.LoadFromFile(src.path)
 			if lerr != nil {
@@ -1099,6 +1153,10 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 		return nil, err
 	}
 	name := info.BestName()
+	if s.isolated && name == workspaceSystemDir {
+		return nil, fmt.Errorf("%w: a torrent named %q cannot be laid out inside a workspace: it would merge with the job's own records",
+			ErrUnsafePath, name)
+	}
 	files, byPath, err := validatedFiles(t, info, name)
 	if err != nil {
 		return nil, err
