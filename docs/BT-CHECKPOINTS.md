@@ -2772,3 +2772,89 @@ was corrected in place.
   intended contract but also means a transient permission blip ends a watch session;
   there is no retry policy for it.
 - The BT-10f ad-hoc metadata timeout remains unexplained and untouched.
+
+## BT-12 — Live progress and rate for the selected payload
+
+**Starting SHA** `9ab3185` (clean). **End SHA** `91f4006`. Additive: no scheduling,
+durable record, or lifecycle change. The live endpoint gains three optional fields per attempt, and the
+CLI live output and TUI overlay render them.
+
+### What the transfer client can actually measure
+
+The pinned library exposes three different things, and only one of them is selected
+progress:
+
+- `File.BytesCompleted()` — bytes present in that file's storage. Includes a partially
+  received piece at a file boundary and data retained from an earlier attempt. This is
+  what `Update.Written` (the `torrent fetch` progress line) already reported.
+- `File.State()` — per-piece state *with the byte length of that piece's portion inside
+  that file*. Summing `Bytes` for `Complete` pieces gives verified bytes of the file's
+  own ranges.
+- `Torrent.BytesCompleted()` / stats — torrent-wide, including unselected files and
+  padding; not usable as selected progress.
+
+Chosen measurement: `selected_bytes` = Σ over selected files Σ over covering pieces
+(`Complete` → `Bytes`), with `selected_total` = Σ selected file lengths. Padding files
+are not in the selection; a piece shared with an unselected neighbour contributes the
+selected share only.
+
+### Implementation
+
+- `internal/transfer/bittorrent`: `Update` gains `Verified`, computed by
+  `selectedVerified` in `report()`. `report` now runs at the top of the wait loop so the
+  tick that observes completion reports the final value rather than the previous tick's.
+- `internal/torrentqueue`: `Request.OnProgress` carries the sample; the adapter maps
+  `Update{Verified,Total}` onto it; `runEntry` wires it to `live.progress(entryID, …)`.
+- `internal/torrentqueue/live.go`: `LiveAttempt` gains `selected_bytes`,
+  `selected_total`, `progress_rate` (all `omitempty` pointers), and `liveState` keeps a
+  per-attempt baseline (`samples`, reset in `add`/`remove`, monotonic clock with a test
+  seam). Rate rules: first sample → absent; rollback → absent + rebaseline; sample
+  inside `liveRateWindow` (250ms) → keep the old baseline; otherwise delta/elapsed, with
+  a measured zero recorded as `0`.
+- Rendering: `queue live` appends `selected=X/Y bytes` and `progress=N B/s` when present;
+  the TUI's `livePhaseText` does the same through `humanBytes`, so rows and live-only
+  entries share one path.
+
+### Evidence (all commands actually run)
+
+- `go test ./internal/transfer/bittorrent/ -run TestSelectedVerified -count=3` → both
+  pass, twice each in 0.02 s:
+  - complete torrent, 32 KiB pieces over two 48 KiB files (piece 1 spans the boundary):
+    `a=49152 b=49152` — a whole-piece count would have reported 64 KiB for one file.
+  - partial data (only a file's first 32 KiB on disk): `verified=32768 of 49152`, so the
+    incomplete boundary piece contributes nothing.
+- `go test ./internal/torrentqueue/ -run 'TestLiveProgress|TestLiveSnapshotProgress' -count=1`
+  → ok 0.436 s. Covers, with a fake clock: first sample has no rate; a full window gives
+  the delta; a sample inside the window keeps the baseline; a full window with no new
+  bytes gives a measured `0`; a rollback gives no rate and a fresh baseline; a new
+  attempt on the same entry has no baseline; a late sample never revives a removed
+  attempt. Plus JSON compatibility in both directions (older endpoint → nil; new
+  endpoint read by an older client → known fields intact) and measured-zero round trip.
+- `TestLiveProgressDuringDownload` (real runner, throttled loopback peer):
+
+  ```
+  LIVE progress entry=queued-000001-0e3dafa5 selected=1064960/4194304 rate=unknown
+  LIVE rate entry=queued-000001-0e3dafa5 3704811 B/s
+  ```
+
+  The first sample is the measured-progress example and also the unavailable-rate
+  example; the second shows the rate once a window exists.
+- `go test ./internal/tui/ -run TestQueueViewProgress -count=2` → pass: progress and
+  rate rendered when present, an absent rate stays absent (no `0 B/s`), a measured zero
+  rate is rendered.
+
+### Not covered / limits
+
+- `selected_bytes` is piece-granular, so a wide-piece torrent shows a staircase and the
+  rate follows the steps. It is not a smoothed byte counter.
+- The end-to-end assertion uses one throttled fixture (4 MiB at 256 KiB/s); no CLI
+  screenshot was captured for this slice. PTY evidence is absent, not implied.
+- Rate is not network throughput and will differ from any external monitor's numbers.
+- Seeding attempts report `uploaded_bytes` only; `selected_*` is a download projection.
+- No ETA, stall detection, or bandwidth policy: a rate of `0` is displayed as `0`, and
+  nothing treats it as stalled.
+- An attempt that finishes between two poll ticks may produce no progress sample at all;
+  the row then disappears rather than showing a final 100%.
+- The ad-hoc metadata timeout (BT-10f) is untouched and still unexplained; it did show
+  up once in an early version of the in-package end-to-end fixture, which is why the
+  counting tests use a local client's own piece states instead of a live transfer.

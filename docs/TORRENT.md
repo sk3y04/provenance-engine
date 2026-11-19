@@ -958,6 +958,48 @@ downloads and for seeds that are merely serving, but a seed caught mid-`Close` m
 report "no runner" and its slot accounting cannot be observed. See the BT-10a
 checkpoint.
 
+### Live progress on the selected payload
+
+A download attempt reports two byte counts and, once it has a baseline, a rate. All
+three describe the selected files only.
+
+| field | meaning |
+|-------|---------|
+| `selected_bytes` | bytes of the selected files covered by pieces the client has hash-verified complete |
+| `selected_total` | sum of the selected files' lengths |
+| `progress_rate` | change in `selected_bytes` per second, in bytes/s |
+
+`selected_bytes` is deliberately not `File.BytesCompleted()`. That counter includes a
+partially received piece at a file boundary and data retained from an earlier attempt —
+it is the storage counter the `torrent fetch` progress line uses, not a verification
+signal. `selected_bytes` sums, for each selected file, the in-file byte length of every
+covering piece whose state is `Complete` (`File.State()`): a piece shared with an
+unselected file contributes only the selected share, padding contributes nothing, and a
+piece still downloading contributes nothing until it verifies. Two consequences worth
+knowing:
+
+- It moves in piece-sized steps. A torrent with 4 MiB pieces can sit at one value for
+  seconds and then jump, and the rate follows the jump.
+- Resumed data counts immediately, which is why the first sample of an attempt never
+  reports a rate.
+
+`progress_rate` is a **progress** rate on the selected payload, not network throughput,
+and not the transfer engine's byte counter. It is sampled from the transfer's 100ms
+poll and computed over at least 250ms of baseline, so a sample inside that window keeps
+the previous baseline instead of producing a spike. It is *absent* — not zero — on the
+first sample of an attempt, after a counter rollback (where the baseline restarts), and
+for a new attempt on the same entry. A measured zero (same verified bytes over a full
+window) is reported as `0`. The baseline is per attempt, so a retry never inherits the
+previous attempt's rate, and a sample arriving after an attempt ended is dropped rather
+than reviving the row.
+
+Unknown stays unknown: `queue live` prints `selected=`/`progress=` only when the
+snapshot carried them, the TUI overlay does the same, and neither infers completion from
+a displayed number (there is no percentage field). The schema change is additive with
+`omitempty`, so an older endpoint's snapshot decodes with the fields absent (unknown) and
+an older client reading a new endpoint ignores them; measured zeros survive the round
+trip as zeros.
+
 ### Download priorities inside a selection
 
 ```
