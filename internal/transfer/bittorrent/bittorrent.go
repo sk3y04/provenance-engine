@@ -71,6 +71,14 @@ const (
 	// synchronously when a piece is marked complete, so this only absorbs the
 	// gap between that and the next poll.
 	finalizeGrace = 2 * time.Second
+
+	// peerRetryInterval is how often the adapter re-offers the configured
+	// explicit peers while it has no active connection to any peer. The library
+	// dials a peer once, drops it when the handshake fails, and never tries that
+	// address again; a peer that is still checking its payload (qBittorrent
+	// reports a torrent complete before it accepts peers) would otherwise stall
+	// the fetch until the deadline.
+	peerRetryInterval = 5 * time.Second
 )
 
 // Sentinel errors. Callers (and tests) can match them with errors.Is.
@@ -994,18 +1002,16 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 		t.AddPeers(s.peers)
 	}
 
-	select {
-	case <-t.GotInfo():
-	case <-ctx.Done():
+	if err := s.waitForInfo(ctx, t); err != nil {
 		if src.id.HasV1 && src.id.HasV2 {
 			// A dual-identity magnet is accepted only if the metadata satisfies
 			// both hashes. The library validates them while acquiring the
 			// metadata, so a contradictory pair never arrives as an identity
 			// error; report what actually happened.
 			return nil, fmt.Errorf("%w: metadata never validated against both supplied infohashes (btih and btmh); one of them is wrong: %w",
-				ErrMetadataTimeout, ctx.Err())
+				ErrMetadataTimeout, err)
 		}
-		return nil, fmt.Errorf("%w: %w", ErrMetadataTimeout, ctx.Err())
+		return nil, fmt.Errorf("%w: %w", ErrMetadataTimeout, err)
 	}
 	// Torrent.InfoHash is the library's 20-byte short hash for v2 torrents, so the
 	// full identity is taken from the metadata bytes it actually holds. Every
@@ -1066,6 +1072,40 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 	// handler is installed before any write can be attempted.
 	t.SetOnWriteChunkError(o.noteStorageError)
 	return o, nil
+}
+
+// waitForInfo blocks until the torrent has metadata. It re-offers the configured
+// explicit peers while nothing is connected, for the same reason the transfer
+// phase does: the library dials a peer once, drops it on a failed handshake and
+// never retries, and a magnet whose only peer is briefly unavailable would
+// otherwise never resolve.
+func (s *Session) waitForInfo(ctx context.Context, t *at.Torrent) error {
+	if len(s.peers) == 0 {
+		select {
+		case <-t.GotInfo():
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	retryAt := time.Now().Add(peerRetryInterval)
+	for {
+		select {
+		case <-t.GotInfo():
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if !time.Now().Before(retryAt) {
+				retryAt = time.Now().Add(peerRetryInterval)
+				if t.Stats().ActivePeers == 0 {
+					t.AddPeers(s.peers)
+				}
+			}
+		}
+	}
 }
 
 type validatedFile struct {
@@ -1227,7 +1267,16 @@ func (s *Session) waitComplete(ctx context.Context, o *opened, selected []valida
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	var settledSince time.Time
+	peerRetryAt := time.Now().Add(peerRetryInterval)
 	for {
+		// Re-offer the caller's peers while nothing is connected. Only when no
+		// peer is active, so a healthy transfer never causes duplicate dials.
+		if len(s.peers) > 0 && !time.Now().Before(peerRetryAt) {
+			peerRetryAt = time.Now().Add(peerRetryInterval)
+			if o.t.Stats().ActivePeers == 0 {
+				o.t.AddPeers(s.peers)
+			}
+		}
 		if err := o.storageError(); err != nil {
 			o.t.DisallowDataDownload()
 			return fmt.Errorf("%w: %v", ErrStorageFailure, err)
