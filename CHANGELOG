@@ -1,13 +1,92 @@
-# Changelog
-
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
 ## [Unreleased]
 
+No unreleased changes.
+
+## [0.9.0] - 2026-11-19
+
+Selective BitTorrent becomes a durable, resumable queue: additions, intents,
+priorities and seeding survive restarts, one foreground runner works the queue
+with bounded concurrency and shared rate budgets, the TUI and `queue live` report
+read-only live state, and verified progress of the selected payload is reported
+without inventing a network-throughput number. v2-only and hybrid torrents are
+read and verified, payload storage is opened only after admission, and the same
+release carries correctness work across the engine facade, the vault, the event
+system and the JSON stores.
+
 ### Added
+
+- **Durable torrent queue (`torrent queue`)**: `queue add SOURCE --select PATH`
+  records an entry under `<staging>/.provenance/torrent/queue/`; `queue start`,
+  `queue pause` and `queue retry` write the entry's *desired* state instead of
+  commanding a running process, so a request survives a restart and is honoured
+  by the next `queue run`. One foreground runner owns the queue while it runs
+  (`--max-active` bounds concurrent attempts, default 1) and a second
+  `queue run` is refused rather than racing it. `queue list` prints the recorded
+  state, `queue list --json` the same document with `runner_held` and the
+  entries. See `docs/TORRENT.md` ("Durable queue").
+
+- **An attempt per isolated workspace**: every attempt downloads into its own
+  workspace under `.provenance/torrent/jobs/<jobID>/` and publishes into the
+  job's payload only when it ends, so a killed attempt cannot leave a
+  half-written job, two attempts never share a working directory, and a
+  completed capture is committed once.
+
+- **Queued work waits instead of failing**: an entry whose attempt cannot start
+  (capacity, metadata, a transient storage error) keeps its reason and stays
+  queued, retried with a bounded backoff; `queue retry` re-queues an entry whose
+  attempt ended blocked or failed; a drained pass returns once both pools are
+  idle instead of claiming new work.
+
+- **Shared rate budgets and peer limits**: `queue run --download-rate`,
+  `--upload-rate`, `--peers-per-job` and `--half-open-per-job` are aggregate
+  budgets shared by every attempt, not per-attempt limits, so the queue as a
+  whole honours the numbers it was given.
+
+- **`queue run --watch`**: keeps scanning after both pools go idle (200 ms
+  cadence) and claims work as it appears, until SIGINT. Without `--watch` a pass
+  ends when the queue drains.
+
+- **Managed seeding with its own slots**: `queue seed ID` / `queue unseed ID`
+  record seed intent, and `queue run --max-seeds N` (off by default) gives
+  completed entries a second pool with its own slot cap. A seed slot is claimed
+  only after the payload verifies against a fresh piece-completion state, and it
+  is held from claim through `Serve` to `Close` and workspace unlock. Seeding is
+  therefore opt-in twice: intent and slots.
+
+- **Read-only live status (`queue live`)**: the runner publishes a Unix socket
+  under the staging root; `queue live` asks it for one snapshot of attempts,
+  phases, pools and slots, and `--json` prints the same document. The socket is
+  read-only — no control channel, no RPC, no way to start or stop a runner
+  through it — and when no runner answers the command says so instead of
+  inferring liveness from recorded state.
+
+- **Live progress on the selected payload**: attempts report `selected_bytes`,
+  `selected_total` and `progress_rate`, where the numerator is the verified bytes
+  of the *selected* files (boundary pieces by their selected share, BEP 47
+  padding excluded) rather than a storage counter or a torrent-wide total. The
+  rate is a rate of progress, and it is omitted when it cannot be measured
+  rather than reported as zero. See `docs/TORRENT.md` ("Live progress").
+
+- **Priorities within an immutable selection**: `queue priority ENTRY PATH
+  normal|high` overrides relative piece ordering for paths that are already
+  selected. It never changes what is selected and is not part of the workspace,
+  capture or duplicate identity.
+
+- **Non-destructive removal**: `queue remove ID` forgets the entry and its
+  restricted source record while leaving the workspace, payload, resume state,
+  published capture and archive artifacts untouched, so the job can still be
+  inspected or re-added. Removal is refused while a runner owns the queue.
+
+- **Queue view in the TUI**: `provenance tui` lists the same entries with their
+  recorded state, and start/pause/retry/seed write the same intents through the
+  same store as the CLI. The view never launches a runner and holds no mutation
+  socket; a successful action means the queue accepted the change, not that a
+  runner has already acted on it.
+
+- **Sources stay secret**: a queue entry stores a magnet carrying only the
+  infohash. Trackers (which can carry passkeys) and local paths never reach the
+  entry record, the restricted record, capture items, the live socket or terminal
+  output, and the TUI masks the source field.
 
 - **v2-only and hybrid magnet ingestion**: `torrent inspect` and `torrent fetch`
   accept `urn:btmh` magnets and magnets carrying both `btih` and `btmh`. Metadata
@@ -24,8 +103,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the missing-layer guard remains for v2-only torrents. Synthetic identities that
   collide on the library's 20-byte storage key are refused by the conflict check.
 
-### Added
-
 - **BEP 47 padding entries are not user files**: entries whose `attr` contains
   `p` are excluded from `torrent inspect` output and cannot be selected or
   captured; the piece layout still accounts for them. An independently generated
@@ -40,23 +117,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while BEP 52 defines `hash request`/`hashes` messages that this integration
   does not implement.
 
-### Fixed
-
-- **A failed piece write is now a diagnosable error, not a silent stall**: the
-  adapter installs `SetOnWriteChunkError` after admission and records the first
-  failure, so `Fetch` returns `ErrStorageFailure` with the cause instead of
-  inheriting the library default, which only logs and silently disables data
-  download. Previously such a job waited for the caller's deadline and reported
-  `ErrTransferTimeout` with no explanation.
-- **A failed part-file promotion is reported instead of waited out**: when every
-  covering piece is complete and idle but the final file never appears (the
-  library logs `error marking piece complete` and marks the piece complete
-  anyway), `Fetch` now fails with `ErrNotFinalized` — "pieces are complete but
-  the file was never finalized" — after a two-second grace, rather than sitting
-  until the transfer deadline.
-
-### Added
-
 - **BitTorrent v2 and hybrid local `.torrent` support**: `torrent inspect` and
   `torrent fetch` accept v1, v2-only (BEP 52) and hybrid torrent files. Identity
   is a typed value holding the full v1 SHA-1 and full v2 SHA-256 separately; the
@@ -70,8 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   piece layers (`Torrent.Metainfo()`), without which a v2 restart cannot verify
   anything; a layer-less metainfo and two different identities that would share a
   payload directory or completion key fail explicitly (`ErrUnsupportedIdentity`,
-  `ErrIdentityConflict`) instead of silently sharing or waiting. `btmh` magnets
-  remain unsupported. See `docs/TORRENT.md` ("Identities").
+  `ErrIdentityConflict`) instead of silently sharing or waiting. See `docs/TORRENT.md` ("Identities").
+
 - **Metadata-first admission for torrent fetches**: payload storage is now
   opened only after the layout, the requested selection and the staging paths
   have passed admission. The torrent is created with
@@ -87,6 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   construction — which is why inspection never builds a client over a staging
   root. See `docs/TORRENT.md` ("Metadata first") for the full order and the
   stated limits.
+
 - **`torrent inspect` is genuinely read-only**: a local `.torrent` is parsed in
   memory with no client at all, and a magnet is resolved through a short-lived
   client with an in-memory piece completion, a private temporary data directory,
@@ -96,11 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its temporary directory are removed on success, error, timeout and
   cancellation. `-o` is no longer used by `inspect`; `--timeout` now bounds the
   metadata wait.
-- **Unsupported torrent identities are rejected explicitly**: v2-only and hybrid
-  (v1+v2) metainfo fail with `ErrUnsupportedIdentity` for both inspect and fetch,
-  and `urn:btmh` magnets stay refused, with no v2/hybrid persistence, job-ID or
-  capture-key change.
-- **`provenance torrent status` for humans and scripts**:
+
 - **`provenance torrent status` for humans and scripts**: lists the job records
   in a staging root (sorted by job id) or shows one job by validated identity
   (`bt-<40 hex>` or the bare infohash, never treated as a path). `--json` emits
@@ -120,6 +177,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stdout. Output never includes magnets, metainfo, tracker URLs, credentials or
   passkeys. See `docs/TORRENT.md` ("Read-only status") for what a record proves
   and the per-file, non-global consistency guarantee.
+
 - **Status hardening**: `staging_root` is resolved through symlinks, so two
   spellings of one root produce identical output; record files are opened with
   `Lstat` and must be regular files, so a symlink planted in the staging tree is
@@ -127,6 +185,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries `complete` (the in-band form of the exit code, for scripts that only
   parse stdout); and `payload.assets` exposes the recorded per-file digests
   (path, length, SHA-256) as attested, without re-hashing anything.
+
 - **Exclusive staging ownership for torrent jobs**: a `bittorrent.Session` now
   takes an exclusive lock on its staging root (`<root>/.provenance/torrent/
   staging.lock`) for its whole lifetime, enforced inside the backend so callers
@@ -188,6 +247,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written to the terminal when one is supplied. The CLI passes no sink, so
   `provenance encode` output is byte-for-byte unchanged; a TUI or worker
   transport can now consume encode progress like every other operation.
+
 - **Run history on the CLI (`provenance history`)**: every run that goes
   through `app.Download` — CLI `grab`, `watch run` (including `--every`
   repeats) and `collect sync` — now records one history entry (URLs,
@@ -196,26 +256,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `show <ID>` (full or unique prefix; prints title, duration, counts,
   output dir, error, URLs, per-file results when recorded), `delete <ID>`,
   and `clear --yes`. Stored under the user cache dir, like the TUI's history.
+
 - **`provenance watch run --every <interval>`**: run a watch (or all watches)
   on a repeating interval (Go duration: `30m`, `24h`, `7d`…). The first run
   starts immediately; per-run errors are reported without stopping the loop;
   Ctrl-C cancels the in-flight run and exits cleanly. Each completed tick
   records a history entry and updates the watch's last-run time.
+
 - **`provenance doctor`**: read-only prerequisite check for yt-dlp, ffmpeg,
   ffprobe, Chrome, an optional cookies file, the cache directory, and the
   archive database (`PROVENANCE_DATABASE_URL`, pinged with a short timeout and
   reported by host only). Exit code is non-zero when a required check fails;
   the command never triggers tool auto-install.
+
 - **Deterministic vault revision IDs**: `computeRevisionID` now excludes the
   wall-clock capture time, so re-ingesting the same capture manifest produces
   the same content-addressed revision ID and retries/resumes are idempotent
   instead of accumulating duplicate revisions.
+
 - **Vault invariants under test**: new test coverage for ingest (path
   traversal rejection, hash-mismatch abort with no blobs stored, missing-file
   skip, content dedupe, revision round-trip), revision diffing, retention
   pruning (newest-N per collection, other collections untouched), and
   garbage collection (referenced blobs always survive, dry-run deletes
   nothing).
+
 - **Transport-neutral extractor paths (Phase 1)**: every path reachable from
   `engine.Resolve` and `engine.Download` — Instagram, X/Twitter, hashtag search,
   Reddit, Album, the browser fallback, and the dispatcher batch/pool paths — now
@@ -224,31 +289,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason codes are defined in `internal/event/reasons.go`; legacy CLI narration is
   preserved byte-for-byte when no sink is supplied, so CLI golden output is
   unchanged.
+
 - **Event sink on the operation context** (`internal/event.WithSink` /
   `SinkFrom`): nested helper functions emit through the context instead of
   threading a sink through every signature. `event.Emit` resolves the context sink
   when no explicit sink is passed. New `event.KindInfo` carries operation facts
   (pagination decisions, fallbacks taken) that are neither warnings nor terminal
   item outcomes; `internal/render` renders it.
+
 - **Event redaction** (`internal/redact`): `Detail` bounds, normalizes, and removes
   cookie/authorization/bearer/token/session fragments, and `URL` drops query
   strings and fragments, so events never carry raw platform response bodies,
   cookies, auth headers, or secret-bearing URLs. Response-body, error, and
   fallback narration now emits stable facts (for example a status code) instead
   of body previews or raw error text.
+
 - **Operation-scoped workspace** (`internal/workspace`): `Download` runs in a
   workspace that records what already existed and reports only files the operation
   created, excluding engine bookkeeping directories and in-progress partials.
   `engine.Config.IsolatedWorkspace` gives each operation its own subdirectory, the
   only arrangement that separates two concurrent jobs sharing a parent directory.
+
 - **Typed capability probe** (`internal/capability`, `engine.Capabilities`,
   `engine.ToolStatus`): reports yt-dlp (required), ffmpeg, ffprobe, and Chrome
   without installing a tool, downloading anything, or mutating the filesystem, so
   a health check has no side effects. `engine.Config.AutoInstall` is false by
   default; the CLI keeps its historical auto-install behavior.
+
 - **Engine-owned dependencies** (`internal/extractor.Deps`): the X/Twitter query-ID
   cache and the tool paths are now per-engine instead of process-global. The
   transport stays a package-level immutable, concurrency-safe shared service.
+
 - **Cancellable retry/backoff paths**: `sleepCtx` replaces `time.Sleep` in every
   extractor retry and rate-limit backoff (Instagram, X/Twitter, hashtag search,
   Reddit, Album) and in the downloader's speed-limit wait, so a canceled
@@ -256,13 +327,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Retry-After` values are parsed by one shared helper (`retryAfterDelay`) and
   capped at 5 minutes; an over-cap value emits a `retry_after_capped` warning
   event.
+
 - **Backoff and event-fact invariants under test**: fixture-server tests prove
   each native extractor's rate-limit and 5xx backoff honors cancellation, an
   over-cap `Retry-After` is clipped with a warning, error-response events carry
   only stable status facts (canary response bodies never leak into events or
   errors), and a speed-limited download aborts promptly on cancellation.
+
 - **Bounded sink close**: `event.Notifier.Close` waits at most a grace period for
   an in-flight delivery, so a blocked foreign sink can never stall the caller.
+
 - **Single X post resolution**: `https://x.com/<user>/status/<id>` is now a
   distinct source kind (`TwSourceStatus`) resolved through the
   `TweetResultByRestId` operation, so a status URL fetches exactly the post it
@@ -271,9 +345,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ScanTwitterResolved` reports `resolve.KindSingle` for these sources. The query
   id has no hard-coded fallback (discovered from the web-client JS or
   `TWITTER_QUERY_TWEET_RESULT_BY_REST_ID`).
+
 - **`encode --remove-original`**: deletes each source file only after its encode
   succeeds. A failed encode leaves its source in place, and `--dry-run` never
   removes anything.
+
 - **Context-cancellable importers**: `ImportGit`, `ImportPDF`, `ImportDocs`,
   `ImportOpenAPI`, and `ImportWeb` now take the operation context. The CLI
   passes the signal context and the TUI its root context, so Ctrl-C stops an
@@ -283,18 +359,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chromedp allocator inherits the caller context instead of
   `context.Background()`; capture-failure narration is emitted as a structured
   `web_scrape_failed` warning (legacy CLI text unchanged without a sink).
+
 - **Importers under test**: first test coverage for `internal/importers` —
   git-arg validation (ext:: transport, scheme allowlist, dash-prefixed refs),
   mid-clone and mid-crawl cancellation against fixture servers, PDF/OpenAPI
   ingest into a temp vault with blob verification, docs scope/maxPages bounds,
   web pre-flight validation, UTF-8-safe truncation, and the narration
   transport-neutrality contract. No test contacts a live service.
+
 - **Config, citation, and resolve under test**: the persisted `config.Config`
   JSON shape (field names, omitempty behavior, round trip) and the
   capture-options mapping are pinned; `internal/citation` gains round-trip,
   formatter, and entity-mapping coverage; `internal/resolve` pins the
   `scan --json` field-name contract and error-category semantics. Every
   package in the module now has tests.
+
 - **SSRF dial guard on the shared extractor transport**: the private-network
   dial control from `downloader.New` is exported as `downloader.NewDialer` and
   now also protects the extractors' shared transport, so platform-supplied URLs
@@ -305,11 +384,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Rate-limiter eviction no longer stalls callers**: `evictLocked` ran an O(n²)
+  exchange sort under the manager mutex on every new host once the cache was
+  full, holding concurrent `GetLimiter` callers for about 50 ms at 5,000
+  cached hosts. It now uses `sort.Slice` with the same oldest-first drop
+  semantics. Measured on the included benchmark: 49.726 ms/op -> 0.992 ms/op
+  (50.1×). The claim is scoped to that benchmark, not to overall engine
+  throughput.
+
 - **`encode`: output now lands in the source directory by default** (in place)
   instead of a `<dir>/av1_qN` subdirectory, and no per-file log files are
   written; ffmpeg stderr is discarded. `--out` still redirects. The scan skips
   its own in-place `<base>.<suffix>.mkv` outputs so re-runs do not re-encode
   them, while a user's own `.mkv` files are still collected.
+
 - **`encode`: `--devices` is auto-detected when unset** — QSV pins the Intel render
   nodes (PCI vendor `8086`) and AMF the AMD nodes (`1002`/`1022`) found in
   `/dev/dri` via `/sys/class/drm`, sorted by node number; NVENC uses GPU index
@@ -319,21 +407,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encode. If no node matches the vendor, every node is pinned so the failure
   is loud; with no render nodes at all nothing is pinned and the encoder
   library chooses.
+
 - `dispatcher.PrintSummary` is now a presentation adapter taking an `io.Writer`;
   reusable paths emit `EventSummary` and never write to a terminal themselves.
+
 - The TUI no longer reassigns `os.Stdout`/`os.Stderr`. It consumes events through
   an `event.Sink` (`internal/tui.teaSink`), which is safe to run alongside other
   consumers in a shared process.
+
 - `Notifier.Close` is bounded by a grace period rather than waiting indefinitely
   for a slow sink.
+
 - **Rate-limit waits are bounded**: a server `Retry-After` longer than 5 minutes
   is clipped to the cap with a one-line notice, so a hostile or broken platform
   response cannot stall a run for hours. Waits within the cap are unchanged.
+
 - **`archive import-docs` validates the URL scheme**: only `http`/`https` seeds
   are accepted, matching `import-web`. Other schemes previously produced an
   empty revision instead of a clear error.
 
 ### Fixed
+
+- **Cross-process file locking for the JSON stores**: data files are replaced by
+  atomic rename, so locking the data inode cannot serialize writers; a new
+  `internal/filelock` locks a stable `path + ".lock"` sidecar instead (flock on
+  Unix, `LockFileEx` on Windows, cancellable polling). Session, collection,
+  history, watch, catalog and TUI-config read-modify-write paths now take it,
+  and `Session`/`Queue`/`AddURLs`/`OpenOrCreate` re-read and re-apply on a
+  version conflict instead of dropping the update. Before this, two independent
+  sessions queueing 40 URLs each lost exactly half, and a four-child-process
+  test kept 20-23 of 80 collection IDs; both are now lossless across repeated
+  runs.
+
+- **`engine.Capabilities` no longer races with `Resolve`/`Download`**: the
+  engine-owned tool report (yt-dlp availability, ffmpeg path) is re-probed by
+  `Capabilities` while operations read it, which the race detector confirmed as
+  a data race and which broke the facade's documented concurrent-use contract.
+  Detection now runs outside an `RWMutex` on a self-contained snapshot and the
+  write lock only publishes it. `TestCapabilitiesConcurrentWithResolve` failed
+  with `DATA RACE` before the fix.
+
+- **`event.Notifier.Close` stops spawning waiter goroutines**: `Close` started a
+  fresh `wg.Wait` goroutine per call and `Download` closes the notifier twice, so
+  a blocked sink accumulated waiters for as long as it stayed blocked. The
+  delivery goroutine now closes a done channel and `Close` waits on it; the
+  grace bound, drain-on-quit and idempotent/concurrent `Close` semantics are
+  unchanged, and a blocked sink is still never interrupted.
+
+- **A failed piece write is now a diagnosable error, not a silent stall**: the
+  adapter installs `SetOnWriteChunkError` after admission and records the first
+  failure, so `Fetch` returns `ErrStorageFailure` with the cause instead of
+  inheriting the library default, which only logs and silently disables data
+  download. Previously such a job waited for the caller's deadline and reported
+  `ErrTransferTimeout` with no explanation.
+
+- **A failed part-file promotion is reported instead of waited out**: when every
+  covering piece is complete and idle but the final file never appears (the
+  library logs `error marking piece complete` and marks the piece complete
+  anyway), `Fetch` now fails with `ErrNotFinalized` — "pieces are complete but
+  the file was never finalized" — after a two-second grace, rather than sitting
+  until the transfer deadline.
 
 - **A torrent fetch that does not seed no longer leaves a stale `seeding`
   claim**: adopting an already-committed capture (the normal recovery path
@@ -342,16 +475,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stopped` before returning, and the fetch report prints the state as it is at
   exit rather than as it was at commit. Status surfaces the recorded value
   either way; this only stops a false claim from being persisted.
+
 - **Revision IDs from user input are path-safe**: `archive.ReadRevision` joined
   its `id` argument straight into the vault path, so `vault revision diff`
   accepted ids like `../../../tmp/evil` and read a `manifest.json` from outside
   the vault. Ids must now be a 64-character lowercase sha256 content address;
   everything else is rejected with a clear error. Retention fixtures now use
   real content-address ids.
+
 - **Invalid `--min-size`/`--max-size` values are rejected**: `manifest.ParseSize`
   silently converted `NaN`, `Inf`, negative values, and sizes that overflow
   int64 into wrapped/negative byte counts, producing nonsensical filters. These
   now return a clear error instead.
+
 - **Extractor routing uses exact domains, not substrings**: `dispatcher.Classify`
   and the platform URL parsers matched hosts with `strings.Contains`, so
   lookalikes (`instagram.com.evil.net`, `notx.com`, `x.com.evil.net`,
@@ -360,26 +496,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   yt-dlp handle the actual host. Routing and `ParseIgURL`/`ParseTwSource`/
   `ParseRdURL`/album host tables now require the exact domain or a subdomain
   (ports and trailing dots normalized).
+
 - **Instagram shortcode overflow**: `igShortcodeToID` silently overflowed
   int64 for codes longer than 11 characters (and had a nonsensical >28-char
   truncation that decoded the wrong prefix). Overlong/invalid codes now return
   0, so the caller falls back to the server-rendered post page instead of
   requesting an unrelated post id.
+
 - **Citation references round-trip**: `citation.Parse` split at the last `@`,
   so entity ids containing `@` (for example `medium.com/@user/...` URLs) failed
   to parse. It now splits at the first `@` and first `#`, rejects empty
   components, and round-trips `Format` for URL-shaped entity ids.
+
 - **Watch runs recover crashed "running" status**: a run killed mid-flight left
   `last_run_status: running` forever. `watch run` now records such a run as
   `interrupted` (preserving its start time and partial duration) before
   starting the next one, so status history stays honest. Covered by store
   tests for recovery, idempotency, and completed-run preservation.
+
 - **Session transitions survive concurrent modification**: when a save hit a
   version conflict, the reload replaced the in-memory entries and the retry
   saved the unmodified state — silently dropping the status transition (a
   failed URL could stay "running" forever). The retry now re-applies the
   pending transition after reloading, matching `ResetRunning`'s behavior.
   Covered by a conflict-injection regression test.
+
 - **Blob store is safe under concurrent Puts**: parallel stores of identical
   content shared one deterministic `.tmp` path, and the loser deleted the
   winner's in-progress file — potentially renaming a partially written blob
@@ -388,10 +529,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be stored under a stale address), and `List` ignores temp/stray entries so
   garbage collection cannot delete an in-progress write. Covered by a
   concurrent-put race test and a List-filtering test.
+
 - **`encode --remove-original` verifies the output first**: an ffmpeg exit 0
   with a missing or empty output file is now reported as a failed encode, so
   the source is never deleted on a phantom success. Successful-encode tests
   now exercise a faithful fake that writes the output file.
+
 - **Downloader resume edge cases**: a zero-byte `.part` left by an interrupted
   attempt no longer blocks every future download of the destination (`O_EXCL`
   became `O_TRUNC` for fresh starts). A 416 "range not satisfiable" response no
@@ -400,18 +543,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   place, and without confirmation the `.part` is preserved instead of
   destroyed. The already-downloaded skip and 416 completion paths now report
   `LastPath`/`LastHash` like a normal download and clean up stale `.part` files.
+
 - **Canceled git imports no longer hang or orphan helpers**: `git clone` spawns
   remote helpers (for example `git-remote-https`) that inherit the output pipes.
   Killing only the parent left them holding the pipes open, so `CombinedOutput`
   waited for EOF forever and the helpers kept running. The clone now runs in its
   own process group, cancellation kills the whole group, and a bounded
   `WaitDelay` guarantees the import returns even if a pipe lingers.
+
 - **Auto-install no longer panics**: `extractor.EnsureInstalled` used
   go-ytdlp's `MustInstall`, which panics when the download fails (network
   down, empty cache) and dumped a full stack trace instead of a clean
   failure. Failed installs are now plain errors; the pre-run auto-install
   stays best-effort, and a missing tool still fails with the normal
   "yt-dlp is not available" message.
+
 - **Capability/doctor now find go-ytdlp's versioned cache binaries**: the
   tool probe only looked for a bare `yt-dlp` on `PATH`, but go-ytdlp caches
   and resolves `yt-dlp-<version>` (e.g. `yt-dlp-2026.08.19`) inside the

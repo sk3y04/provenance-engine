@@ -87,7 +87,7 @@ tag (then `go mod tidy` is safe again).
   `0.7.0`, so the first engine release is **`v0.7.0`**, continuing the existing
   sequence rather than restarting at `v0.1.0`.
 - The CLI's `--version` comes from `internal/version.Version` (default
-  `0.8.0`). Release builds stamp it via `-ldflags -X …version.Version=<tag
+  `0.9.0`). Release builds stamp it via `-ldflags -X …version.Version=<tag
   without the leading v>` — both `.github/workflows/release.yml` and `make
   release-dry-run` do this, and `make build` stamps `git describe` output.
   Bump the default in `internal/version/version.go` in step with each release
@@ -125,11 +125,11 @@ These are recorded as open questions; no legal conclusion is drawn here.
 
 ## Tagging (manual, after review)
 
-The current release is `v0.8.0` (see Versioning above). After the human review
+The current release is `v0.9.0` (see Versioning above). After the human review
 gate:
 
 ```bash
-git tag -a v0.8.0 -m "Upgrade to Go 1.27 and refresh dependencies"
+git tag -a v0.9.0 -m "Selective BitTorrent queue, live progress and v2 identity support"
 git push origin master --tags
 ```
 

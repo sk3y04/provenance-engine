@@ -93,6 +93,26 @@ extractor.RunYtdlpCaptured()     ← try yt-dlp first
 
 ---
 
+## Torrent queue path
+
+`provenance torrent queue add` (or the TUI picker) admits one source through
+`torrentqueue.Admit`: the source is reduced to a magnet carrying only the
+infohash, a local `.torrent` gets its identity without any network, and the entry
+record is written under `<staging>/.provenance/torrent/queue/`. `start`, `pause`,
+`retry` and `seed`/`unseed` change recorded intent only — they never command a
+process, which is why they survive a restart.
+
+`provenance torrent queue run` takes the runner lock and drives one foreground
+pass: it claims entries whose intent is `run`, gives each attempt its own
+workspace, and runs the isolated fetch path through `torrentqueue.Adapter` into
+`internal/transfer/bittorrent` on a bounded worker pool. A published capture is
+recorded on the entry; seeding, when both intent and slots exist, is a second
+pool with its own slot cap. While the runner holds the queue it publishes a
+private Unix socket serving one read-only snapshot
+(`internal/torrentqueue/live.go`), which `queue live` and the TUI queue view poll.
+Neither the store nor the socket can start, stop or reprioritise a runner: only
+the runner moves an entry's phase.
+
 ## Extractor Design
 
 Each extractor follows a common pattern with three entry points:
@@ -205,6 +225,24 @@ perm-fail:https://example.com/deleted    ← permanently failed
 Lines without a prefix are treated as `ok:` for backward compatibility. The `--no-archive` flag disables both URL archives and yt-dlp's download archive.
 
 ---
+
+### Torrent state
+
+```
+<staging>/.provenance/torrent/
+  <infohash>.torrent                 ← persisted metainfo (0600)
+  bt-<infohash>.job.json             ← job record: selection, attestation, three states
+  queue/entries/<entryID>.json       ← intent, recorded phase, priorities, job pointer
+  queue/restricted/<entryID>.json    ← source (magnet with infohash only), 0600
+  queue/store.lock                   ← serialises entry writes across processes
+  queue/runner.lock                  ← one runner per queue (flock; a held lock is a live runner)
+  staging.lock                       ← staging-root ownership for the fetch path
+  jobs/<jobID>/                      ← per-attempt workspace: payload, resume state, capture
+```
+
+A queue entry points at a job; it does not duplicate the job's payload, capture
+or seeding state. Entry and job records are validated on read with the writer's
+rules, and `status` never infers liveness from a timestamp or a leftover lock.
 
 ## Concurrency Model
 
@@ -416,4 +454,19 @@ Side-effect-free probe for yt-dlp, ffmpeg, ffprobe, and Chrome (including go-ytd
 Read-only prerequisite checks (tools, cookies file, cache dir, archive database) with a plain-table report and non-zero exit on required-check failure.
 
 ### `tui`
-Bubble Tea terminal UI. Consumes engine events through `teaSink` (no process-global stream mutation) and runs vault/sync/import operations on the model's root context. Full details in [`docs/TUI.md`](TUI.md).
+Bubble Tea terminal UI. Consumes engine events through `teaSink` (no process-global stream mutation) and runs vault/sync/import operations on the model's root context. Its torrent queue view is read-only over the durable records and the runner's local snapshot, and its keys write intent through the same store the CLI uses. Full details in [`docs/TUI.md`](TUI.md).
+
+### `torrentqueue`
+Durable local queue for torrent jobs, worked by one foreground runner. `store.go` owns the entry records, intents, priorities, the store/runner locks and non-destructive removal; `runner.go` claims work, bounds concurrency, joins both pools and turns a fatal store error into a session-ending shutdown; `seed.go` is the opt-in second pool with its own slot cap; `live.go` publishes a read-only Unix-socket snapshot and projects verified selected progress with a per-attempt rate baseline; `admit.go` and `actions.go` are the paths shared with the TUI; `adapter.go` maps a claim onto the isolated fetch path.
+
+### `bittorrent` (under `internal/transfer/`)
+Selective BitTorrent adapter over `github.com/anacrolix/torrent v1.62.0`: one magnet or `.torrent` into a private client, a selection into verified pieces, a capture manifest out. Adds typed v1/v2 identity, discovery profiles with BEP 27 enforcement, hostile-path rejection, metadata-first admission (no payload storage before validation), isolated per-job workspaces with exclusive staging ownership, offline recheck, a workspace-scoped seed session, a durable job record and record-only status documents. See [`docs/TORRENT.md`](TORRENT.md).
+
+### `filelock`
+Advisory cross-process exclusive locks keyed by a stable `path + ".lock"` sidecar, because data files are replaced by atomic rename and locking the inode cannot serialise writers. `Acquire` blocks (cancellably); `TryAcquire` reports `ErrLocked`. Unix uses `flock`, Windows `LockFileEx`.
+
+### `atomicfile`
+Atomic file replacement: a unique temp file in the destination directory, fsync, rename, so a reader never observes a half-written file.
+
+### `version`
+Single source of truth for the version reported by the CLI and stamped into capture manifests and archive revisions; overridable at build time with `-ldflags -X`.

@@ -42,6 +42,12 @@ provenance encode --dir ~/Movies --encoder qsv
 provenance encode --file ~/Movies/clip.mp4 --quality 22 --suffix hq
 # Preview the exact ffmpeg commands without encoding anything
 provenance encode --dir ~/Movies --dry-run
+
+# Fetch selected files from a torrent and queue the work durably
+provenance torrent inspect release.torrent
+provenance torrent queue add release.torrent --select "release/track.flac"
+provenance torrent queue start queued-000001-0e3dafa5
+provenance torrent queue run --watch
 ```
 
 Single binary. No Python, Node, or runtime dependencies beyond [yt-dlp](https://github.com/yt-dlp/yt-dlp) + ffmpeg (auto-installed on first run).
@@ -103,7 +109,7 @@ Deep dive: [`docs/EXTRACTORS.md`](docs/EXTRACTORS.md)
 | [`docs/TUI.md`](docs/TUI.md) | Terminal UI — views, key bindings, state model |
 | [`docs/SESSIONS.md`](docs/SESSIONS.md) | Session lifecycle, resume, optimistic concurrency |
 | [`docs/WATCHES.md`](docs/WATCHES.md) | Recurring download subscriptions |
-| [`docs/TORRENT.md`](docs/TORRENT.md) | Selective BitTorrent — pinned library, advisory review, safety model, resume |
+| [`docs/TORRENT.md`](docs/TORRENT.md) | Selective BitTorrent — pinned library, advisory review, safety model, durable queue, resume |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Architecture, data flow, design decisions, package reference |
 | [`TREEVIEW.md`](TREEVIEW.md) | File-level reference — every source file |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build, test, conventions |

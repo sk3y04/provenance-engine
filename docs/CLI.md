@@ -592,11 +592,55 @@ Records are validated on read: unsafe paths in a record, a mismatched file name,
 - **One owner per staging root.** A staging root is owned exclusively by one process for as long as its `fetch` runs, including while `--seed` continues serving after the capture is committed. A second `torrent fetch` against the same root—through any spelling of the path—fails with `staging root is busy … retry after it exits` and writes nothing. `torrent inspect` and `torrent status` do not take the lock, so both work while a fetch owns the root. Different `--output` roots run concurrently. The lock is released when the command exits, and by the kernel if the process is killed.
 - **Selection is immutable per job.** Re-running with a different `--select` set is refused (`ErrSelectionLocked`); use a new staging root.
 - **Uploads while fetching** are enabled (normal reciprocity). Continued seeding after completion is opt-in via `--seed`.
-- **No network surface.** The adapter opens no listener for other tools, exposes no RPC, and has no aria2-compatible interface.
+- **No remote surface.** The adapter opens no listener off the machine, exposes no RPC, and has no aria2-compatible interface. The queue's live status endpoint is a user-private Unix socket that only answers a read-only snapshot, and it exists only while a runner owns the queue.
 - Paths from metainfo are treated as hostile: traversal, absolute paths, separators, reserved device names, and symlinks inside staging reject the whole torrent.
 - Torrent fetches never invoke yt-dlp.
 
 See [TORRENT.md](TORRENT.md) for the pinned library version, the security advisory review, and the dependency/licence position.
+
+### Durable queue (`torrent queue`)
+
+A durable queue for selective fetches. Entries live under `<staging>/.provenance/torrent/queue/` and outlive the process that created them: `start`, `pause`, `seed` and `retry` record what an entry *should* do, and one foreground `queue run` applies those intents.
+
+```bash
+provenance torrent queue add "magnet:?xt=urn:btih:..." --select "release/track.flac"
+provenance torrent queue list                        # recorded state, one line per entry
+provenance torrent queue start queued-000001-0e3dafa5
+provenance torrent queue run --max-active 2 --watch   # work the queue until SIGINT
+provenance torrent queue live                        # one read-only snapshot of the session
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `add SOURCE --select PATH` | Record an entry; it stays paused until started |
+| `list [--json]` | Recorded entries, or `{runner_held, entries[]}` |
+| `start ID...` / `pause ID...` | Set the entry's desired state |
+| `retry ID...` | Re-queue an entry whose attempt ended blocked or failed |
+| `run` | One foreground pass over the queue |
+| `seed ID...` / `unseed ID...` | Set or clear seed intent for a completed entry |
+| `priority ID PATH normal\|high` | Relative piece priority for an already-selected path |
+| `remove ID...` | Forget the entry; payload, workspace and capture are kept |
+| `live [--json]` | Read-only snapshot from the running session |
+
+| `queue run` flag | Type | Default | Description |
+|------------------|------|---------|-------------|
+| `--max-active` | int | `1` | Concurrent download attempts, 1-32 |
+| `--max-seeds` | int | `0` (off) | Seed slots for completed entries with seed intent, 1-32 |
+| `--download-rate` | string | *(unlimited)* | Aggregate download budget shared by every attempt, e.g. `2MB` |
+| `--upload-rate` | string | *(unlimited)* | Aggregate upload budget shared by every attempt, e.g. `512KB` |
+| `--peers-per-job` | int | `0` (40) | Established peers per torrent per attempt, max 200 |
+| `--half-open-per-job` | int | `0` (derived) | Outbound handshakes in progress per torrent per attempt |
+| `--watch` | bool | `false` | Keep scanning after both pools go idle instead of returning |
+
+- **One runner, recorded intents.** A second `queue run` is refused while a runner holds the queue, and `queue remove` is refused for the same reason. Interrupting a runner is not a pause: the recorded intent is preserved and the next pass honours it.
+- **A pass drains; `--watch` keeps claiming.** Without `--watch` a pass returns once both pools are idle and does not pick up work that appears afterwards. `--watch` keeps scanning (200 ms idle cadence) until SIGINT.
+- **Live status is read-only and observational.** `queue live` asks the runner's private Unix socket for one snapshot; there is no control channel, no RPC, and no way to start or stop a runner through it. When no runner answers, the command says so instead of inferring liveness from recorded state.
+- **Progress is verified selected bytes, not throughput.** `selected_bytes`/`selected_total` count verified bytes of the selected files (a boundary piece by its selected share, BEP 47 padding excluded); `progress_rate` is the change in that number per second and is omitted when it cannot be measured rather than reported as zero.
+- **Managed seeding is opt-in twice**: `queue seed ID` records the intent and `--max-seeds N` provides the slots; with either missing, completed entries are not served.
+- **Removal is non-destructive**: `queue remove` forgets the entry and its restricted source record and leaves the workspace, payload, resume state, capture and archive artifacts in place.
+- **Sources are not echoed.** A queue entry stores a magnet carrying only the infohash; trackers (which can carry passkeys) and local paths do not reach records, capture items or terminal output, and the TUI masks the source field.
+
+See [TORRENT.md](TORRENT.md) for the full queue semantics — claim and backoff rules, managed seeding, priorities, live progress and the stated limits.
 
 ---
 
