@@ -1051,6 +1051,10 @@ func (s *Session) open(ctx context.Context, src source) (*opened, error) {
 			if err != nil {
 				return nil, errors.New("add magnet: " + sanitizeSourceText(err.Error(), src.magnet))
 			}
+		case "resume":
+			// A known-identity restart whose metainfo is gone. Never fall back to
+			// the swarm: resolution is a separate, explicit step.
+			return nil, fmt.Errorf("%w: no persisted metainfo for %s in %s", ErrJobNotFound, src.id.JobID(), s.staging)
 		case "metainfo":
 			if src.mi == nil {
 				return nil, errors.New("internal: metainfo source without metainfo")

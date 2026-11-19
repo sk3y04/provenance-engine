@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/sk3y04/provenance-engine/internal/manifest"
+	"github.com/sk3y04/provenance-engine/internal/torrentqueue"
 	"github.com/sk3y04/provenance-engine/internal/transfer/bittorrent"
 )
 
@@ -139,7 +141,323 @@ owns the root.`,
 	recheck.Flags().BoolVar(&flagTorrentJSON, "json", false, "Emit the recheck report as JSON on stdout")
 	cmd.AddCommand(recheck)
 
+	queue := &cobra.Command{
+		Use:   "queue",
+		Short: "Durable local job queue: add paused, start, pause, retry, run",
+		Long: "A durable queue over isolated workspaces. Entries are added paused; only an explicit\n" +
+			"start makes one runnable. `queue run` drains the queue in the foreground with one worker\n" +
+			"and then exits, so nothing keeps running in the background. No daemon, no RPC, no TUI.\n\n" +
+			"Interrupting the runner is not a pause: the recorded intent is preserved, so a restart\n" +
+			"picks the work back up. Nothing in this command group deletes payload or data.",
+	}
+	queue.AddCommand(queueAddCmd(), queueListCmd(), queueStartCmd(), queuePauseCmd(), queueRetryCmd(), queueRunCmd())
+	cmd.AddCommand(queue)
+
 	return cmd
+}
+
+// queueStore opens the queue under --output, which is the job root.
+func queueStore() (*torrentqueue.Store, error) {
+	return torrentqueue.OpenStore(flagTorrentOut)
+}
+
+func queueAddCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "add SOURCE",
+		Short: "Add a magnet or .torrent to the queue, paused",
+		Long: "Validates the source without contacting the network and records the entry as paused.\n" +
+			"A magnet whose identity needs a metadata exchange is accepted as unresolved and keeps\n" +
+			"its discovery policy for that exchange; a source this build cannot resume is refused\n" +
+			"here rather than accepted as a job that would never start.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(normalizeCLISelection(flagTorrentSelect)) == 0 {
+				return errors.New("a queue entry needs --select (repeatable, comma lists accepted)")
+			}
+			mode, err := bittorrent.ParseDiscovery(flagTorrentDiscovery)
+			if err != nil {
+				return fmt.Errorf("--discovery: %w", err)
+			}
+			prepared, err := bittorrent.PrepareSource(flagTorrentOut, args[0], mode)
+			if err != nil {
+				return err
+			}
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			source := torrentqueue.Source{Kind: prepared.Kind}
+			if prepared.Kind == "file" {
+				if abs, aerr := filepath.Abs(args[0]); aerr == nil {
+					source.Path = abs
+				} else {
+					source.Path = args[0]
+				}
+			} else {
+				source.Magnet = prepared.Sanitized
+			}
+			entry, duplicate, err := store.Add(torrentqueue.AddRequest{
+				Source:     source,
+				RawSource:  args[0],
+				Peers:      flagTorrentPeer,
+				Discovery:  string(mode),
+				Selection:  normalizeCLISelection(flagTorrentSelect),
+				JobID:      prepared.JobID,
+				InfoHash:   prepared.InfoHash,
+				InfoHashV2: prepared.InfoHashV2,
+				Workspace:  prepared.Workspace,
+				Unresolved: prepared.Unresolved,
+			})
+			if err != nil {
+				return err
+			}
+			var b strings.Builder
+			switch {
+			case duplicate:
+				fmt.Fprintf(&b, "%s already queued for this selection (%s)\n", entry.ID, torrentqueue.EntryLabel(entry))
+			case prepared.Unresolved:
+				fmt.Fprintf(&b, "%s added paused; identity unresolved until metadata is fetched\n", entry.ID)
+			case entry.JobID != "":
+				fmt.Fprintf(&b, "%s added paused for %s (%s)\n", entry.ID, entry.JobID, entry.Workspace)
+			default:
+				fmt.Fprintf(&b, "%s added paused\n", entry.ID)
+			}
+			fmt.Fprintf(&b, "start it with: provenance torrent queue start %s\n", entry.ID)
+			_, _ = io.WriteString(os.Stdout, b.String())
+			return nil
+		},
+	}
+	cmd.Flags().StringArrayVar(&flagTorrentSelect, "select", nil, "Exact file path within the torrent to fetch (repeatable; comma lists accepted)")
+	return cmd
+}
+
+func queueListCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List queued entries from their records (read-only)",
+		Long: "Reads the queue records and prints them. Nothing here is live telemetry: phases are\n" +
+			"what the runner last recorded, and the only liveness signal shown is whether the runner\n" +
+			"lock is currently held.",
+		Args: cobra.NoArgs,
+		// A failed entry is an outcome, not a usage error: do not bury it under the
+		// flag table.
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			entries, err := store.List()
+			if err != nil {
+				return err
+			}
+			if flagTorrentJSON {
+				payload := struct {
+					RunnerHeld bool                 `json:"runner_held"`
+					Entries    []torrentqueue.Entry `json:"entries"`
+				}{RunnerHeld: torrentqueue.RunnerHeld(store.Root()), Entries: entries}
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(payload)
+			}
+			var b strings.Builder
+			fmt.Fprintf(&b, "runner: %s\n", runnerState(store.Root()))
+			if len(entries) == 0 {
+				fmt.Fprintln(&b, "no entries")
+				_, _ = io.WriteString(os.Stdout, b.String())
+				return nil
+			}
+			for _, e := range entries {
+				source := e.Source.Magnet
+				if source == "" {
+					source = "local .torrent"
+				}
+				target := e.JobID
+				if target == "" {
+					target = "(unresolved)"
+				}
+				fmt.Fprintf(&b, "%s  %-7s %-18s %s\n", e.ID, e.Desired, torrentqueue.EntryLabel(e), target)
+				fmt.Fprintf(&b, "    source: %s\n", source)
+				if e.Capture != nil {
+					fmt.Fprintf(&b, "    capture: %s (%s)\n", e.Capture.Key, e.Capture.Manifest)
+				}
+				if e.LastError != "" {
+					fmt.Fprintf(&b, "    error: %s\n", e.LastError)
+				}
+				if e.Note != "" {
+					fmt.Fprintf(&b, "    note: %s\n", e.Note)
+				}
+			}
+			_, _ = io.WriteString(os.Stdout, b.String())
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&flagTorrentJSON, "json", false, "Emit entries as JSON on stdout")
+	return cmd
+}
+
+func runnerState(root string) string {
+	if torrentqueue.RunnerHeld(root) {
+		return "active (runner lock held)"
+	}
+	return "idle (no runner lock; recorded phases may predate this command)"
+}
+
+func queueStartCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "start ID...",
+		Short: "Make paused entries runnable",
+		Long: "Records desired=run. This is the only way a new entry becomes runnable, and it is\n" +
+			"durable: a restart keeps it. A failed entry is refused here - use `queue retry`, so a\n" +
+			"failure is never silently retried by a bulk start.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			var b strings.Builder
+			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
+			for _, id := range args {
+				entry, uerr := store.Update(id, func(e *torrentqueue.Entry) error {
+					if e.Phase == torrentqueue.PhaseFailed {
+						return fmt.Errorf("entry %s is failed; use `torrent queue retry %s` to make the retry explicit", e.ID, e.ID)
+					}
+					e.Desired = torrentqueue.DesiredRun
+					if e.Phase == torrentqueue.PhasePaused || e.Phase == torrentqueue.PhaseStopping {
+						e.Phase = torrentqueue.PhaseQueued
+					}
+					return nil
+				})
+				if uerr != nil {
+					return uerr
+				}
+				fmt.Fprintf(&b, "%s  desired=%s phase=%s\n", entry.ID, entry.Desired, torrentqueue.EntryLabel(entry))
+			}
+			return nil
+		},
+	}
+	return cmd
+}
+
+func queuePauseCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "pause ID...",
+		Short: "Record pause intent for entries",
+		Long: "Writes desired=paused and acknowledges only after it is durable. A running job is not\n" +
+			"killed by this command: the runner observes the intent, reports the entry as stopping\n" +
+			"until the client has closed and the workspace is released, and then records paused.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			var b strings.Builder
+			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
+			for _, id := range args {
+				entry, uerr := store.Update(id, func(e *torrentqueue.Entry) error {
+					e.Desired = torrentqueue.DesiredPaused
+					if e.Phase == torrentqueue.PhaseQueued {
+						e.Phase = torrentqueue.PhasePaused
+					}
+					return nil
+				})
+				if uerr != nil {
+					return uerr
+				}
+				switch entry.Phase {
+				case torrentqueue.PhaseRunning, torrentqueue.PhaseStopping:
+					fmt.Fprintf(&b, "%s  pause recorded; the runner will stop it and report stopping until the client closes\n", entry.ID)
+				case torrentqueue.PhaseCompleted:
+					fmt.Fprintf(&b, "%s  pause recorded (already completed; the capture is untouched)\n", entry.ID)
+				default:
+					fmt.Fprintf(&b, "%s  paused\n", entry.ID)
+				}
+			}
+			return nil
+		},
+	}
+	return cmd
+}
+
+func queueRetryCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "retry ID...",
+		Short: "Clear a failure or a backoff and make the entry runnable",
+		Long: "An explicit retry, separate from start and from recheck: a failed capture retries from\n" +
+			"verified local bytes through the normal resume path, and a failed recheck never repairs\n" +
+			"anything on its own.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			var b strings.Builder
+			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
+			for _, id := range args {
+				entry, uerr := store.Update(id, func(e *torrentqueue.Entry) error {
+					if e.Phase == torrentqueue.PhaseCompleted {
+						return fmt.Errorf("entry %s already completed a capture; nothing to retry", e.ID)
+					}
+					e.Desired = torrentqueue.DesiredRun
+					e.Phase = torrentqueue.PhaseQueued
+					e.LastError = ""
+					e.Note = ""
+					e.NotBefore = time.Time{}
+					return nil
+				})
+				if uerr != nil {
+					return uerr
+				}
+				fmt.Fprintf(&b, "%s  retryable: desired=%s phase=%s\n", entry.ID, entry.Desired, torrentqueue.EntryLabel(entry))
+			}
+			return nil
+		},
+	}
+	return cmd
+}
+
+func queueRunCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "run",
+		Short: "Drain the queue in the foreground with one worker",
+		Long: "Runs runnable entries in queue order, one at a time, then exits. This is not a daemon:\n" +
+			"when there is nothing left to do it returns. SIGINT stops the active job, records it as\n" +
+			"an interruption (not a pause) and leaves every entry's intent intact.",
+		Args: cobra.NoArgs,
+		// A failed entry is an outcome, not a usage error: do not bury it under the
+		// flag table.
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			// --timeout bounds each attempt; the queue has no global deadline so one
+			// slow entry cannot consume the whole run.
+			runner := torrentqueue.NewRunner(store, torrentqueue.Adapter{Timeout: flagTorrentTimeout}, torrentqueue.Options{Log: os.Stdout})
+			sum, rerr := runner.Run(cmd.Context())
+			if rerr != nil {
+				return rerr
+			}
+			_, _ = fmt.Fprintf(os.Stdout, "drained: %d completed, %d failed, %d blocked, %d paused, %d claimed\n",
+				sum.Completed, sum.Failed, sum.Blocked, sum.Paused, len(sum.Ran))
+			if sum.Failed > 0 {
+				return fmt.Errorf("queue run: %d entr%s failed; inspect with `torrent queue list`", sum.Failed, plural(sum.Failed))
+			}
+			return nil
+		},
+	}
+	return cmd
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return "y"
+	}
+	return "ies"
 }
 
 // runTorrentRecheck prints the report and turns a non-verified outcome into a
