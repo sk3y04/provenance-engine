@@ -765,6 +765,33 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
+### Removing a queue entry (non-destructive)
+
+```
+provenance torrent queue remove queued-000001-ab12cd34
+```
+
+Removal means "forget this queue entry", never "delete this torrent's data". It
+deletes exactly two things: the public entry and that entry's own restricted source
+record. The workspace, payload, resume database, persisted metainfo, published capture
+and archive artifacts are left untouched, so the job can still be verified, rechecked
+or re-added afterwards.
+
+- Removal takes runner **ownership** (the same lock `queue run` uses) for the duration
+  of the command. A recorded phase proves nothing, so an active runner is refused with
+  an actionable error rather than being paused, unseeded or cancelled behind your back.
+  Because ownership is what is checked, a stale `running`/`serving` record left by a
+  killed process does not block removal.
+- The commit point is the public entry: it goes first, so a crash can never leave a
+  runnable entry whose source was already deleted. If deleting the restricted record
+  then fails, the command says so and the entry is already gone; running the same
+  `remove` again cleans that record and nothing else. There is no orphan sweep.
+- Entry ids are validated strictly (`queued-<6 digits>-<8 hex>`). A prefix, a torrent
+  hash, a filename or a path is refused instead of being turned into a deletion target.
+- Re-adding the same source and selection creates a new paused entry, which adopts the
+  existing verified capture through the normal reconciliation path - no refetch, no
+  second run. A different selection is a new capture intent and is not solved here.
+
 ### Managed seeding in the queue (opt-in)
 
 Seeding is a second pool with its own slots. It is **off unless asked for twice**: an

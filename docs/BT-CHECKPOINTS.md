@@ -1549,3 +1549,76 @@ clearing `SeedAttempt`.
 
 BT-09, starting with non-destructive removal: drop a queue entry without touching its
 workspace, payload or capture.
+
+## BT-09a — Non-destructive queue removal
+
+**Starting SHA** `b9007ee` (clean). No data deletion, no file priorities, no selection
+change.
+
+### What is deleted, and what is not
+
+| path | outcome |
+|------|---------|
+| `.provenance/torrent/queue/entries/<id>.json` | deleted (the commit point) |
+| `.provenance/torrent/queue/restricted/<id>.json` | deleted after the entry, if present |
+| workspace `.provenance/torrent/jobs/<jobID>/…` | untouched - payload, completion DB, metainfo, `staging.lock` |
+| `.provenance/items/<id>.json`, `.provenance/runs/<ts>.json` | untouched |
+| archive/vault artifacts | untouched |
+| another entry's records | untouched |
+
+Deletion targets are derived only from the validated entry id: no path, display name,
+source URL or recorded workspace path is ever turned into a deletion target. The id
+grammar is `queued-<6 digits>-<8 hex>`; prefixes, hashes, filenames and traversal-shaped
+input are refused before any filesystem call.
+
+### Ownership and commit points
+
+Removal takes **runner ownership** first (the same lock `queue run` uses), then the
+store lock, then mutates - the same order a runner uses, so there is no lock-order
+cycle and no window in which a runner can start between a busy check and the deletion.
+A recorded phase is never consulted: an active runner is refused with
+`another runner owns this queue: stop it, wait for its clients to close, then retry`,
+and a stale `running`/`serving` record left by a killed process does **not** block
+removal, because the lock is what is checked.
+
+The public entry is deleted first and the restricted record second, so a crash between
+them can only leave an orphaned credential record, never a runnable entry with its
+source already gone. `Removal.CleanupError` reports that case explicitly; retrying the
+same id deletes only that entry's restricted record.
+
+### Verified
+
+| test | result |
+|------|--------|
+| `TestQueueRemoveUnresolvedEntryKeepsOthers` | both queue-owned records gone; a sibling entry is byte-identical; its restricted record untouched; five invalid ids refused (prefix, bare hash, `../../etc/passwd`, `<id>/../../x`, bad hex, extra suffix); unknown id → `ErrEntryNotFound` |
+| `TestQueueRemoveCompletedEntryRetainsWorkspace` | payload, persisted metainfo, capture items and published run all hash identically before and after; the workspace still verifies every piece through `OpenSeedSession`; capture key unchanged |
+| `TestQueueRemoveRefusesActiveRunner` | with the runner lock held, `Remove` returns `ErrRunnerActive` and changes nothing; with removal holding ownership, a competing `Run` is refused |
+| `TestQueueRemoveStaleRecordWithoutOwner` | a fixture with `phase=running`, `seed_phase=serving` and no owner removes cleanly - documented as a stale-state fixture, not a kill |
+| `TestQueueRemovePartialCleanupRetry` | restricted directory made read-only: entry removed, `CleanupError` non-empty, the entry is not runnable and the queue still drains; after restoring permissions the retry deletes only that restricted record and leaves the sibling untouched |
+| `TestQueueReAddAdoptsExistingCapture` | remove, re-add the same source and selection, start, run → completes with the **same capture key**, the same run-manifest count, and an unchanged payload; a conflicting selection neither completes nor publishes a run |
+| `TestQueueRemoveHighestThenAllocate` | after removing the highest-sequence entry the next entry reuses the sequence but not the id (the id carries entropy), and the removed entry's restricted record is gone |
+
+CLI smoke: `queue remove <id>` prints `removed (payload, workspace and capture kept)`;
+a second removal reports `entry not found`; `../../etc/passwd` is refused as
+`not a queue entry id`; the add output and removal output never contain the passkey.
+Both queue directories were empty afterwards.
+
+### Gates
+
+- `go test ./internal/torrentqueue/ -race -run 'TestQueueRemove|TestQueueReAdd|TestQueueSeed' -count=3`
+- `make test` (repo-wide, `-race`), `make lint`, `go vet ./...`, `git diff --check`
+- Results recorded with this entry.
+
+### Not covered
+
+- Removal while a runner is active is out of scope by design: it is refused, not
+  coordinated.
+- No workspace/archive garbage collection and no vault deletion.
+- The real-kill path for removal is covered only by the stale-record fixture; the
+  kill-under-load path is covered for seeding in BT-08d.4, not for removal.
+- Selection changes remain a separate capture intent, unsolved here.
+
+### Next
+
+BT-09b: priorities within an existing selection - which already-selected files fetch
+first, without changing what the capture contains.
