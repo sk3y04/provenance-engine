@@ -122,6 +122,8 @@ Deep dive: [`docs/EXTRACTORS.md`](docs/EXTRACTORS.md)
 | [`docs/SESSIONS.md`](docs/SESSIONS.md) | Session lifecycle, resume, optimistic concurrency |
 | [`docs/WATCHES.md`](docs/WATCHES.md) | Recurring download subscriptions |
 | [`docs/TORRENT.md`](docs/TORRENT.md) | Selective BitTorrent — pinned library, advisory review, safety model, durable queue, resume |
+| [`docs/SOULSEEK.md`](docs/SOULSEEK.md) | Soulseek via an external `slskd` — profile, health states, jobs, import, curated shares, uploads |
+| [`docs/SLSKD-CHECKPOINTS.md`](docs/SLSKD-CHECKPOINTS.md) | Soulseek integration record — contract evidence, review findings, verified vs inferred |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Architecture, data flow, design decisions, package reference |
 | [`TREEVIEW.md`](TREEVIEW.md) | File-level reference — every source file |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build, test, conventions |
