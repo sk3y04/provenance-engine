@@ -174,6 +174,7 @@ search. No runtime dependencies beyond yt-dlp + ffmpeg.`,
 	root.AddCommand(tuiCmd())
 	root.AddCommand(encodeCmd())
 	root.AddCommand(torrentCmd())
+	root.AddCommand(soulseekCmd())
 	root.AddCommand(completionCmd())
 
 	root.PersistentFlags().StringVar(&flagChromePath, "chrome-path", "", "Path to Chrome/Chromium executable (for browser fallback and import-web)")
@@ -236,6 +237,11 @@ func shouldSkipAutoInstall(cmd *cobra.Command) bool {
 	}
 	// Torrent transfers never touch yt-dlp.
 	if strings.HasPrefix(path, "provenance torrent") {
+		return true
+	}
+	// Soulseek talks to an external slskd over HTTP; nothing here extracts media
+	// through a local tool.
+	if strings.HasPrefix(path, "provenance soulseek") {
 		return true
 	}
 	switch path {
