@@ -37,6 +37,7 @@ var mainItems = []string{
 	"Vault",
 	"Archive",
 	"Manifest",
+	"Torrent queue",
 	"Install yt-dlp",
 	"Vault init",
 	"Encode videos",
@@ -62,6 +63,8 @@ func (m *model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "enter":
 		switch mainItems[m.mainCursor] {
+		case "Torrent queue":
+			return m.openQueueView()
 		case "New grab":
 			m.view = viewNewDownload
 			m.formStep = 0

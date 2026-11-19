@@ -765,6 +765,31 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
+### Queue view in the TUI (read-only)
+
+The main menu has a **Torrent queue** entry. It shows the durable queue (entry id,
+desired state, recorded phase) and, when a foreground runner answers, one live
+snapshot per poll (2 s), with the two pools' used/configured slot counts and the live
+attempt for each entry.
+
+- Recorded and live are separate columns and separate labels. A live observation never
+  overwrites a recorded phase, and it is joined to a row only by exact entry id. A live
+  attempt with no matching durable row is listed under `live only`, not attached to a
+  neighbour.
+- When nothing answers, the durable queue stays browsable and the header reads
+  `live status: unavailable (no foreground runner is reachable)`; the previous snapshot
+  is discarded rather than shown as current. A malformed reply is reported separately
+  from "no runner", and a failed durable refresh keeps the last good rows while saying
+  so.
+- Missing values stay missing: a download has no byte counter in the snapshot, so none
+  is rendered — never `0 B`. A seed's `uploaded_bytes` is shown when present, and a
+  stopping seed is labelled as holding its slot until it closes.
+- One refresh is in flight at a time; each visit to the view gets a new generation, so a
+  late reply from a previous visit is dropped. Polling is a `tea.Tick` scheduled from
+  message handlers only, so nothing survives leaving the view.
+- The view never creates a queue, starts or stops a runner, or takes a writer lock; it
+  performs one durable read and one snapshot request.
+
 ### Live status (`queue live`)
 
 ```

@@ -1916,3 +1916,86 @@ like a lifecycle failure.
 - `make test`, `make lint`, `go vet ./...`, `git diff --check` → recorded with this entry
 - Platform: Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3. No skips in the seed/live
   suites; Unix sockets only, as before.
+
+## BT-10b — Read-only torrent queue view in the TUI
+
+**Starting SHA** `2f16092` (clean). Built on the BT-10a snapshot client; no streaming,
+no mutation IPC, no new counters.
+
+### What the view shows
+
+Main menu → **Torrent queue**. One durable read (`store.List`) and, per poll, one live
+snapshot request over the existing endpoint. Layout:
+
+```
+Torrent queue — /path/to/root
+live: runner pid 4242, started 12:00:00   download slots 1/1   seed slots 1/2
+
+> queued-000001-aaaaaaaa     desired=run    recorded=running    live=download running
+  queued-000002-bbbbbbbb     desired=run    recorded=completed  live=seed serving  uploaded=4.0 KB
+```
+
+- Durable rows keep queue order and show `desired` plus `recorded=` separately from
+  `live=`. The join is by exact entry id only.
+- A live attempt whose id has no durable row is listed under `live only (no durable
+  entry with this id)` — never folded into a neighbouring row.
+- A stopping seed renders as `stopping (stopping; slot held until close)` and the slot
+  counts show it still occupied.
+- `uploaded_bytes` appears when the snapshot has it; a download has no counter in the
+  protocol, so nothing is rendered for it — not `0 B`.
+- No runner: the header reads `live status: unavailable (no foreground runner is
+  reachable)`, the previous snapshot is dropped, and the durable list stays browsable.
+  A malformed reply is labelled separately from "no runner", and a durable read failure
+  keeps the last good rows while reporting the failure above them.
+
+### Polling and cancellation
+
+`tea.Tick(2s)` is scheduled **only from message handlers**, and every message carries
+the view generation: `openQueueView` bumps a counter that survives re-entry, `refresh`
+bumps it again, and a message whose generation is not current is dropped. At most one
+refresh is in flight (`inflight` counts the two sub-requests); `r` refuses to start
+another while one is running. Leaving the view bumps the generation and returns to the
+menu, so nothing in flight can land afterwards. The commands themselves are the
+standard Bubble Tea closures — no goroutine is started by the view.
+
+### Verified (automated)
+
+| test | result |
+|------|--------|
+| `TestQueueViewDurableOnly` | entries render with recorded phases; no `live=`/`uploaded=`/slot line; header says unavailable |
+| `TestQueueViewOverlapAndSlots` | download and seed attempts on their own rows, `download slots 1/1`, `seed slots 1/2`, `uploaded=4.0 KB`, and the recorded phase is untouched |
+| `TestQueueViewStoppingHoldsSlot` | `stopping; slot held until close` with `seed slots 1/1` |
+| `TestQueueViewAbsentCounter` | no `uploaded=` and no `0 B` when the snapshot has no counter |
+| `TestQueueViewLiveOnlyEntry` | an unknown id appears under `live only` and is not attached to a durable row |
+| `TestQueueRunnerDisappears` | after a successful poll, `ErrNoLiveRunner` clears the overlay, keeps the rows, and the view stops claiming live |
+| `TestQueueLateMessageIgnored` | a message with an older generation changes nothing, durable or live |
+| `TestQueueReopenInvalidatesPreviousGenerations` | reopening bumps the generation and drops the previous visit's message |
+| `TestQueueRefreshSingleFlight` | the second refresh is refused, the generation does not advance, `inflight` drains to zero after both replies |
+| `TestQueueDurableFailureKeepsLive` | a durable failure reports the error, keeps the previous rows and keeps the live observation |
+| `TestQueueViewAgainstRealEndpoint` | a real runner publishes the real socket; the view shows `live=seed serving` alongside the durable row, then after the runner exits shows the same row with `unavailable` and no live overlay; the entry record is unchanged afterwards |
+
+### Verified (gates)
+
+- `go test ./internal/tui/ ./internal/torrentqueue/ -race -run 'TestQueue|TestLive|TestSeedPool|TestRunJoins' -count=3 -timeout 800s`
+  → `tui 1.451s`, `torrentqueue 229.022s` — includes the BT-10a Close barrier, live
+  overlap, slow-reader and SIGKILL regressions, with no skips on the Unix path
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok
+- `make lint` → `0 issues`; `go vet ./...` clean; `git diff --check` clean
+- Platform: Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3
+
+### Manual vs automated
+
+No live terminal session was driven for this slice: the TUI needs a TTY, and every
+claim above is model- or endpoint-level. `TestQueueViewAgainstRealEndpoint` is the
+closest automated analogue to "open the view while a runner is serving, stop the
+runner, keep browsing" — it exercises the real socket and the real store, but not
+Bubble Tea's terminal loop, key handling or rendering to a real screen. That remains
+manual verification.
+
+### Not covered
+
+- No start/pause/retry/seed actions, no mutation IPC, no streaming.
+- Root selection is the process working directory (`queue.root` is seeded from it); no
+  flag or config was added in this slice.
+- Windows: the live endpoint is Unix-only, so the live half is unavailable there by
+  design; the durable half still renders.

@@ -42,6 +42,8 @@ func (m *model) View() string {
 	switch m.view {
 	case viewMain:
 		body = m.viewMain()
+	case viewTorrentQueue:
+		body = m.viewTorrentQueue()
 	case viewSessions:
 		body = m.viewSessions()
 	case viewSessionDetail:
@@ -134,6 +136,8 @@ func (m *model) renderStatusBar() string {
 
 func (m *model) viewFooter() string {
 	switch m.view {
+	case viewTorrentQueue:
+		return "↑/↓ move • r refresh • esc back"
 	case viewMain:
 		base := "↑/↓ move • enter select • q quit"
 		if m.resumeCandidate != "" {

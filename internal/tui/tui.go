@@ -61,6 +61,7 @@ const (
 	viewArchiveImportWeb
 	viewManifestShow
 	viewManifestVerify
+	viewTorrentQueue
 )
 
 const confirmWindow = 3 * time.Second
@@ -85,6 +86,9 @@ type model struct {
 	// status bar
 	ytDlpInstalled bool
 	vaultInit      bool
+
+	// torrent queue (read-only)
+	queue queueState
 
 	// sessions
 	sessions        []session.Info

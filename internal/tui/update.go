@@ -424,6 +424,8 @@ func (m *model) updateView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.updateArchiveImportOpenAPI(msg)
 	case viewArchiveImportWeb:
 		return m.updateArchiveImportWeb(msg)
+	case viewTorrentQueue:
+		return m.updateQueue(msg)
 	case viewManifestShow:
 		return m.updateManifestShow(msg)
 	case viewManifestVerify:
