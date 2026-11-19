@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,9 @@ var (
 	flagSlskdInterval   time.Duration
 	flagSlskdOnce       bool
 	flagSlskdSettle     time.Duration
+	flagSlskdRemove     bool
+	flagSlskdAnother    bool
+	flagSlskdAddr       string
 )
 
 func searchFlags(cmd *cobra.Command) *cobra.Command {
@@ -459,4 +463,272 @@ func yesNo(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+func soulseekCancelCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "cancel <jobID>",
+		Short: "Cancel a job's transfers and mark it cancelled",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, settings, err := slskdClient(cmd.Context())
+			if err != nil {
+				return err
+			}
+			root, err := slskdStateRoot(settings)
+			if err != nil {
+				return err
+			}
+			store, err := slskd.OpenJobStore(root)
+			if err != nil {
+				return err
+			}
+			job, err := slskd.NewReconciler(client, store).Cancel(cmd.Context(), args[0], flagSlskdRemove)
+			if err != nil {
+				return err
+			}
+			fmt.Println(formatJob(job))
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&flagSlskdRemove, "remove", false, "also remove the transfer record in slskd")
+	return cmd
+}
+
+func soulseekRetryCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "retry <jobID>",
+		Short: "Re-enqueue a failed, cancelled or interrupted job as a new job",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, settings, err := slskdClient(cmd.Context())
+			if err != nil {
+				return err
+			}
+			root, err := slskdStateRoot(settings)
+			if err != nil {
+				return err
+			}
+			store, err := slskd.OpenJobStore(root)
+			if err != nil {
+				return err
+			}
+			out, err := slskd.NewReconciler(client, store).Retry(cmd.Context(), args[0], flagSlskdAnother)
+			if err != nil {
+				return err
+			}
+			if out.Duplicate {
+				fmt.Printf("already queued as %s\n", out.Job.ID)
+				return nil
+			}
+			fmt.Printf("queued %s: %d file(s) from %s\n", out.Job.ID, len(out.Job.Items), out.Job.Peer)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&flagSlskdAnother, "another-source", false, "use the next ranked alternate peer instead of retrying the same one")
+	return cmd
+}
+
+func soulseekPositionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "position <jobID>",
+		Short: "Ask each peer for this job's place in its queue (rate-limited)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, settings, err := slskdClient(cmd.Context())
+			if err != nil {
+				return err
+			}
+			root, err := slskdStateRoot(settings)
+			if err != nil {
+				return err
+			}
+			store, err := slskd.OpenJobStore(root)
+			if err != nil {
+				return err
+			}
+			pos, err := slskd.NewReconciler(client, store).QueuePosition(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			if flagSlskdJSON {
+				return printJSON(pos)
+			}
+			for name, place := range pos {
+				fmt.Printf("%-60s position %d\n", name, place)
+			}
+			return nil
+		},
+	}
+}
+
+func soulseekClearCompletedCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "clear-completed",
+		Short: "Remove completed download records from slskd (job history is kept)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, settings, err := slskdClient(cmd.Context())
+			if err != nil {
+				return err
+			}
+			root, err := slskdStateRoot(settings)
+			if err != nil {
+				return err
+			}
+			store, err := slskd.OpenJobStore(root)
+			if err != nil {
+				return err
+			}
+			if err := slskd.NewReconciler(client, store).ClearCompleted(cmd.Context()); err != nil {
+				return err
+			}
+			fmt.Println("cleared completed transfers in slskd; provenance job records were not touched")
+			return nil
+		},
+	}
+}
+
+func soulseekRecoverCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "recover",
+		Short: "Reconcile durable jobs against slskd and the filesystem",
+		Long: `Cross-check every pending job against slskd's transfers and the bytes on
+disk. A job whose transfer records expired but whose files arrived becomes
+ready to ingest; a job that exists in neither place becomes INTERRUPTED and
+can be re-enqueued with ` + "`provenance soulseek retry`" + `.
+
+Nothing is changed when slskd cannot be reached: a network failure is not
+evidence that a download is gone.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, settings, err := slskdClient(cmd.Context())
+			if err != nil {
+				return err
+			}
+			root, err := slskdStateRoot(settings)
+			if err != nil {
+				return err
+			}
+			store, err := slskd.OpenJobStore(root)
+			if err != nil {
+				return err
+			}
+			rep, err := (&slskd.Recovery{Client: client, Store: store, Mount: settings.ProvenanceDownloadsMount}).Run(cmd.Context())
+			for _, line := range rep.Summary() {
+				fmt.Println(line)
+			}
+			return err
+		},
+	}
+}
+
+func soulseekWebhookListenCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "webhook-listen",
+		Short: "Run the optional webhook receiver that wakes the reconciler early",
+		Long: `Serve the slskd webhook endpoint and reconcile on delivery.
+
+Webhooks are a latency optimisation only: polling stays authoritative, because
+slskd emits no search, progress or failure webhooks and drops them entirely on a
+volatile restart. The endpoint refuses every delivery unless a shared secret is
+configured.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, settings, err := slskdClient(cmd.Context())
+			if err != nil {
+				return err
+			}
+			secret := settings.WebhookSecret
+			if strings.TrimSpace(secret) == "" {
+				return errors.New("no webhook secret is configured; run `provenance soulseek settings set --webhook-secret <value>`")
+			}
+			root, err := slskdStateRoot(settings)
+			if err != nil {
+				return err
+			}
+			store, err := slskd.OpenJobStore(root)
+			if err != nil {
+				return err
+			}
+			reconciler := slskd.NewReconciler(client, store)
+			ing := &slskd.Ingestor{
+				SlskdDownloadsRoot: settings.SlskdDownloadsRoot,
+				Mount:              settings.ProvenanceDownloadsMount,
+				VaultRoot:          flagSlskdVault,
+				Collection:         flagSlskdCollection,
+				Cleanup:            settings.PostImportCleanup,
+				Client:             client,
+			}
+			ing.AttachStore(store)
+
+			wake := make(chan string, 1)
+			handler := &slskd.WebhookHandler{
+				Secret: secret,
+				Wake: func(reason string) {
+					select {
+					case wake <- reason:
+					default:
+					}
+				},
+			}
+			mux := http.NewServeMux()
+			mux.Handle("/api/integrations/slskd/webhook", handler)
+
+			ctx := cmd.Context()
+			go func() {
+				// Reconcile immediately at start, then whenever woken, plus a slow
+				// safety tick so a lost webhook cannot stall a download forever.
+				runPass := func() {
+					if _, err := reconciler.Poll(ctx); err != nil && ctx.Err() == nil {
+						fmt.Fprintf(os.Stderr, "poll: %v\n", err)
+					}
+					if _, err := ing.IngestPending(ctx, store); err != nil && ctx.Err() == nil {
+						fmt.Fprintf(os.Stderr, "ingest: %v\n", err)
+					}
+				}
+				runPass()
+				tick := time.NewTicker(60 * time.Second)
+				defer tick.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-wake:
+						runPass()
+					case <-tick.C:
+						runPass()
+					}
+				}
+			}()
+
+			srv := &http.Server{
+				Addr:              flagSlskdAddr,
+				Handler:           mux,
+				ReadHeaderTimeout: 5 * time.Second,
+				ReadTimeout:       10 * time.Second,
+				WriteTimeout:      10 * time.Second,
+			}
+			fmt.Printf("webhook receiver listening on %s\n", flagSlskdAddr)
+			fmt.Println("paste this into slskd.yml (substitute the secret from your settings file):")
+			fmt.Print(slskd.WebhookConfigSnippet("http://<provenance-host>"+flagSlskdAddr+"/api/integrations/slskd/webhook", "<webhook-secret>"))
+			errCh := make(chan error, 1)
+			go func() { errCh <- srv.ListenAndServe() }()
+			select {
+			case <-ctx.Done():
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				return srv.Shutdown(shutdownCtx)
+			case err := <-errCh:
+				if errors.Is(err, http.ErrServerClosed) {
+					return nil
+				}
+				return err
+			}
+		},
+	}
+	cmd.Flags().StringVar(&flagSlskdAddr, "addr", ":8791", "listen address for the webhook receiver")
+	cmd.Flags().StringVar(&flagSlskdVault, "vault", "", "also ingest each capture into this vault root")
+	cmd.Flags().StringVar(&flagSlskdCollection, "collection", "soulseek", "vault collection name")
+	return cmd
 }

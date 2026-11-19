@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sk3y04/provenance-engine/internal/slskd"
 )
@@ -170,4 +172,89 @@ func fakeSlskdServer(t *testing.T, mount string) *httptest.Server {
 			http.NotFound(w, r)
 		}
 	}))
+}
+
+// TestSoulseekRecoverAndCancelCLI proves the recovery and cancel commands are
+// wired to the durable store: a job slskd has forgotten and that has no bytes
+// becomes INTERRUPTED, and cancel reaches slskd.
+func TestSoulseekRecoverAndCancelCLI(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	mount := filepath.Join(dir, "downloads")
+	if err := os.MkdirAll(mount, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var canceled atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/transfers/downloads"):
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodDelete:
+			canceled.Store(r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		case strings.HasSuffix(r.URL.Path, "/application/version"):
+			_, _ = w.Write([]byte(`"0.26.0.0"`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	if _, err := runSoulseek(t, "settings", "set", "--base-url", srv.URL, "--api-key", "k", "--enable", "--downloads-mount", mount); err != nil {
+		t.Fatal(err)
+	}
+
+	// A durable job that slskd no longer tracks and that has no bytes on disk.
+	store, err := slskd.OpenJobStore(mount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.Create(slskd.Job{
+		ID: "prov-9999999999999999", Peer: "peer1", Status: slskd.JobInProgress,
+		DestinationSubdir: "provenance/prov-9999999999999999",
+		Items:             []slskd.Item{{RemoteFilename: `music\a.flac`, Size: 10}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(job.ID, func(j *slskd.Job) error {
+		j.CreatedAt = j.CreatedAt.Add(-time.Hour)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runSoulseek(t, "recover")
+	if err != nil {
+		t.Fatalf("recover: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "interrupted") || !strings.Contains(out, job.ID) {
+		t.Fatalf("recover output = %q", out)
+	}
+
+	out, err = runSoulseek(t, "retry", job.ID)
+	if err != nil {
+		// Retry legitimately fails here: the fake slskd has no batch endpoint.
+		t.Logf("retry (expected to fail against this fake): %v", err)
+	}
+	_ = out
+
+	if _, err := store.Update(job.ID, func(j *slskd.Job) error {
+		j.Items[0].TransferID = "t1"
+		j.Status = slskd.JobInProgress
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err = runSoulseek(t, "cancel", job.ID)
+	if err != nil {
+		t.Fatalf("cancel: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "CANCELLED") {
+		t.Fatalf("cancel output = %q", out)
+	}
+	if v, _ := canceled.Load().(string); v == "" {
+		t.Fatal("cancel did not reach slskd")
+	}
 }
