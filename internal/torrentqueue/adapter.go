@@ -110,3 +110,24 @@ func relativeTo(root, path string) (string, error) {
 	}
 	return filepath.ToSlash(rel), nil
 }
+
+// OpenSeed builds a verified seed session for a completed entry. It reuses the exact
+// startup path proven in BT-08d.2a (network-inert verification against fresh
+// completion state, then an explicit Serve) and the same shared upload budget and
+// per-job peer limit as a download - seeding never gets a second limiter.
+func (a Adapter) OpenSeed(entry Entry, req Request) (SeedSession, error) {
+	cfg := a.config(req)
+	// The entry names its workspace by canonical id; the helper derives the path so
+	// this cannot drift from the workspace layout.
+	ws, werr := bittorrent.WorkspacePathForJob(req.Root, entry.JobID)
+	if werr != nil {
+		return nil, werr
+	}
+	cfg.StagingDir = ws
+	cfg.Discovery = bittorrent.Discovery(req.Discovery)
+	sess, err := bittorrent.OpenSeedSession(context.Background(), cfg, entry.JobID)
+	if err != nil {
+		return nil, err
+	}
+	return sess, nil
+}

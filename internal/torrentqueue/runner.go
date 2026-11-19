@@ -47,6 +47,9 @@ var (
 	ErrEntryFormat = errors.New("unrecognized torrent queue entry format")
 	// ErrRunnerActive means another runner owns this queue.
 	ErrRunnerActive = errors.New("another runner owns this queue")
+	// ErrUsage marks a caller mistake, such as a seed command for an entry that has
+	// not completed a capture.
+	ErrUsage = errors.New("invalid queue operation")
 	// ErrWorkspaceBusy is a retryable condition: the job's workspace is owned by
 	// another process, so this entry is deferred with a bounded backoff.
 	ErrWorkspaceBusy = errors.New("job workspace is busy")
@@ -83,6 +86,10 @@ const (
 // being a bounded resource user: every attempt costs a client, sockets, a
 // completion database and a payload write path.
 const MaxActiveLimit = 32
+
+// MaxSeedLimit bounds --max-seeds: each serving seed is a client, a listener and a
+// payload write path that runs until the user stops it.
+const MaxSeedLimit = 32
 
 // Request is one unit of work handed to the transfer backend.
 type Request struct {
@@ -148,6 +155,11 @@ type Options struct {
 	// attempt may use all of it.
 	DownloadLimit int64
 	UploadLimit   int64
+	// MaxSeeds is the size of the seed-slot pool. Zero (the default) disables
+	// managed seeding for this invocation, so an ordinary drain never uploads.
+	// Seed slots are separate from MaxActive: a serving seed consumes neither a
+	// download slot nor a workspace lock while it waits for one.
+	MaxSeeds int
 	// PeersPerJob and HalfOpenPerJob are per-attempt limits: established peers per
 	// torrent, and outbound handshakes in progress per torrent. Zero keeps the
 	// adapter defaults. They are per job, not a runner-wide pool, so the runner's
@@ -165,6 +177,9 @@ type Options struct {
 
 // Validate rejects a configuration instead of silently clamping it.
 func (o Options) Validate() error {
+	if o.MaxSeeds < 0 || o.MaxSeeds > MaxSeedLimit {
+		return fmt.Errorf("%w: --max-seeds must be between 1 and %d, got %d", ErrUsage, MaxSeedLimit, o.MaxSeeds)
+	}
 	if o.MaxActive < 0 {
 		return fmt.Errorf("max-active must be at least 1, got %d", o.MaxActive)
 	}
@@ -259,6 +274,12 @@ type Summary struct {
 	Failed    int
 	Blocked   int
 	Paused    int
+	// Seeded lists entries this runner started serving, and SeedFinished counts
+	// the seed slots that closed. SeedBlocked counts workspaces that could not be
+	// served (damaged, selective, ineligible).
+	Seeded       []string
+	SeedFinished int
+	SeedBlocked  int
 	// Stale counts attempt results that arrived after the attempt was superseded.
 	Stale int
 	// Remaining counts entries that are still runnable or blocked after the drain.
@@ -291,6 +312,18 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 
 	limit := r.opts.maxActive()
 	var mu sync.Mutex
+	// The seed pool runs beside the download loop with its own slots. It is started
+	// once and reports done when it has nothing left to serve.
+	seedsOn := r.opts.maxSeeds() > 0
+	seedDone := make(chan struct{})
+	if seedsOn {
+		go func() {
+			defer close(seedDone)
+			r.runSeeds(ctx, &mu, &sum)
+		}()
+	} else {
+		close(seedDone)
+	}
 	done := make(chan string, limit)
 	inflight := map[string]context.CancelFunc{}
 	active := 0
@@ -359,6 +392,14 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 			}(claimed, claimed.Attempt, attemptCtx)
 		}
 		if active == 0 {
+			if seedsOn {
+				// Downloads drained. With managed seeding requested the runner stays
+				// alive while the seed pool has work and exits when it has none, so
+				// an active seed is never cut off by a finished download queue.
+				r.logf("downloads drained; managing seeds until they stop")
+				<-seedDone
+				break
+			}
 			// Drained: nothing is running and nothing is eligible. An entry blocked
 			// on a future not_before is not eligible, so a drain ends instead of
 			// polling until the backoff expires - the same contract as the
@@ -368,6 +409,9 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 		take(true)
 	}
 	r.shutdown(inflight, done, active)
+	if seedsOn {
+		<-seedDone
+	}
 	return sum, nil
 }
 

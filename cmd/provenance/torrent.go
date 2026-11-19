@@ -27,6 +27,7 @@ var (
 	flagTorrentJSON      bool
 	flagTorrentSeed      bool
 	flagQueueMaxActive   int
+	flagQueueMaxSeeds    int
 	flagQueueDownRate    string
 	flagQueueUpRate      string
 	flagQueuePeers       int
@@ -155,7 +156,8 @@ owns the root.`,
 			"Interrupting the runner is not a pause: the recorded intent is preserved, so a restart\n" +
 			"picks the work back up. Nothing in this command group deletes payload or data.",
 	}
-	queue.AddCommand(queueAddCmd(), queueListCmd(), queueStartCmd(), queuePauseCmd(), queueRetryCmd(), queueRunCmd())
+	queue.AddCommand(queueAddCmd(), queueListCmd(), queueStartCmd(), queuePauseCmd(), queueRetryCmd(),
+		queueSeedCmd(), queueUnseedCmd(), queueRunCmd())
 	cmd.AddCommand(queue)
 
 	return cmd
@@ -424,6 +426,64 @@ func queueRetryCmd() *cobra.Command {
 	return cmd
 }
 
+func queueSeedCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "seed ID...",
+		Short: "Record seeding intent for completed entries",
+		Long: "Writes seed_desired=on and acknowledges only after it is durable. Only a completed\n" +
+			"entry with a published capture can be seeded, and download intent is not changed.\n" +
+			"Intent does nothing on its own: serving requires `torrent queue run --max-seeds N`.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			var b strings.Builder
+			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
+			for _, id := range args {
+				entry, uerr := store.SetSeedIntent(id, true)
+				if uerr != nil {
+					return uerr
+				}
+				fmt.Fprintf(&b, "%s  seed intent recorded: seed_desired=%s seed_phase=%s\n",
+					entry.ID, entry.SeedDesired, entry.SeedPhase)
+			}
+			return nil
+		},
+	}
+	return cmd
+}
+
+func queueUnseedCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "unseed ID...",
+		Short: "Stop seeding an entry and keep it stopped",
+		Long: "Writes seed_desired=off durably. A serving seed reports stopping until its client has\n" +
+			"closed and the workspace is released; a later run does not resume it. The capture,\n" +
+			"payload and workspace are untouched.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			var b strings.Builder
+			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
+			for _, id := range args {
+				entry, uerr := store.SetSeedIntent(id, false)
+				if uerr != nil {
+					return uerr
+				}
+				fmt.Fprintf(&b, "%s  seed intent cleared: seed_desired=%s seed_phase=%s\n",
+					entry.ID, entry.SeedDesired, entry.SeedPhase)
+			}
+			return nil
+		},
+	}
+	return cmd
+}
+
 func queueRunCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -451,6 +511,10 @@ func queueRunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if flagQueueMaxSeeds < 0 || flagQueueMaxSeeds > torrentqueue.MaxSeedLimit {
+				return fmt.Errorf("--max-seeds must be between 1 and %d, got %d (omit it to leave managed seeding off)",
+					torrentqueue.MaxSeedLimit, flagQueueMaxSeeds)
+			}
 			store, err := queueStore()
 			if err != nil {
 				return err
@@ -464,6 +528,7 @@ func queueRunCmd() *cobra.Command {
 					UploadLimit:    upRate,
 					PeersPerJob:    flagQueuePeers,
 					HalfOpenPerJob: flagQueueHalfOpen,
+					MaxSeeds:       flagQueueMaxSeeds,
 					Log:            os.Stdout,
 				})
 			sum, rerr := runner.Run(cmd.Context())
@@ -479,6 +544,8 @@ func queueRunCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVar(&flagQueueMaxActive, "max-active", 1, "Concurrent attempts to run at once (1-32)")
+	cmd.Flags().IntVar(&flagQueueMaxSeeds, "max-seeds", 0,
+		"Seed slots for completed entries with seed intent (1-32); 0 leaves managed seeding off")
 	cmd.Flags().StringVar(&flagQueueDownRate, "download-rate", "", "Aggregate download budget shared by every attempt, e.g. 2MB (bytes/second; empty means unlimited)")
 	cmd.Flags().StringVar(&flagQueueUpRate, "upload-rate", "", "Aggregate upload budget shared by every attempt, e.g. 512KB (bytes/second; empty means unlimited)")
 	cmd.Flags().IntVar(&flagQueuePeers, "peers-per-job", 0, "Established peers per torrent per attempt (0 keeps the default of 40; max 200)")

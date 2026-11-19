@@ -98,6 +98,58 @@ type CaptureRef struct {
 	Reconciled  bool      `json:"reconciled,omitempty"`
 }
 
+// SeedDesired is what the user asked for. Only an explicit `queue seed` sets it.
+type SeedDesired string
+
+// SeedPhase is what the runner last observed.
+type SeedPhase string
+
+const (
+	SeedOff SeedDesired = "off"
+	SeedOn  SeedDesired = "on"
+
+	SeedIdle      SeedPhase = "idle"
+	SeedWaiting   SeedPhase = "waiting"
+	SeedVerifying SeedPhase = "verifying"
+	SeedServing   SeedPhase = "serving"
+	SeedStopping  SeedPhase = "stopping"
+	SeedStopped   SeedPhase = "stopped"
+	SeedBlocked   SeedPhase = "blocked"
+)
+
+// SeedWanted reports whether the user asked for this entry to be seeded.
+func (e Entry) SeedWanted() bool { return e.SeedDesired == SeedOn }
+
+// SeedEligible reports whether the entry can be handed to a seed session right now:
+// a completed download with a published capture, an explicit opt-in, and no seed
+// already owning the record.
+func (e Entry) SeedEligible(now time.Time) bool {
+	if !e.SeedWanted() || e.Phase != PhaseCompleted || e.Capture == nil || e.Workspace == "" {
+		return false
+	}
+	switch e.SeedPhase {
+	case SeedServing, SeedVerifying, SeedStopping:
+		return false
+	}
+	return !e.SeedNotBefore.After(now)
+}
+
+// SeedPending reports work a runner is still responsible for: opted-in entries that
+// are idle, waiting, or actively starting/serving. A blocked seed does not keep a
+// runner alive - it is waiting for a person, not for a slot.
+func (e Entry) SeedPending() bool {
+	if !e.SeedWanted() {
+		return false
+	}
+	switch e.SeedPhase {
+	case SeedWaiting, SeedVerifying, SeedServing, SeedStopping:
+		return true
+	case "":
+		return e.Phase == PhaseCompleted
+	}
+	return false
+}
+
 // Entry is one durable queue record.
 type Entry struct {
 	Format    string    `json:"format"`
@@ -135,6 +187,18 @@ type Entry struct {
 	LastError string `json:"last_error,omitempty"`
 	// NotBefore is a bounded backoff for a blocked entry.
 	NotBefore time.Time `json:"not_before,omitempty"`
+	// SeedDesired is user intent for managed seeding, kept separate from Desired so
+	// a queue drain can never start uploading by itself. Empty reads as off, which
+	// is what records written before this field existed mean.
+	SeedDesired SeedDesired `json:"seed_desired,omitempty"`
+	// SeedPhase is the last observed seeding state, never the intent.
+	SeedPhase SeedPhase `json:"seed_phase,omitempty"`
+	// SeedAttempt is the token of the seed attempt that owns the record, so a late
+	// result cannot overwrite a newer unseed or seed command.
+	SeedAttempt string `json:"seed_attempt,omitempty"`
+	SeedError   string `json:"seed_error,omitempty"`
+	// SeedNotBefore is a bounded backoff after an ineligible workspace.
+	SeedNotBefore time.Time `json:"seed_not_before,omitempty"`
 	// Note carries a short reconciliation remark, such as "interrupted by runner
 	// shutdown" or "adopted capture published before the queue updated".
 	Note string `json:"note,omitempty"`
@@ -223,7 +287,7 @@ func (s *Store) lock() (*filelock.Lock, error) {
 func (s *Store) Add(req AddRequest) (Entry, bool, error) {
 	var zero Entry
 	if len(req.Selection) == 0 {
-		return zero, false, errors.New("a queue entry needs at least one selected path")
+		return zero, false, fmt.Errorf("%w: a queue entry needs at least one selected path", ErrUsage)
 	}
 	if _, err := time.ParseDuration("0s"); err != nil { // keep time imported for doc clarity
 		return zero, false, err
@@ -397,8 +461,88 @@ func (s *Store) Update(id string, mutate func(*Entry) error) (Entry, error) {
 	return entry, nil
 }
 
-// RestrictedSource returns the stored raw source and peers for an entry. It is
-// only used by the runner (to resolve an entry) and by nothing that prints.
+// SetSeedIntent records the user's seeding intent for one entry. It persists before
+// returning, so a caller may acknowledge only after this succeeds, and it never
+// touches download intent.
+func (s *Store) SetSeedIntent(id string, on bool) (Entry, error) {
+	return s.Update(id, func(e *Entry) error {
+		if on {
+			if e.Phase != PhaseCompleted || e.Capture == nil || e.Workspace == "" {
+				return fmt.Errorf("%w: only a completed entry with a published capture can be seeded", ErrUsage)
+			}
+			e.SeedDesired = SeedOn
+			e.SeedPhase = SeedWaiting
+			e.SeedNotBefore = time.Time{}
+			e.SeedError = ""
+			return nil
+		}
+		e.SeedDesired = SeedOff
+		switch e.SeedPhase {
+		case SeedServing, SeedVerifying:
+			// The runner observes the intent and reports stopping until the client
+			// has closed; the phase here is not a claim that it already stopped.
+			e.SeedPhase = SeedStopping
+		default:
+			e.SeedPhase = SeedStopped
+		}
+		return nil
+	})
+}
+
+// SeedCandidates lists entries this runner may start serving, in queue order,
+// excluding anything already in flight and anything in a workspace already owned.
+func (s *Store) SeedCandidates(now time.Time, skip map[string]bool) ([]Entry, error) {
+	entries, err := s.list()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Entry, 0, len(entries))
+	for _, e := range entries {
+		if skip[e.ID] || !e.SeedEligible(now) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// SeedPending reports whether any entry still needs this runner's seed pool.
+func (s *Store) SeedPending() (bool, error) {
+	entries, err := s.list()
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if e.SeedPending() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// UpdateSeed applies a mutation only if the seed attempt still owns the record.
+func (s *Store) UpdateSeed(id, token string, mutate func(*Entry) error) (Entry, error) {
+	var stale bool
+	entry, err := s.Update(id, func(e *Entry) error {
+		if token != "" && e.SeedAttempt != token {
+			stale = true
+			return nil
+		}
+		return mutate(e)
+	})
+	if err != nil {
+		return entry, err
+	}
+	if stale {
+		return entry, errStaleAttempt
+	}
+	return entry, nil
+}
+
+// RestrictedSource returns the stored raw source and peers for an entry. It is about
+// the restricted record, not the public one.
+// RestrictedSource returns the stored raw source and peers for an entry. It is only
+// used by the runner (to resolve an entry) and by nothing that prints.
 func (s *Store) RestrictedSource(id string) (raw string, peers []string, err error) {
 	path := filepath.Join(s.restrictedDir(), id+".json")
 	data, rerr := os.ReadFile(path)

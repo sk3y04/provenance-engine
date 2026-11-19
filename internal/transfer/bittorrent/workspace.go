@@ -90,6 +90,16 @@ func WorkspacePath(root string, id Identity) (string, error) {
 	return filepath.Join(root, filepath.FromSlash(workspaceJobsDir), jobID), nil
 }
 
+// WorkspacePathForJob is WorkspacePath for a caller that holds only the canonical
+// job id string, so no package has to reconstruct the layout itself.
+func WorkspacePathForJob(root, jobID string) (string, error) {
+	id, err := parseIdentityString(jobID)
+	if err != nil {
+		return "", err
+	}
+	return WorkspacePath(root, id)
+}
+
 // validateJobID accepts only the two canonical forms, so a caller cannot pass a
 // bare hash, a display name or a truncated key and have it become a path.
 func validateJobID(jobID string) error {
