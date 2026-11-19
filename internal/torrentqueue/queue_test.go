@@ -212,9 +212,16 @@ func TestQueuePauseDuringWork(t *testing.T) {
 	if _, err := store.Update(entry.ID, func(e *Entry) error { e.Desired = DesiredRun; return nil }); err != nil {
 		t.Fatal(err)
 	}
+	// The worker parks after seeing the cancellation, so "stopping" is observed
+	// through a barrier instead of a poll that could miss the window: the worker
+	// cannot have written "paused" while it is still inside Run.
+	cancelled := make(chan struct{})
+	release := make(chan struct{})
 	fake := newFakeTransfer()
 	fake.behavior = func(ctx context.Context, req Request) (Outcome, error) {
 		<-ctx.Done()
+		close(cancelled)
+		<-release
 		return Outcome{}, ctx.Err()
 	}
 	runner := NewRunner(store, fake, Options{PollInterval: 2 * time.Millisecond})
@@ -228,11 +235,17 @@ func TestQueuePauseDuringWork(t *testing.T) {
 	if _, err := store.Update(entry.ID, func(e *Entry) error { e.Desired = DesiredPaused; return nil }); err != nil {
 		t.Fatal(err)
 	}
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker was never cancelled by the pause")
+	}
 	// stopping is observable while the worker is still closing.
 	stopping := waitPhase(t, store, entry.ID, PhaseStopping, 5*time.Second)
 	if stopping.Desired != DesiredPaused {
 		t.Fatalf("stopping entry desired %q", stopping.Desired)
 	}
+	close(release)
 	sum := <-done
 	final := waitPhase(t, store, entry.ID, PhasePaused, 5*time.Second)
 	if final.Capture != nil {
