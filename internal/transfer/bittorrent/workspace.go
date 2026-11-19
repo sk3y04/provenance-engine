@@ -246,7 +246,10 @@ func openWorkspace(root string, id Identity, cfg Config) (*Session, error) {
 // openWorkspaceAt opens a workspace whose directory is already known, taking its
 // lock and validating any existing record. Seeds use it for an existing workspace;
 // everything else goes through openWorkspace, which derives the path first.
-func openWorkspaceAt(ws string, id Identity, cfg Config) (*Session, error) {
+// openWorkspaceBare takes ownership of a workspace and validates its job record,
+// without opening storage or starting a client. The caller holds the lock and must
+// release it through Session.Close, which tolerates a session that never had a client.
+func openWorkspaceBare(ws string, id Identity, cfg Config) (*Session, error) {
 	peers, err := parsePeers(cfg.Peers)
 	if err != nil {
 		return nil, err
@@ -267,7 +270,14 @@ func openWorkspaceAt(ws string, id Identity, cfg Config) (*Session, error) {
 			return nil, fmt.Errorf("workspace %s: %w", ws, verr)
 		}
 	}
+	return s, nil
+}
 
+func openWorkspaceAt(ws string, id Identity, cfg Config) (*Session, error) {
+	s, err := openWorkspaceBare(ws, id, cfg)
+	if err != nil {
+		return nil, err
+	}
 	completion, err := storage.NewDefaultPieceCompletionForDir(filepath.Join(ws, filepath.FromSlash(workspaceCompletionDir)))
 	if err != nil {
 		_ = s.releaseOwnership()

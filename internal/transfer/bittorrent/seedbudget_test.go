@@ -23,10 +23,10 @@ package bittorrent
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,7 +39,7 @@ import (
 // client can add it (an empty, non-nil piece-layer table is rejected).
 func sessionMetainfo(t *testing.T, s *SeedSession) *metainfo.MetaInfo {
 	t.Helper()
-	mi := s.tor.Metainfo()
+	mi := *s.Metainfo()
 	if len(mi.PieceLayers) == 0 {
 		mi.PieceLayers = nil
 	}
@@ -52,6 +52,18 @@ const (
 	budgetPerSeed = 2 << 20
 	budgetToler   = 1.25
 )
+
+// startServing runs Serve and waits until the serving client has an address, so a
+// leecher never dials an empty one.
+func startServing(t *testing.T, s *SeedSession) (stop func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{}, 1)
+	go func() { _ = s.Serve(ctx); done <- struct{}{} }()
+	ctlWait(t, "serving address", 60*time.Second, func() bool { return s.Address() != "" },
+		func() string { return "no address; listening=" + strconv.FormatBool(s.Listening()) })
+	return func() { cancel(); <-done }
+}
 
 // budgetRun is one measured configuration.
 type budgetRun struct {
@@ -118,17 +130,9 @@ func runBudgetCase(t *testing.T, shared bool) budgetRun {
 	}
 	t.Cleanup(func() { _ = sessB.Close() })
 
-	serveCtx, stopServing := context.WithCancel(context.Background())
-	served := make(chan struct{}, 2)
-	for _, s := range []*SeedSession{sessA, sessB} {
-		s := s
-		go func() { _ = s.Serve(serveCtx); served <- struct{}{} }()
-	}
-	defer func() {
-		stopServing()
-		<-served
-		<-served
-	}()
+	stopA := startServing(t, sessA)
+	stopB := startServing(t, sessB)
+	defer func() { stopA(); stopB() }()
 
 	start := time.Now()
 	// Measurement starts before either leecher exists, so nothing is missed.
@@ -255,12 +259,8 @@ func TestSeedStopOneKeepsSibling(t *testing.T) {
 	}
 	defer func() { _ = sessB.Close() }()
 
-	ctxA, stopA := context.WithCancel(context.Background())
-	ctxB, stopB := context.WithCancel(context.Background())
-	doneA := make(chan error, 1)
-	servedB := make(chan struct{}, 1)
-	go func() { doneA <- sessA.Serve(ctxA) }()
-	go func() { _ = sessB.Serve(ctxB); servedB <- struct{}{} }()
+	stopA := startServing(t, sessA)
+	stopB := startServing(t, sessB)
 
 	leechB := ctlLeech(t, t.TempDir(), sessionMetainfo(t, sessB), sessB.Address())
 	ctlWait(t, "sibling to start serving", 60*time.Second, func() bool {
@@ -269,14 +269,6 @@ func TestSeedStopOneKeepsSibling(t *testing.T) {
 	before := sessB.UploadedBytes()
 
 	stopA()
-	select {
-	case err := <-doneA:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("stopped seed returned %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("stopping one seed did not return promptly")
-	}
 	if err := sessA.Close(); err != nil {
 		t.Fatalf("close A: %v", err)
 	}
@@ -290,21 +282,17 @@ func TestSeedStopOneKeepsSibling(t *testing.T) {
 		t.Fatalf("shared limiter was replaced: burst=%d limit=%v", limiter.Burst(), limiter.Limit())
 	}
 	stopB()
-	<-servedB
 	if err := sessB.Close(); err != nil {
 		t.Fatalf("close B: %v", err)
 	}
 	assertWorkspaceFree(t, wsB)
 }
 
-// TestSeedVerificationDoesNotFetchOrServe is the carried-forward invariant. It is
-// SKIPPED with a measured reason, not a passing claim: on the pinned version a peer
-// that connects while verification runs is served about 2 MiB before Serve is called,
-// so the per-torrent upload gate is not a hard gate once pieces verify. Closing that
-// needs a serving client that does not exist until verification is done, which this
-// slice does not build.
+// TestSeedVerificationDoesNotFetchOrServe is the startup gate. During verification a
+// client exists but has no listener and dials nothing, so there is no peer path to
+// abuse - proven here structurally (listener count, port, hook observation) rather
+// than by a sleep and a zero byte count.
 func TestSeedVerificationDoesNotFetchOrServe(t *testing.T) {
-	t.Skip("blocked on the pin: DisallowDataUpload does not hold once pieces verify; a peer connected during verification received ~2 MiB before Serve")
 	files := map[string][]byte{"a.bin": patterned(12<<20, 83)}
 	seedRoot := t.TempDir()
 	source := ctlMetainfo(t, seedRoot, "fixture", files)
@@ -316,49 +304,78 @@ func TestSeedVerificationDoesNotFetchOrServe(t *testing.T) {
 		t.Fatalf("fetch: %v", err)
 	}
 
-	_ = atomic.Bool{}
-	var leech *ctlPeer
-	var verifying atomic.Bool
-	var servedDuringVerification int64
-	var fetchedDuringVerification int64
+	// Observe every client created during startup, and try to reach it the way a peer
+	// would: dial its port. A verification client must have none.
+	type observation struct {
+		listeners int
+		port      int
+		dialErr   error
+	}
+	var seen []observation
 	prev := clientOpenHook
 	clientOpenHook = func(client *at.Client) {
-		addr := "127.0.0.1:" + strconv.Itoa(client.LocalPort())
-		// The peer requests the same torrent the seed is about to verify.
-		leech = ctlLeech(t, t.TempDir(), source, addr)
+		o := observation{listeners: len(client.Listeners()), port: client.LocalPort()}
+		conn, derr := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(o.port), 300*time.Millisecond)
+		if derr == nil {
+			_ = conn.Close()
+		}
+		o.dialErr = derr
+		seen = append(seen, o)
 	}
 	t.Cleanup(func() { clientOpenHook = prev })
-	verifying.Store(true)
 
 	sess, err := OpenSeedSession(context.Background(), isolatedConfig(cap.StagingDir), cap.JobID)
 	if err != nil {
-		verifying.Store(false)
 		t.Fatalf("open seed: %v", err)
 	}
-	// Verification is over and nothing has been served yet: upload stays closed until
-	// Serve is called, so a peer that connected during verification cannot have been
-	// given anything.
-	servedDuringVerification = sess.UploadedBytes()
-	fetchedDuringVerification = seedFetchedBytes(sess)
-	verifying.Store(false)
+	if len(seen) == 0 {
+		t.Fatal("no client was observed during startup; the check proves nothing")
+	}
+	for i, o := range seen {
+		if o.listeners != 0 {
+			t.Fatalf("startup client %d opened %d listener(s): a peer could reach it before Serve", i, o.listeners)
+		}
+		if o.port != 0 {
+			t.Fatalf("startup client %d bound port %d", i, o.port)
+		}
+		if o.dialErr == nil {
+			t.Fatalf("startup client %d accepted a connection before Serve", i)
+		}
+	}
+	// Nothing is reachable, nothing was served, nothing was fetched.
+	if sess.Listening() {
+		t.Fatal("the session reports a listener before Serve")
+	}
+	if addr := sess.Address(); addr != "" {
+		t.Fatalf("the session advertises %q before Serve", addr)
+	}
+	if served := sess.UploadedBytes(); served != 0 {
+		t.Fatalf("the session served %d bytes before Serve", served)
+	}
+	if fetched := seedFetchedBytes(sess); fetched != 0 {
+		t.Fatalf("the seed fetched %d payload bytes during verification", fetched)
+	}
+
+	// After Serve the same verified data is available to a peer.
 	serveCtx, stopServing := context.WithCancel(context.Background())
 	served := make(chan struct{}, 1)
 	go func() { _ = sess.Serve(serveCtx); served <- struct{}{} }()
-	defer func() { stopServing(); <-served }()
-	if leech == nil {
-		t.Fatal("the instrumented peer never connected; the check proves nothing")
-	}
-	if servedDuringVerification != 0 {
-		t.Fatalf("the seed served %d bytes before verification completed", servedDuringVerification)
-	}
-	if fetchedDuringVerification != 0 {
-		t.Fatalf("the seed fetched %d payload bytes during verification", fetchedDuringVerification)
-	}
-	// Once Serve is called the same peer is served, which is what makes the zero
-	// above meaningful rather than a dead connection.
-	ctlWait(t, "post-verification serving", 120*time.Second, func() bool {
+	ctlWait(t, "serving listener and address", 30*time.Second, func() bool {
+		return sess.Listening() && sess.Address() != ""
+	}, func() string { return "listening=false address=" + sess.Address() })
+	leech := ctlLeech(t, t.TempDir(), sessionMetainfo(t, sess), sess.Address())
+	ctlWait(t, "post-Serve transfer", 120*time.Second, func() bool {
 		return sess.UploadedBytes() > 0 && leech.allPiecesComplete()
 	}, func() string { return leech.describe() })
+	got, rerr := os.ReadFile(filepath.Join(leech.root, "fixture", "a.bin"))
+	if rerr != nil {
+		t.Fatalf("leecher read: %v", rerr)
+	}
+	if string(got) != string(files["a.bin"]) {
+		t.Fatalf("leecher payload differs: %d bytes", len(got))
+	}
+	stopServing()
+	<-served
 	if err := sess.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -367,13 +384,56 @@ func TestSeedVerificationDoesNotFetchOrServe(t *testing.T) {
 
 // seedFetchedBytes is payload this seed's client read from peers.
 func seedFetchedBytes(s *SeedSession) int64 {
-	if s.sess == nil || s.sess.client == nil {
+	if s.client == nil {
 		return 0
 	}
 	var total int64
-	for _, tor := range s.sess.client.Torrents() {
+	for _, tor := range s.client.Torrents() {
 		counter := tor.Stats().BytesReadUsefulData
 		total += counter.Int64()
 	}
 	return total
+}
+
+// TestSeedCancelBetweenVerificationAndServe: a verified session that is closed without
+// ever serving leaves no listener, no client and no lock.
+func TestSeedCancelBetweenVerificationAndServe(t *testing.T) {
+	ws, jobID, _ := seedBudgetFixture(t, 87)
+	sess, err := OpenSeedSession(context.Background(), isolatedConfig(ws), jobID)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if sess.Listening() {
+		t.Fatal("listening before Serve")
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	assertWorkspaceFree(t, ws)
+}
+
+// TestSeedFailedHandoffLeavesNothingServing: Serve with an already-cancelled context
+// builds the serving client and then aborts the handoff. Nothing may be left listening
+// or holding the workspace.
+func TestSeedFailedHandoffLeavesNothingServing(t *testing.T) {
+	ws, jobID, _ := seedBudgetFixture(t, 89)
+	sess, err := OpenSeedSession(context.Background(), isolatedConfig(ws), jobID)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sess.Serve(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Serve on a cancelled context returned %v", err)
+	}
+	if sess.Listening() {
+		t.Fatal("a failed handoff left a listener behind")
+	}
+	if sess.UploadedBytes() != 0 {
+		t.Fatalf("a failed handoff served %d bytes", sess.UploadedBytes())
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	assertWorkspaceFree(t, ws)
 }

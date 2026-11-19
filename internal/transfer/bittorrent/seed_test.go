@@ -9,6 +9,7 @@ package bittorrent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -60,18 +61,12 @@ func TestSeedSessionServesVerifiedWorkspace(t *testing.T) {
 		t.Errorf("report files = %d, want 2", report.Files)
 	}
 
-	serveCtx, stop := context.WithCancel(context.Background())
-	served := make(chan error, 1)
-	go func() { served <- sess.Serve(serveCtx) }()
+	stopServing := startServing(t, sess)
 
 	leechRoot := t.TempDir()
 	// Normalise an empty piece-layer table: the library serialises one for a v1
 	// torrent, and a non-nil table makes the receiving client demand piece roots.
-	mi := sess.tor.Metainfo()
-	if len(mi.PieceLayers) == 0 {
-		mi.PieceLayers = nil
-	}
-	leecher := ctlLeech(t, leechRoot, &mi, sess.Address())
+	leecher := ctlLeech(t, leechRoot, sessionMetainfo(t, sess), sess.Address())
 	ctlWait(t, "leecher to verify every piece from the seed", 60*time.Second, leecher.allPiecesComplete, leecher.describe)
 
 	for rel, want := range files {
@@ -93,10 +88,7 @@ func TestSeedSessionServesVerifiedWorkspace(t *testing.T) {
 		t.Logf("seed served %d bytes; leecher read %d", uploaded, read.Int64())
 	}
 
-	stop()
-	if err := <-served; !errors.Is(err, context.Canceled) {
-		t.Errorf("Serve returned %v, want context.Canceled", err)
-	}
+	stopServing()
 	if err := sess.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -138,7 +130,7 @@ func TestSeedSessionRefusesDamagedWorkspace(t *testing.T) {
 	_, serr := OpenSeedSession(context.Background(), isolatedConfig(ws), jobID)
 	elapsed := time.Since(start)
 	if serr == nil {
-		t.Skip("flaky on the pinned version: verification intermittently reports every piece complete after a same-length corruption; the refusal path is not claimed until this is understood")
+		t.Fatalf("a damaged workspace was accepted for seeding: %+v", probeReport(ws, jobID))
 	}
 	if !errors.Is(serr, ErrSeedDataIncomplete) {
 		t.Fatalf("refusal = %v, want ErrSeedDataIncomplete", serr)
@@ -221,4 +213,14 @@ func assertWorkspaceFree(t *testing.T, ws string) {
 	if rerr := l.Release(); rerr != nil {
 		t.Fatalf("release probe lock: %v", rerr)
 	}
+}
+
+// probeReport reopens a workspace to report why it was accepted, for failure messages.
+func probeReport(ws, jobID string) string {
+	s, err := OpenSeedSession(context.Background(), isolatedConfig(ws), jobID)
+	if err != nil {
+		return "reopen refused: " + err.Error()
+	}
+	defer func() { _ = s.Close() }()
+	return fmt.Sprintf("accepted for seeding: %+v", s.Report())
 }
