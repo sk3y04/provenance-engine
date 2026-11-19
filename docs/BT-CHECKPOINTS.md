@@ -2453,3 +2453,93 @@ outstanding.
 - The exact mechanism behind the ad-hoc CLI fixtures' metadata failure.
 - Simultaneous download+seed overlap in one live snapshot.
 - No TUI changes, no timeout/retry/discovery changes, no seeding policy work.
+
+## BT-10h — Live overlap closed: one snapshot with a download and a seed
+
+**Starting SHA** `fdfde5b` (clean). **No production change** — this is the evidence the
+BT-10f/BT-10g checkpoints were missing, and the scheduler was not touched to obtain it.
+The ad-hoc metadata timeout from BT-10f stays documented as unexplained: nothing here
+identifies its cause, and it is not restated as either a queue defect or a fixture bug.
+
+### Fixture setup, verified before the assertion
+
+Setup is a separate step with its own failure message, and it does not download entry A
+inside the test:
+
+1. Entry A is completed through the ordinary queue path against a controlled loopback
+   seeder (`newLoopbackSeeder`, 96 KiB single file), then checked in the durable record:
+   `Phase == completed`, `Capture != nil`, `Workspace != ""`. Only then is seed intent
+   enabled (`Store.EnableSeed`). No store record is fabricated and no ad-hoc seeder
+   bootstraps the prerequisite.
+2. Entry B uses BT-10g's matched construction: the `.torrent` is built from the very
+   directory `startProbeSeeder` serves, and the test asserts
+   `loaded.HashInfoBytes() == mi.HashInfoBytes()` before adding it. Payload 6 MiB at
+   768 KiB/s so it stays active long enough to be observed.
+3. Both intents are recorded **before** `Run` starts (see the drain note below).
+
+### One real snapshot
+
+`TestLiveOverlapDownloadAndSeed`, one response from the real Unix-socket endpoint:
+
+```
+OVERLAP snapshot pid=1970828 downloads=1/1 seeds=1/1 attempts=2
+  OVERLAP attempt entry=queued-000002-a75fc015 kind=download phase=running stopping=false
+  OVERLAP attempt entry=queued-000001-6c0ed42a kind=seed phase=serving stopping=false
+```
+
+The condition requires all of `seed serving` **and** `download running` **and**
+`downloads 1/1` **and** `seeds 1/1` in the same response, plus exactly two attempts, so
+no observation is stitched together from different polls. `-race -count=3` → `ok 2.117s`
+(0.35 s per run).
+
+What "serving" means here: the session passed verification and holds its slot with its
+own listener. `uploaded_bytes` is absent (`-1` in the log) because nothing in this
+fixture leeches from A — the uploaded-byte budget was measured separately in BT-08d.1
+and BT-08d.3, and this checkpoint does not re-claim it.
+
+### Terminal evidence, captured separately
+
+Same fixture through the CLI and a scripted PTY (`drive8.py`, 80 columns): A completed
+and seeded, B added, started and throttled to 512 KiB/s, runner launched with
+`--max-active 1 --max-seeds 1`. One screen after a single `r`:
+
+```
+live: runner pid 1972809, started 17:21:28   download slots 1/1   seed slots 1/1
+> queued-000001-1b99d001     desired=run    recorded=completed  seed=on/serving  live=seed serving
+  queued-000002-9c1dd5df     desired=run    recorded=running    live=download running
+```
+
+After the runner exits, the same session:
+
+```
+live status: unavailable (no foreground runner is reachable)
+> queued-000001-1b99d001     desired=run    recorded=completed  seed=on/idle
+  queued-000002-9c1dd5df     desired=run    recorded=completed
+```
+
+Both durable rows remain, the live overlay is gone, and the seed settles at `idle`
+rather than pretending to serve. Every id is the durable entry id, and the seed slot and
+download slot are reported by the endpoint, not inferred by the view.
+
+### Observed limit (not a defect, not fixed here)
+
+The runner is a **drain**: once the download pool is empty it waits on the seed pool, so
+an entry started *after* that point is never claimed in that pass. The first version of
+this test started B after A was already serving and B stayed `phase=queued,
+Attempts=0`; starting B before `Run` is what makes the overlap observable. That is the
+behaviour BT-08d.3 documented, recorded here because it changes how a user reaches
+overlap: record both intents, then run.
+
+### Gates
+
+- `go test ./internal/torrentqueue/ -race -run TestLiveOverlapDownloadAndSeed -count=3` → `ok 2.117s`
+- focused `-race -count=3` over `TestLiveOverlap|TestQueueFileSource|TestQueueSeed|TestLive|TestSeedPool|TestRunJoins`
+- `make test`, `make lint`, `go vet ./...`, `git diff --check`
+- Platform: Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3
+
+### Not covered
+
+- Uploaded bytes during overlap (no leecher for A in this fixture).
+- The BT-10a Close barrier remains the separate proof of slot lifetime during teardown;
+  this checkpoint measures neither the stopping interval nor teardown ordering.
+- The BT-10f ad-hoc metadata timeout: still unexplained, unchanged in status.
