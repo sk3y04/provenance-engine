@@ -302,16 +302,7 @@ func queueStartCmd() *cobra.Command {
 			var b strings.Builder
 			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
 			for _, id := range args {
-				entry, uerr := store.Update(id, func(e *torrentqueue.Entry) error {
-					if e.Phase == torrentqueue.PhaseFailed {
-						return fmt.Errorf("entry %s is failed; use `torrent queue retry %s` to make the retry explicit", e.ID, e.ID)
-					}
-					e.Desired = torrentqueue.DesiredRun
-					if e.Phase == torrentqueue.PhasePaused || e.Phase == torrentqueue.PhaseStopping {
-						e.Phase = torrentqueue.PhaseQueued
-					}
-					return nil
-				})
+				entry, uerr := store.Start(id)
 				if uerr != nil {
 					return uerr
 				}
@@ -339,13 +330,7 @@ func queuePauseCmd() *cobra.Command {
 			var b strings.Builder
 			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
 			for _, id := range args {
-				entry, uerr := store.Update(id, func(e *torrentqueue.Entry) error {
-					e.Desired = torrentqueue.DesiredPaused
-					if e.Phase == torrentqueue.PhaseQueued {
-						e.Phase = torrentqueue.PhasePaused
-					}
-					return nil
-				})
+				entry, uerr := store.Pause(id)
 				if uerr != nil {
 					return uerr
 				}
@@ -380,17 +365,7 @@ func queueRetryCmd() *cobra.Command {
 			var b strings.Builder
 			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
 			for _, id := range args {
-				entry, uerr := store.Update(id, func(e *torrentqueue.Entry) error {
-					if e.Phase == torrentqueue.PhaseCompleted {
-						return fmt.Errorf("entry %s already completed a capture; nothing to retry", e.ID)
-					}
-					e.Desired = torrentqueue.DesiredRun
-					e.Phase = torrentqueue.PhaseQueued
-					e.LastError = ""
-					e.Note = ""
-					e.NotBefore = time.Time{}
-					return nil
-				})
+				entry, uerr := store.Retry(id)
 				if uerr != nil {
 					return uerr
 				}

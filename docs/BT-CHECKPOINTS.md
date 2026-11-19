@@ -2096,3 +2096,86 @@ not re-prove the protocol.
 - No PTY run was attempted with a live runner; the queue view's live half was verified
   in BT-10b.
 - Windows: the picker itself is portable; nothing here uses the Unix socket.
+
+## BT-10d — Start, pause and retry from the TUI
+
+**Starting SHA** `444488a` (clean). The live socket stays read-only and no runner is
+launched from the TUI.
+
+### Shared operations
+
+The three CLI bodies became store methods — `Start` (refuses a failed entry so a bulk
+start never silently retries), `Pause` (intent only; a running attempt keeps its
+observed phase), `Retry` (desired=run, phase=queued, error/note/backoff cleared, refused
+for a completed entry). `queue start|pause|retry` now call them, and so does the TUI, so
+parity is structural rather than maintained by hand.
+
+### Screen semantics
+
+`s`/`p`/`t` act on the highlighted entry's **id**. A result is phrased as what was
+saved: with no runner the status says nothing starts until one runs; with a live attempt
+the pause status says the runner has not acknowledged yet and the live column keeps
+showing the real phase and slot. The action never clears a live observation.
+
+### Verified — real PTY, real runner, real socket
+
+A throttled loopback seeder (192 KiB/s) served a 4 MiB fixture to `queue run`; a PTY
+drove the TUI against that root. Three captures, in order:
+
+```
+live: runner pid 1298562, started 16:11:30   download slots 1/1   seed slots 0/0
+> queued-000001-6554a903     desired=run    recorded=running    live=download running
+```
+```
+saved: saved pause intent for queued-000001-6554a903 (desired=paused); the runner has not acknowled…
+> queued-000001-6554a903     desired=paused recorded=running    live=download running
+```
+```
+live status: unavailable (no foreground runner is reachable)
+> queued-000001-6554a903     desired=paused recorded=paused
+```
+
+So a live update reached the screen through the real terminal; the saved request and the
+observed transition were visibly distinct while the attempt wound down; and after the
+runner exited the same row stayed browsable with its live overlay cleared. The runner's
+own log recorded the sequence `running → stopping (pause requested) → paused`, and the
+payload on disk remained a `.part` file: pausing saved intent and stopped the attempt
+without pretending the job completed.
+
+An earlier PTY attempt showed why the barrier matters: a second run of the same torrent
+completed before the TUI connected, so nothing live was observable and the pause status
+correctly said only "recorded as paused". Transient-state assertions are made in the
+model tests, not by eye.
+
+### Verified — model and store tests
+
+| test | result |
+|------|--------|
+| `TestQueueStartSavesIntentAndRefusesFailures` | start sets desired=run/queued, takes no runner lock; a failed entry is refused and nothing is written |
+| `TestQueuePauseRecordsIntentOnly` | pause on a running entry keeps its observed phase; on a queued entry it records paused |
+| `TestQueueRetryClearsFailureNotJustStarts` | retry clears error/note/backoff and queues; a completed entry is refused |
+| `TestQueueActionStartFromTUI` | action goes through `Update`, status says "saved … no runner is running", durable state changes, no runner appears, selection preserved by id |
+| `TestQueueActionPauseDistinguishesRequestFromObservation` | with a live attempt: status says not acknowledged, phase unchanged, live overlay and slot untouched, and the render still shows it |
+| `TestQueueActionRetryFromTUI` | failure state cleared, status says errors cleared |
+| `TestQueueActionInvalidStateRefused` | start on a failed entry refused with the retry hint; entry unchanged |
+| `TestQueueActionUsesSelectedIDNotRow` | with two rows, only the highlighted id changes |
+| `TestQueueActionSingleFlightAndPollDuringWrite` | second key starts no write; a poll during the write keeps pending state and status |
+| `TestQueueActionLateResultIgnored` | older generation, another root, or after navigation: nothing applied |
+| `TestQueueActionFailedWriteKeepsRow` | refusal rendered, pending state cleared, row kept |
+
+### Gates
+
+- Focused: `go test ./internal/tui/ ./internal/torrentqueue/ -race -run 'TestQueue|TestTorrent|TestLive|TestSeedPool|TestRunJoins' -count=3 -timeout 900s`
+  → `tui 1.776s`, `torrentqueue 229.086s` (includes the BT-10a Close barrier and the
+  BT-10c paused-add regressions, no skips on the Unix path)
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok
+- `make lint` → `0 issues`; `go vet ./...` clean; `git diff --check` clean
+- Platform: Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3
+
+### Not covered
+
+- Seed controls, selection editing, removal and runner launch remain out of scope.
+- The TUI writes through the store while a runner is live; that is the CLI's own
+  contract (the runner observes durable changes on its next poll), and the PTY run
+  exercised it, but no test asserts a specific poll latency.
+- PTY evidence is scripted (`pty` + keystrokes), not an interactive human session.

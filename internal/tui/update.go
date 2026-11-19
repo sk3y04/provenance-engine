@@ -41,7 +41,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleMouseClick(msg.Y)
 		}
 
-	case queueDurableMsg, queueLiveMsg, queuePollMsg:
+	case queueDurableMsg, queueLiveMsg, queuePollMsg, queueActionMsg:
 		return m.updateQueue(msg)
 
 	case torrentInspectMsg, torrentAdmitMsg:

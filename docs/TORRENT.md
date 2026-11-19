@@ -765,6 +765,27 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
+### Queue actions from the TUI
+
+In the queue view: `s` start, `p` pause, `t` retry — on the highlighted entry, by its
+recorded **id**, never by row position. They call the same store operations as the CLI
+(`Store.Start`, `Store.Pause`, `Store.Retry`), so eligible states, refusals and retry
+semantics cannot drift between the two front ends.
+
+- A saved action is reported as **saved**, never as an observed runner change. With no
+  runner the status says so ("no runner is running, so nothing starts until one is"). If
+  the action concerns an entry the runner is actively handling, the status says the
+  runner has not acknowledged yet and the live column keeps showing the real attempt —
+  a pause does not clear a live slot to look finished.
+- The written id comes from the record and the store re-validates the transition at
+  write time, because a rendered row may already be stale (start on a failed entry is
+  refused with "use retry").
+- One write at a time: repeated key presses cannot double-apply, a poll arriving while
+  the write is pending neither clears the pending state nor overwrites the status, and a
+  result for another root, another generation or after navigation is ignored.
+- On completion the view refreshes and re-selects the entry by id. A failure keeps the
+  row and shows a redacted, actionable error.
+
 ### Adding a torrent from the TUI
 
 `a` in the queue view opens a picker: enter a `.torrent` path or a magnet (the field

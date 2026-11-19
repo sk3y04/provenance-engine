@@ -48,6 +48,12 @@ type queueState struct {
 	pendingSelect string
 	// discoveryMode remembers the last profile used for an add.
 	discoveryMode bittorrent.Discovery
+	// actionBusy is true while one durable action is being written, so repeated key
+	// presses cannot queue a second write for the same row.
+	actionBusy bool
+	// status reports the outcome of the last action, phrased as what was saved.
+	status    string
+	statusErr bool
 }
 
 type queueDurableMsg struct {
@@ -128,6 +134,78 @@ func (m *model) pollQueueCmd() tea.Cmd {
 
 type queuePollMsg struct{ gen int }
 
+// queueActionMsg is the result of one durable action. It carries the id it was for, so
+// a late result can neither touch another row nor another root's view.
+type queueActionMsg struct {
+	gen    int
+	root   string
+	id     string
+	action string
+	entry  torrentqueue.Entry
+	err    error
+}
+
+func (m *model) queueActionCmd(gen int, root, id, action string) tea.Cmd {
+	return func() tea.Msg {
+		store, err := torrentqueue.OpenStore(root)
+		if err != nil {
+			return queueActionMsg{gen: gen, root: root, id: id, action: action, err: err}
+		}
+		var entry torrentqueue.Entry
+		var aerr error
+		switch action {
+		case "start":
+			entry, aerr = store.Start(id)
+		case "pause":
+			entry, aerr = store.Pause(id)
+		case "retry":
+			entry, aerr = store.Retry(id)
+		default:
+			aerr = fmt.Errorf("unknown queue action %q", action)
+		}
+		return queueActionMsg{gen: gen, root: root, id: id, action: action, entry: entry, err: aerr}
+	}
+}
+
+// liveAttemptFor is the runner's current observation of one entry, if any.
+func (m *model) liveAttemptFor(id string) (torrentqueue.LiveAttempt, bool) {
+	if m.queue.live == nil {
+		return torrentqueue.LiveAttempt{}, false
+	}
+	for _, a := range m.queue.live.Attempts {
+		if a.EntryID == id {
+			return a, true
+		}
+	}
+	return torrentqueue.LiveAttempt{}, false
+}
+
+// describeAction phrases a result as what was SAVED, never as what the runner did.
+func (m *model) describeAction(msg queueActionMsg) string {
+	id := msg.id
+	switch msg.action {
+	case "start":
+		live := ""
+		if a, ok := m.liveAttemptFor(id); ok {
+			live = "; the runner is already " + a.Phase
+		} else if m.queue.live == nil {
+			live = "; no runner is running, so nothing starts until one is"
+		}
+		return fmt.Sprintf("saved start intent for %s (desired=run, phase=%s)%s", id, msg.entry.Phase, live)
+	case "pause":
+		detail := "; recorded as paused"
+		if a, ok := m.liveAttemptFor(id); ok {
+			// Any live attempt means the runner has not acted on the request yet: it
+			// keeps its slot until its client closes.
+			detail = fmt.Sprintf("; the runner has not acknowledged yet — it is still %s and keeps its slot until it closes", a.Phase)
+		}
+		return fmt.Sprintf("saved pause intent for %s (desired=paused)%s", id, detail)
+	case "retry":
+		return fmt.Sprintf("saved retry for %s (desired=run, phase=%s, errors cleared)", id, msg.entry.Phase)
+	}
+	return "saved"
+}
+
 func (m *model) updateQueue(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case queueDurableMsg:
@@ -172,6 +250,20 @@ func (m *model) updateQueue(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.finishQueueRefresh()
 		return m, nil
+	case queueActionMsg:
+		if msg.gen != m.queue.gen || msg.root != m.queue.root || m.view != viewTorrentQueue {
+			return m, nil // late result: another view, another root, or a newer generation
+		}
+		m.queue.actionBusy = false
+		if msg.err != nil {
+			m.queue.status = msg.action + " refused: " + msg.err.Error()
+			m.queue.statusErr = true
+			return m, nil
+		}
+		m.queue.statusErr = false
+		m.queue.status = m.describeAction(msg)
+		m.queue.pendingSelect = msg.id
+		return m, m.refreshQueue()
 	case queuePollMsg:
 		if msg.gen != m.queue.gen || m.view != viewTorrentQueue {
 			return m, nil
@@ -207,10 +299,33 @@ func (m *model) updateQueueKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "a":
 		return m.openTorrentAdd()
+	case "s", "p", "t":
+		return m.queueAction(msg.String())
 	case "r":
 		return m, m.refreshQueue()
 	}
 	return m, m.pollQueueCmd()
+}
+
+// queueAction applies one durable operation to the highlighted entry. The id comes
+// from the record, never from the row position, and the store re-validates the
+// transition at write time because the rendered row may already be stale.
+func (m *model) queueAction(key string) (tea.Model, tea.Cmd) {
+	if m.queue.actionBusy {
+		return m, nil // one write at a time: repeated keys cannot double-apply
+	}
+	rows := m.queueRows()
+	if len(rows) == 0 {
+		m.queue.status = "no entry selected"
+		m.queue.statusErr = true
+		return m, nil
+	}
+	id := rows[m.queue.cursor].ID
+	action := map[string]string{"s": "start", "p": "pause", "t": "retry"}[key]
+	m.queue.actionBusy = true
+	m.queue.status = action + " requested…"
+	m.queue.statusErr = false
+	return m, m.queueActionCmd(m.queue.gen, m.queue.root, id, action)
 }
 
 // reconcileQueueCursor keeps the highlighted entry by id when the list changes.
@@ -272,6 +387,9 @@ func (m *model) viewTorrentQueue() string {
 	if m.queue.durableErr != "" {
 		fmt.Fprintf(&b, "durable read failed: %s\n", m.queue.durableErr)
 	}
+	if m.queue.status != "" {
+		fmt.Fprintf(&b, "saved: %s\n", m.queue.status)
+	}
 	b.WriteString("\n")
 	if len(m.queue.entries) == 0 && m.queue.durableErr == "" {
 		b.WriteString("no queue entries\n")
@@ -298,7 +416,7 @@ func (m *model) viewTorrentQueue() string {
 			fmt.Fprintf(&b, "  %-26s %s %s\n", trim(a.EntryID, 26), a.Kind, livePhaseText(a))
 		}
 	}
-	b.WriteString("\n↑/↓ move • a add torrent • r refresh • esc back\n")
+	b.WriteString("\n↑/↓ move • s start • p pause • t retry • a add torrent • r refresh • esc back\n")
 	return clipLines(b.String(), width)
 }
 
