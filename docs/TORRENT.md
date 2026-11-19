@@ -606,6 +606,94 @@ Rules this layout enforces, each covered by a test in `isolated_workspace_test.g
 There is no migration path and no fallback: an identity is either legacy or
 isolated, and the layout it was created with is the one it keeps.
 
+## Durable queue (`torrent queue`)
+
+A forward-only, one-worker queue over isolated workspaces. Foreground only: `queue
+run` drains and exits, so there is no daemon, no RPC and no background process.
+
+```
+provenance torrent queue add SOURCE --select path [-o ROOT] [--discovery ...] [--peer ...]
+provenance torrent queue list [-o ROOT] [--json]
+provenance torrent queue start ID...        # desired=run
+provenance torrent queue pause ID...        # desired=paused, acknowledged after it is durable
+provenance torrent queue retry ID...        # clears failed/blocked, desired=run
+provenance torrent queue run [-o ROOT]      # drain once, one worker, then exit
+```
+
+### Records and state
+
+```
+.provenance/torrent/queue/entries/<entryID>.json      public entry (0644)
+.provenance/torrent/queue/restricted/<entryID>.json   raw source + peers (0600)
+.provenance/torrent/queue/store.lock                  store read-modify-write
+.provenance/torrent/queue/runner.lock                 one runner per queue
+.provenance/torrent/jobs/<jobID>/                     the workspace (BT-05)
+```
+
+An entry has its **own id** (`queued-<seq>-<rand>`), never a torrent hash: a btmh
+magnet may resolve to a hybrid whose canonical workspace is `bt-<v1>`, so the queue
+must be able to hold work whose identity is not known yet. `job_id`, the hashes and
+`workspace` are attached only after a validated resolution; `unresolved` says the
+entry still needs one metadata exchange.
+
+Intent and observation are separate fields:
+
+| field | values | meaning |
+|-------|--------|---------|
+| `desired` | `paused`, `run` | what the user asked for; survives every restart |
+| `phase` | `queued`, `resolving`, `running`, `stopping`, `paused`, `completed`, `failed`, `blocked` | the last thing the runner observed and persisted |
+
+Rules that follow from keeping them apart:
+
+- A new entry is `paused`/`queued`. Only `start` sets `desired=run`; nothing else
+  makes work runnable.
+- A pause records intent first and is acknowledged after the write. A running job
+  is not killed by the command: the runner notices the intent on its poll, sets
+  `stopping`, cancels the worker, and only writes `paused` once the client has
+  closed and the workspace lock is released.
+- If a pause arrives while a capture is being committed, the capture is kept
+  (`phase=completed`) and the intent stays paused. A published capture is never
+  undone to satisfy a pause.
+- SIGINT on the runner is not a pause: the entry returns to `queued` with a note,
+  `desired` is untouched, and the next runner resumes it.
+- `failed` needs an explicit `retry`; a drain never re-claims it, so one bad job
+  cannot block or repeat forever.
+- `blocked` is a retryable condition (a workspace owned by another process) with
+  `not_before`; the drain skips it until the backoff elapses.
+- A restart reconciles interrupted observations against reality: if the workspace
+  already holds a published capture covering the selection, the entry becomes
+  `completed` and is never refetched, even if the crash happened between "capture
+  committed" and "queue updated".
+
+### Locks
+
+| lock | held by | duration |
+|------|---------|----------|
+| `runner.lock` | `queue run` | the whole drain |
+| store lock | `add`, `start`, `pause`, `retry`, every runner transition | one record's read-modify-write |
+| workspace lock | the adapter, per job | one attempt |
+
+The runner never holds the store lock while awaiting peers, transferring, hashing
+or closing a client, and never takes a workspace lock itself. `list`, `status` and
+`recheck` take none of the queue locks, so there is no lock order to deadlock on.
+
+### Secrets and discovery
+
+The public entry holds an identity-only magnet (`xt` entries only). Trackers,
+`xs`/`as` sources and `x.pe` hints from the original argument, plus any `--peer`
+addresses, live in the restricted 0600 record and are handed only to the backend.
+`list` prints the public record and nothing else. The discovery profile is recorded
+per entry and used again on every attempt: a `direct` or `tracker` entry never
+falls back to public discovery on restart.
+
+### What this slice does not do
+
+No seeding after completion (a completed entry releases the only worker slot), no
+multi-worker scheduling, no bandwidth limits, no destructive removal, no cancel
+command (delete the entry file by hand or wait for BT-09), no legacy migration, and
+no live telemetry: `list` prints recorded state, plus whether the runner lock is
+currently held.
+
 ## Offline recheck
 
 `provenance torrent recheck JOB_ID --output ROOT [--json]` answers one question

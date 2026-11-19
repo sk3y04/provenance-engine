@@ -661,3 +661,151 @@ Gates on `111c587` (Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores):
 **BT-07** (durable queue and desired-state controller). It consumes this ticket's
 `Recheck` as the offline check an operator or the runner can call before
 idle/selection changes, and the isolated workspace entry point shipped in BT-05.
+
+## BT-07 — Durable queue with a foreground runner (shipped: one worker, no daemon)
+
+**Starting SHA** `6061208` (tree clean). **Ending SHA** `dbb4f3e`.
+
+Scope shipped: a durable local queue over isolated workspaces, drained in the
+foreground by one worker (`torrent queue add|list|start|pause|retry|run`). Not
+shipped, by decision: daemon, RPC, TUI, multi-worker scheduling, bandwidth limits,
+seeding after completion, destructive removal, a cancel command, legacy migration.
+
+### Changed paths
+
+- `internal/torrentqueue/store.go` (new, 461 lines) — entry record, atomic writes,
+  sequence-ordered ids, duplicate detection, restricted source record, store lock.
+- `internal/torrentqueue/runner.go` (new, 533 lines) — reconcile, claim, pause
+  watch, failure/backoff handling, summary, `SanitizeError` for persisted errors.
+- `internal/torrentqueue/adapter.go` (new, 99 lines) — the real backend over
+  `FetchIsolated` / `RunKnownWorkspace`.
+- `internal/transfer/bittorrent/queueapi.go` (new, 314 lines) — `PrepareSource`,
+  `WorkspaceDir`, `HasJob`, `OpenWorkspaceJob`, `RunKnownWorkspace`,
+  `AdoptCapture` (+ `manifestCovers`), sanitized magnets.
+- `internal/transfer/bittorrent/bittorrent.go` — a `resume` source case that fails
+  loudly when the persisted metainfo is missing instead of dialling.
+- `cmd/provenance/torrent.go` — the `queue` command group.
+- `internal/torrentqueue/queue_test.go` (764) + `integration_test.go` (495) — the
+  acceptance suites.
+- `docs/TORRENT.md` — "Durable queue" section.
+
+### The record, and why the id is not the infohash
+
+```json
+{
+  "format": "provenance/torrent-queue-entry+1",
+  "id": "queued-000001-c627a1e8",        // own id: survives an unresolved identity
+  "seq": 1,                               // deterministic queue order
+  "desired": "paused",                    // user intent, survives restarts
+  "phase": "queued",                      // last observation, never a live claim
+  "source": { "kind": "magnet",
+              "magnet": "magnet:?xt=urn:btih:cccc…" },   // identity only
+  "discovery": "direct",
+  "selection": ["fixture/a.bin"],         // immutable capture intent
+  "job_id": "bt-cccc…",                   // attached only after validation
+  "workspace": ".provenance/torrent/jobs/bt-cccc…",
+  "unresolved": false,
+  "capture": { "key": "…", "manifest": ".provenance/runs/….json" },
+  "attempts": 1,
+  "last_error": "…", "note": "…", "not_before": "…"
+}
+```
+
+A btmh-only magnet resolves to a hybrid whose canonical workspace is `bt-<v1>`, so
+`job_id`/`workspace` are attached only after a validated resolution; before that the
+entry is `unresolved` and keeps its source plus discovery profile. Enqueue rejects
+what it cannot resume (unreadable `.torrent`, unsupported scheme, private torrent
+outside `tracker`, an identity already held by a legacy job at the root).
+
+Transitions (all persisted; only transitions, never progress ticks):
+
+```
+add ──▶ paused/queued ──start──▶ paused|queued ──▶ running ──▶ completed
+                          │                        │
+                          └─pause─▶ stopping ──▶ paused
+                                                   │
+   running ──error──▶ failed ──retry──▶ queued      │
+   running ──busy───▶ blocked (not_before) ──retry/time──▶ queued
+   interrupted (SIGINT or dead process) ──▶ queued (desired kept)
+   restart with a published capture ──▶ completed (adopted, no refetch)
+```
+
+### Commit points and locks
+
+| point | what it means |
+|-------|---------------|
+| run manifest written by the adapter | the capture is committed; the queue may still be `running` |
+| queue record updated to `completed` | the queue has caught up; a restart between the two adopts the manifest |
+| `desired` write | user intent; acknowledged only after the rename |
+
+| lock | holder | held across |
+|------|--------|-------------|
+| `runner.lock` | `queue run` | the whole drain |
+| store lock | `add`/`start`/`pause`/`retry`/every transition | one record's read-modify-write |
+| workspace lock | the adapter, per job | one attempt |
+
+No lock is held while awaiting peers, transferring, hashing or closing a client;
+`list`, `status` and `recheck` take no queue lock, so there is no lock order to
+deadlock.
+
+### Verified
+
+Fake backend, `internal/torrentqueue -count=3` → ok 23.196s:
+
+| Test | Demonstrates |
+|------|--------------|
+| `TestQueueAddPausedThenStart` | add is paused and a drain claims nothing; after `start`, two entries run in queue order with max concurrency 1, both completed with captures and one attempt each |
+| `TestQueuePauseDuringWork` | pause recorded while the worker runs; `stopping` observable before `paused`; no capture; a second drain does nothing |
+| `TestQueuePauseRacingCompletion` | pause during a run that then completes: `phase=completed`, capture kept, `desired=paused`, note explains it |
+| `TestQueueFailureDoesNotBlockLaterJobs` | failure recorded, later entry still completes, no automatic retry, explicit retry succeeds on attempt 2 |
+| `TestQueueShutdownPreservesIntent` | SIGINT → `queued` with a shutdown note (not `paused`), the paused entry untouched, restart completes only the interrupted one |
+| `TestQueueReconcileInterruptedObservations` | a record left `running` with a published capture becomes `completed` without a transfer; a `running` record without one is re-queued |
+| `TestQueueBlockedWorkspaceBacksOff` | typed busy error → `blocked` with `not_before`; untyped error → `failed`; the next drain skips the backoff |
+| `TestQueueOneRunnerPerQueue` | second runner → `ErrRunnerActive`; the lock is released when the drain returns |
+| `TestQueueOrderAndIds` | ids carry the sequence and never the infohash; `list` returns recorded order |
+| `TestQueueDuplicateAndConflict` | same job+selection dedupes to one entry; a different selection is a second entry |
+| `TestQueueRecordsNoSecrets` | no passkey/tracker/peer in the public record; restricted record is 0600 and reaches the backend; the recorded discovery profile reaches the backend |
+| `TestQueueUnresolvedEntrySurvivesRestart` | an unresolved entry keeps source and `tracker` profile, attaches identity only after resolution, and leaks no tracker URL |
+
+Real backend on a loopback seeder (DHT/PEX/trackers/web seeds/uTP/IPv6 off):
+
+| Test | Demonstrates |
+|------|--------------|
+| `TestQueueRealInterruptAndResume` (7.09s) | a 400 KiB selective transfer interrupted after bytes landed: `queued`/`desired=run` with no capture; restart resumes in the same workspace, `attempts=2`, one run manifest, one capture item, payload matches, exactly one unselected neighbour never captured |
+| `TestQueueAdoptsCapturePublishedBeforeQueueUpdate` | the backend publishes and then the queue update is lost: the entry ends `completed` with the published capture adopted (note says so), and a restart claims nothing and keeps the same key with one manifest |
+| `TestQueueConflictingSelectionIsRejected` | a second `--select` for the same torrent fails with a selection error, and the first capture, its manifest and its items are unchanged |
+| `TestQueueBusyWorkspaceBlocksThenRetries` | a held workspace lock → `blocked` (no capture, no failure), then after release the entry completes with one manifest |
+
+Gates on `dbb4f3e` (Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores):
+
+- `go test ./internal/torrentqueue/ -count=3` → `ok 23.196s`
+- `go test ./internal/transfer/bittorrent/ ./cmd/provenance/ -count=1` → `ok 44.019s`, `ok 0.034s`
+- `go test ./internal/torrentqueue/ -run 'TestQueueReal|TestQueueAdopts|TestQueueConflicting|TestQueueBusy' -count=1` → pass
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok
+- `go vet ./...` clean, `gofmt -l ./cmd ./internal` empty, `golangci-lint run ./...` → `0 issues`, `git diff --check` clean
+- CLI smoke (`bt07-smoke`, real binary):
+  - `queue add "magnet:?xt=…&tr=http://tracker.example/announce?passkey=SECRET&x.pe=10.9.9.9:6881" --select fixture/a.bin --discovery direct` → `queued-000001-c627a1e8 added paused for bt-cccc…`
+  - `queue list` → `paused  queued`, source printed as `magnet:?xt=urn:btih:cccc…` only; `grep -rl "SECRET|tracker.example|10.9.9.9"` matched **only** `queue/restricted/queued-000001-….json`, mode `-rw-------`; `list --json` matched nothing
+  - `start` → `desired=run phase=queued`; `pause` → `paused`; `start` again → `queued`
+  - `run --timeout 4s` (unreachable peer) → `failed (timed out waiting for torrent metadata…)`, `drained: 0 completed, 1 failed, 0 blocked, 0 paused, 1 claimed`, and the process exited nonzero. The recorded `run_exit=0` in that one shell line is the status of the trailing `| tail -3`, not of the binary; an earlier identical smoke captured `exit=1` directly.
+
+### Not verified (explicit)
+
+- **Process death during a run.** Interruption is proven by ctx cancellation (real
+  backend) and by an injected post-publication failure; no test kills a live runner
+  mid-transfer. The runner lock is an flock, so ownership does survive death, but
+  that path is exercised only for legacy roots by `ownership_process_test.go`.
+- **Seeding.** Deliberately out of this slice: a completed entry releases the single
+  worker, so `--seed` has no queue meaning yet.
+- **No cancel command.** Removing an entry (or its payload) is not implemented; the
+  docs say so. Delete is BT-09 work.
+- **Live telemetry.** `list` prints recorded phases plus whether the runner lock is
+  held. It never claims a job is alive because a record says `running`.
+- **Multi-worker behaviour, bandwidth limits, priorities.** One worker, FIFO order.
+
+### Next eligible ticket
+
+**BT-08** (scheduling, resources and seeding) now has the hooks it needs: the
+runner's single-worker loop, `not_before` backoff, and per-entry recorded profile.
+BT-09's safe removal is the other independent follow-up. The BT-02/04 matrix rows
+remain explicitly unproven and untouched.
