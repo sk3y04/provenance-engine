@@ -765,6 +765,41 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
+### Live status (`queue live`)
+
+```
+provenance torrent queue live            # human lines
+provenance torrent queue live --json     # the snapshot
+```
+
+One read-only request to the foreground runner over a user-private Unix socket. It
+answers what that process can observe about itself: the active entry ids, whether each
+attempt is a `download` or a `seed`, the runner's own phase (`running`, `verifying`,
+`serving`, `stopping`), an explicit `stopping` flag, and the used/configured slots for
+each pool. A seed also reports `uploaded_bytes`; downloads report no byte counter at
+all, because this slice has no read path for their transfer counters that is safe
+alongside `Close` — an absent field is honest, a zero would not be.
+
+- `queue list` remains the durable view. A recorded `serving` phase is never reported
+  as live: if no process answers, the command fails with
+  `no foreground runner is reachable for this queue root`.
+- The endpoint is published only by the process that holds runner ownership, and it
+  is removed on shutdown. The socket lives in a short private directory and the queue
+  directory holds a small index naming it, because a queue root can exceed a Unix
+  socket's path limit. Neither file proves liveness: the client connects, sends
+  `{"op":"snapshot"}`, and needs a valid snapshot back.
+- Nothing mutates. The only accepted request is a snapshot; anything else gets
+  `{"error":"unsupported request"}`.
+- Readers are bounded (8 concurrent, 2 s deadlines) and a slow reader cannot delay
+  claims or shutdown: the snapshot is copied under one short mutex and serialized
+  outside it, and shutdown closes the listener and drops open connections.
+
+**Known blocker:** the runner can return while a seed client is still inside `Close`,
+which takes the endpoint with it. Until that is fixed, `queue live` is trustworthy for
+downloads and for seeds that are merely serving, but a seed caught mid-`Close` may
+report "no runner" and its slot accounting cannot be observed. See the BT-10a
+checkpoint.
+
 ### Download priorities inside a selection
 
 ```

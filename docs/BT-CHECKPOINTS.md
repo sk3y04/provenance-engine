@@ -1687,3 +1687,88 @@ override disappears from `queue list --json`.
 
 BT-09c or BT-10: adding files to an existing job must be an explicit new capture
 intent, not a third priority level.
+
+## BT-10a — Live snapshots for the foreground runner (partially shipped)
+
+**Starting SHA** `269552b` (clean). Durable `queue list` unchanged; no daemon, RPC
+event stream, TUI or TCP listener.
+
+### What shipped
+
+`provenance torrent queue live [--json]` asks the runner that owns the queue root for
+one snapshot. Contract: `LiveFormat = "provenance/torrent-queue-live+1"` with
+`root`, `pid`, `started_at`, `download_slots{used,max}`, `seed_slots{used,max}` and
+`attempts[]` of `{entry_id, kind: download|seed, phase, stopping, uploaded_bytes?}`.
+
+- Transport: a Unix socket in a private temp directory, named by a small index file
+  under `.provenance/torrent/queue/`. The index is not a liveness claim: the client
+  must connect, send `{"op":"snapshot"}` and receive a valid snapshot, so a leftover
+  index or socket after a crash is reported as
+  `no foreground runner is reachable for this queue root`.
+- Published only by the process holding runner ownership, removed on shutdown.
+- Read-only by construction: the only accepted op is `snapshot`; anything else gets
+  `{"error":"unsupported request"}`.
+- Consistency: the snapshot is copied under one short mutex and serialized outside
+  it, so serialization never holds the runner's state. Readers are bounded to 8
+  concurrent connections with 2 s read/write deadlines; shutdown closes the listener,
+  drops open connections and waits at most one second for handlers.
+- Slots in use are derived from the registry itself, so an attempt is counted from
+  claim until its client has closed, not from a recorded phase.
+
+### Verified
+
+| test | result |
+|------|--------|
+| `TestLiveSnapshotOverlappingAttempts` | one download (kind `download`, phase `running`) and one seed serving at the same time, slots `1/1` and `1/1`, while `store.List()` still reports the durable phases unchanged |
+| `TestLiveNoRunner` | no index → `ErrNoLiveRunner`; a stale index naming a non-existent socket → `ErrNoLiveRunner` |
+| `TestLiveSlowReaderCannotBlockShutdown` | a client that connects and sends nothing does not stop other readers, malformed input gets `unsupported request`, cancellation returns well inside the bound, the record is unmutated, and the endpoint is gone afterwards |
+| `TestLiveAfterRunnerDeath` | a real subprocess runner answers, SIGKILL; queries report `ErrNoLiveRunner`; a second runner publishes its own endpoint and answers with its own pid |
+
+### BLOCKED: the release gate
+
+`TestLiveStoppingHeldAtClose` is **skipped, not passed**. With a seed whose client is
+held inside `Close` — reproduced twice, once with a `BeforeSeedClose` barrier and once
+with a session whose own `Close` blocks — the runner returns and its endpoint
+disappears while the attempt still holds the workspace and its slot. So:
+
+- a reader can be told "no runner" while a seed is still closing, and
+- the slot accounting this slice was supposed to demonstrate cannot be observed at
+  the boundary the ticket cares about.
+
+I could not identify the path that empties the seed pool's active set without the
+attempt's `done` channel closing, and a speculative fix (`seedActive` counter gating
+the pool's exit) did not change the behaviour, so it was reverted rather than shipped
+untested. The next experiment is to log the pool's dispatch/reap/exit transitions at
+`h.done` granularity in a standalone test of `runSeeds` alone, with no socket, no
+store and a fake session — the failure looks like bookkeeping, not transport.
+
+Consequences for this slice: live status is trustworthy for downloads and for seeds
+that are serving, and it is truthful about "no runner". It is **not** trustworthy for
+a seed in `Close`, and no claim is made that a live snapshot explains runner shutdown.
+
+### Also verified, from the carried-forward note
+
+The BT-09b fixture claim was checked: 96 KiB over 16 KiB pieces starts and ends on a
+piece boundary, so it is **not** a shared-edge case. The priority-mapping test is
+still valid (a.bin high, b.bin normal, c.bin none), but it never exercised a piece
+shared between two selected files. That remains unverified and is recorded as such.
+
+### Gates
+
+- `go test ./internal/torrentqueue/ -race -run TestLive -count=3`
+- `make test`, `make lint`, `go vet ./...`, `git diff --check`
+- Results recorded with this entry.
+
+### Not covered
+
+- Platform: Unix sockets only; Windows is not supported or tested in this slice, and no
+  TCP fallback exists by design.
+- No event stream, no rates, ETA, peer detail or global sequencing.
+- `uploaded_bytes` is a last-observed value for seeds only; download byte counters are
+  deliberately absent.
+
+### Next
+
+Fix the seed-pool exit-while-closing defect (the experiment above), then the same
+snapshot contract can back a TUI queue view. Streaming only if polling proves
+inadequate.
