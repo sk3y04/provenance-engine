@@ -299,9 +299,9 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 	if err := r.opts.Validate(); err != nil {
 		return sum, err
 	}
-	l, err := filelock.TryAcquire(filepath.Join(r.store.root, filepath.FromSlash(queueDirName), "runner"))
+	l, err := r.store.LockRunner()
 	if err != nil {
-		if errors.Is(err, filelock.ErrLocked) {
+		if errors.Is(err, ErrRunnerActive) {
 			return sum, fmt.Errorf("%w: %s is already being drained", ErrRunnerActive, r.store.root)
 		}
 		return sum, err

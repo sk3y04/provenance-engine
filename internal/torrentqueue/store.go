@@ -539,6 +539,128 @@ func (s *Store) UpdateSeed(id, token string, mutate func(*Entry) error) (Entry, 
 	return entry, nil
 }
 
+// Removal reports exactly what a remove did, so a caller never claims a clean
+// removal when credential cleanup lagged behind it.
+type Removal struct {
+	ID                string
+	EntryRemoved      bool
+	RestrictedRemoved bool
+	// CleanupError is non-empty when the public entry is gone but its restricted
+	// source record is still on disk. Retrying the same id cleans that record and
+	// nothing else.
+	CleanupError string
+}
+
+// validEntryID accepts only the ids this store allocates: queued-<6 digits>-<8 hex>.
+// A prefix, a torrent hash, a filename or a path is refused here rather than being
+// turned into a deletion target.
+func validEntryID(id string) bool {
+	if !strings.HasPrefix(id, "queued-") {
+		return false
+	}
+	rest := id[len("queued-"):]
+	if len(rest) < 6 || len(rest) > 6+1+8 {
+		return false
+	}
+	if !isDigits(rest[:6]) {
+		return false
+	}
+	if len(rest) == 6 {
+		return true
+	}
+	if rest[6] != '-' {
+		return false
+	}
+	return isHexLower(rest[7:])
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexLower(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// Remove forgets one queue entry and its own restricted source record, and nothing
+// else. A workspace, payload, resume database, capture or vault artifact is never
+// touched: those belong to the job, not to the queue.
+//
+// The public record goes first, so a crash cannot leave a runnable entry whose source
+// was already deleted. If deleting the restricted record fails afterwards the entry is
+// still gone and the caller is told that cleanup is incomplete; retrying the same id
+// deletes that record and no other.
+func (s *Store) Remove(id string) (Removal, error) {
+	res := Removal{ID: id}
+	if !validEntryID(id) {
+		return res, fmt.Errorf("%w: %q is not a queue entry id", ErrUsage, id)
+	}
+	// Ownership first, then the store lock - the same order a runner uses. Holding
+	// runner ownership across the mutation is what makes "no runner is active" and
+	// "the entry is gone" one atomic decision; a recorded phase proves nothing.
+	owner, err := s.LockRunner()
+	if err != nil {
+		return res, err
+	}
+	defer func() { _ = owner.Release() }()
+
+	l, err := s.lock()
+	if err != nil {
+		return res, err
+	}
+	defer func() { _ = l.Release() }()
+
+	if _, serr := os.Stat(s.entryPath(id)); serr == nil {
+		if rerr := os.Remove(s.entryPath(id)); rerr != nil {
+			return res, fmt.Errorf("remove queue entry %s: %w", id, rerr)
+		}
+		res.EntryRemoved = true
+	}
+	restricted := filepath.Join(s.restrictedDir(), id+".json")
+	if _, serr := os.Stat(restricted); serr == nil {
+		if rerr := os.Remove(restricted); rerr != nil {
+			res.CleanupError = fmt.Sprintf("queue entry %s is removed, but its restricted source record could not be deleted; retry `torrent queue remove %s`", id, id)
+		} else {
+			res.RestrictedRemoved = true
+		}
+	}
+	if !res.EntryRemoved && !res.RestrictedRemoved && res.CleanupError == "" {
+		return res, fmt.Errorf("%w: %s", ErrEntryNotFound, id)
+	}
+	return res, nil
+}
+
+// LockRunner takes runner ownership without blocking. Removal uses it so a foreground
+// runner cannot start between the busy check and the mutation: the answer is the lock,
+// never a recorded phase or the mere existence of a sidecar file.
+func (s *Store) LockRunner() (*filelock.Lock, error) {
+	l, err := filelock.TryAcquire(filepath.Join(s.root, filepath.FromSlash(queueDirName), "runner"))
+	if err != nil {
+		if errors.Is(err, filelock.ErrLocked) {
+			return nil, fmt.Errorf("%w: a foreground runner owns this queue; stop it, wait for its clients to close, then retry", ErrRunnerActive)
+		}
+		return nil, err
+	}
+	return l, nil
+}
+
 // RestrictedSource returns the stored raw source and peers for an entry. It is about
 // the restricted record, not the public one.
 // RestrictedSource returns the stored raw source and peers for an entry. It is only

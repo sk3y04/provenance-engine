@@ -157,7 +157,7 @@ owns the root.`,
 			"picks the work back up. Nothing in this command group deletes payload or data.",
 	}
 	queue.AddCommand(queueAddCmd(), queueListCmd(), queueStartCmd(), queuePauseCmd(), queueRetryCmd(),
-		queueSeedCmd(), queueUnseedCmd(), queueRunCmd())
+		queueSeedCmd(), queueUnseedCmd(), queueRemoveCmd(), queueRunCmd())
 	cmd.AddCommand(queue)
 
 	return cmd
@@ -481,6 +481,54 @@ func queueUnseedCmd() *cobra.Command {
 			return nil
 		},
 	}
+	return cmd
+}
+
+func queueRemoveCmd() *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "remove ID...",
+		Short: "Forget queue entries without deleting any downloaded data",
+		Long: "Removes the queue entry and its own restricted source record. The workspace, payload,\n" +
+			"resume state, published capture and archive artifacts are left exactly as they are, so\n" +
+			"the job can still be inspected, rechecked or re-added. Removal is refused while a\n" +
+			"foreground runner owns the queue: stop it and wait for its clients to close first.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			var b strings.Builder
+			results := make([]torrentqueue.Removal, 0, len(args))
+			for _, id := range args {
+				res, rerr := store.Remove(id)
+				if rerr != nil {
+					return rerr
+				}
+				results = append(results, res)
+				switch {
+				case res.CleanupError != "":
+					fmt.Fprintf(&b, "%s  removed; %s\n", res.ID, res.CleanupError)
+				default:
+					fmt.Fprintf(&b, "%s  removed (payload, workspace and capture kept)\n", res.ID)
+				}
+			}
+			out, merr := json.MarshalIndent(struct {
+				Removed []torrentqueue.Removal `json:"removed"`
+			}{Removed: results}, "", "  ")
+			if merr != nil {
+				return merr
+			}
+			if asJSON {
+				_, _ = io.WriteString(os.Stdout, string(out)+"\n")
+				return nil
+			}
+			_, _ = io.WriteString(os.Stdout, b.String())
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Print the removal result as JSON")
 	return cmd
 }
 
