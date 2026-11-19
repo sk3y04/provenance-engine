@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -115,7 +116,114 @@ owns the root.`,
 	status.Flags().BoolVar(&flagTorrentJSON, "json", false, "Emit recorded job state as JSON")
 	cmd.AddCommand(status)
 
+	recheck := &cobra.Command{
+		Use: "recheck JOB_ID",
+		// A mismatch is a result, not a usage error: printing the flag table after
+		// "1 of 1 files no longer match" would bury the finding.
+		SilenceUsage: true,
+		Short:        "Verify a job's selected files against their recorded digests, offline",
+		Long: "Recheck hashes each selected, finalized file and compares it with the digest\n" +
+			"recorded when the job's capture was published. It starts no torrent client, contacts\n" +
+			"no peer, tracker or web seed, opens no completion database and never repairs: a\n" +
+			"mismatch exits nonzero so repair stays an explicit fetch.\n\n" +
+			"The job root is --output: a legacy staging root or a directly supplied isolated\n" +
+			"workspace. Exit status is 0 only when every selected file matches, so a job with\n" +
+			"unchecked files is never reported as verified.\n\n" +
+			"A match verifies the working copy against the recorded digest. It is not a\n" +
+			"piece-completion scan and says nothing about the vault blob.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runTorrentRecheck(cmd.Context(), flagTorrentOut, args[0], os.Stdout)
+		},
+	}
+	recheck.Flags().BoolVar(&flagTorrentJSON, "json", false, "Emit the recheck report as JSON on stdout")
+	cmd.AddCommand(recheck)
+
 	return cmd
+}
+
+// runTorrentRecheck prints the report and turns a non-verified outcome into a
+// nonzero exit. JSON always lands on stdout, including on failure, so a caller can
+// parse it; the one-line reason goes to stderr through the command error.
+func runTorrentRecheck(ctx context.Context, root, jobID string, stdout io.Writer) error {
+	report, err := bittorrent.Recheck(ctx, root, jobID)
+	if flagTorrentJSON {
+		if err != nil {
+			report.Error = err.Error()
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if merr := enc.Encode(report); merr != nil {
+			return merr
+		}
+		if err != nil {
+			return err
+		}
+	} else {
+		if err != nil {
+			return err
+		}
+		printRecheck(stdout, report)
+	}
+	if !report.Verified {
+		return errors.New("recheck: " + report.UnverifiedProblem() + "; nothing was repaired")
+	}
+	return nil
+}
+
+// printRecheck renders the human report. It keeps the historical capture and the
+// current outcome in separate blocks on purpose.
+func printRecheck(w io.Writer, r bittorrent.RecheckReport) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "job %s\n", r.JobID)
+	if r.InfoHash != "" {
+		fmt.Fprintf(&b, "  btih %s\n", r.InfoHash)
+	}
+	if r.InfoHashV2 != "" {
+		fmt.Fprintf(&b, "  btmh %s\n", r.InfoHashV2)
+	}
+	if r.Capture != nil {
+		state := "manifest missing"
+		if r.Capture.Present {
+			state = "manifest present"
+		}
+		reconciled := ""
+		if r.Capture.Reconciled {
+			reconciled = ", reconciled"
+		}
+		fmt.Fprintf(&b, "capture (historical): %s  key %s  committed %s%s  %s\n",
+			r.Capture.Manifest, r.Capture.Key, r.Capture.CommittedAt.UTC().Format(time.RFC3339), reconciled, state)
+	} else {
+		fmt.Fprintln(&b, "capture (historical): none published")
+	}
+	fmt.Fprintf(&b, "selected: %d file(s)\n", r.Summary.Selected)
+	for _, f := range r.Files {
+		fmt.Fprintf(&b, "  %-12s %s", strings.ToUpper(string(f.Status)), f.Path)
+		if f.SHA256 != "" {
+			fmt.Fprintf(&b, "  %d bytes  sha256 %s", f.Bytes, f.SHA256)
+		}
+		if f.AttestedSHA256 != "" && f.SHA256 != "" && f.SHA256 != f.AttestedSHA256 {
+			fmt.Fprintf(&b, "  attested %s", f.AttestedSHA256)
+		}
+		if f.Detail != "" {
+			fmt.Fprintf(&b, "  (%s)", f.Detail)
+		}
+		fmt.Fprintln(&b)
+	}
+	s := r.Summary
+	fmt.Fprintf(&b, "recheck (now): %d match, %d mismatch, %d missing, %d partial, %d unverifiable, %d error\n",
+		s.Match, s.Mismatch, s.Missing, s.Partial, s.Unverifiable, s.Error)
+	if r.Detail != "" {
+		fmt.Fprintf(&b, "note: %s\n", r.Detail)
+	}
+	if r.Verified {
+		fmt.Fprintln(&b, "verified: yes (every selected file matches its recorded digest)")
+	} else {
+		fmt.Fprintln(&b, "verified: no")
+		fmt.Fprintln(&b, "repair: rerun the fetch that created this job with the same source and selection;")
+		fmt.Fprintln(&b, "        recheck itself never repairs, re-downloads or rewrites a capture")
+	}
+	_, _ = io.WriteString(w, b.String())
 }
 
 // torrentConfig maps the CLI flags onto the adapter configuration. An unknown

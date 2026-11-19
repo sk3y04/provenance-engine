@@ -165,6 +165,17 @@ func ReadJobStatus(stagingDir, rawID string) (JobStatus, error) {
 	if err != nil {
 		return JobStatus{}, err
 	}
+	job, _, err := lookupJob(root, req)
+	if err != nil {
+		return JobStatus{}, err
+	}
+	return projectJob(root, job)
+}
+
+// lookupJob reads the record for a requested identity, applying the hybrid alias
+// rule, and refuses a record that does not describe what was asked for. Recheck
+// and status share it so both resolve an alias identically.
+func lookupJob(root string, req Identity) (*jobRecord, string, error) {
 	path := filepath.Join(root, filepath.FromSlash(torrentStateDir), req.JobID()+".job.json")
 	job, err := readJobRecordFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -172,23 +183,19 @@ func ReadJobStatus(stagingDir, rawID string) (JobStatus, error) {
 		// under its v1 id. Resolving that alias only reads records; it never
 		// rewrites, renames or creates one.
 		if job, err = resolveIdentityAlias(root, req); err != nil {
-			return JobStatus{}, err
+			return nil, path, err
 		}
 	} else if err != nil {
-		return JobStatus{}, err
-	}
-	status, err := projectJob(root, job)
-	if err != nil {
-		return JobStatus{}, err
+		return nil, path, err
 	}
 	got, err := identityFromJob(job)
 	if err != nil {
-		return JobStatus{}, err
+		return nil, path, err
 	}
 	if !got.Compare(req) {
-		return JobStatus{}, fmt.Errorf("job record %s does not describe %s", path, req)
+		return nil, path, fmt.Errorf("job record %s does not describe %s", path, req)
 	}
-	return status, nil
+	return job, path, nil
 }
 
 // resolveIdentityAlias finds a job whose identity includes the requested one

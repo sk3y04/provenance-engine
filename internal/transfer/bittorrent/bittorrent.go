@@ -286,7 +286,14 @@ type Session struct {
 // ".lock"; the path is inside the root so any spelling that resolves to the
 // same directory contends on the same inode.
 func (s *Session) lockPath() string {
-	return filepath.Join(s.staging, filepath.FromSlash(torrentStateDir), "staging")
+	return jobLockPath(s.staging)
+}
+
+// jobLockPath is the ownership key for a job root. filelock keys its sidecar on
+// path+".lock", so this is `<root>/.provenance/torrent/staging.lock`. Recheck and
+// a fetch must name the same key or they would not contend at all.
+func jobLockPath(root string) string {
+	return filepath.Join(root, filepath.FromSlash(torrentStateDir), "staging")
 }
 
 // New validates cfg, takes exclusive ownership of the staging root, and starts
