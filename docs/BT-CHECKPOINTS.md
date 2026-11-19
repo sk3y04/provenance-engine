@@ -1484,3 +1484,68 @@ Gates: `go test ./internal/torrentqueue/ -race -run TestQueueSeed -count=3 -time
 
 BT-08d.4 (or BT-09 if you prefer to close the gaps first): the blocked/duplicate/stale
 cases above, plus process death while serving.
+
+## BT-08d.4 — Closing the managed-seeding regression gaps
+
+**Starting SHA** `62be45e` (clean). Tests first; production changed only where a test
+reproduced a defect. Two defects were found and fixed here.
+
+### Defect 1 (gap 3): seeding a damaged workspace deleted it
+
+```
+after:  len=0 sha=e3b0c442...  err=open .../alpha/a.bin: no such file or directory
+```
+
+The verifier's storage ran with part files enabled, the default. On reading a piece
+back incomplete the file storage truncates the file to its last complete piece and
+renames it to `*.part` - so a refusal destroyed the very bytes it was reporting on.
+BT-08d.2a did not catch it because the payload was finalized read-only (0444): the
+truncation failed silently and the file survived.
+
+Fix: `seedStoreOpts` sets `UsePartFiles: false` for both seed phases, so the storage
+opens the finalized files in place and writes only when a piece is downloaded - which
+a seed never does. The damaged payload now survives verification byte for byte.
+
+### Defect 2 (gap 4): process death left a seed stuck in `serving`
+
+The restarted runner never claimed the entry: the dead process had recorded
+`seed_phase=serving`, and `SeedEligible` refuses to dispatch anything in that phase, so
+the entry was permanently uneligible while its intent still said `on`.
+
+Fix: `reconcile` now treats `verifying`, `serving` and `stopping` as observations of a
+process that no longer exists (the runner lock was free, so no client can own the
+workspace) and resets them to `idle` when intent is on, `stopped` when it is off,
+clearing `SeedAttempt`.
+
+### Gap-by-gap result
+
+| gap | status | evidence |
+|-----|--------|----------|
+| 1. stop → start during `Close` | **verified** | `TestQueueSeedStopStartDuringClose`: `Close` held at a barrier; while held the workspace is unacquirable and no replacement opens a session (`opened == 1`); `unseed` then `seed` while held; after release the stale close does not publish `stopped`, the pool dispatches a replacement (`opened >= 2`), final state `on`/`serving`, capture key unchanged, lock free at the end |
+| 2. duplicate canonical workspace | **verified** | `TestQueueSeedDuplicateWorkspaceSingleOwner`: two records naming one workspace with `--max-seeds 2`; exactly one session opened, held for 2 s (a hot loop would open more), the duplicate never reaches `serving`, no extra run manifest |
+| 3. queue-level eligibility failures | **verified** | `TestQueueSeedBlockedWorkspaceAndUnrelatedDownload`: damaged workspace → `blocked` with the actionable note, an unrelated download completes in the same run, no new run manifest, the damaged bytes are preserved and the historical capture is unchanged. The BT-08d.2a no-pre-`Serve`-network and stale-completion tests still pass with no skips |
+| 4. runner death while serving | **verified** | `TestQueueSeedResumesAfterRunnerDeath`: child runner served **425,984 bytes** to a controlled leecher, SIGKILL; the restarted runner served **376,832 bytes** on a different address; intent survived, an explicitly stopped entry stayed stopped, captures not duplicated. Continuity of peer connections and upload counters across death is **not** claimed |
+| 5. shared upload limiter | **verified (pointer wiring only)** | `TestQueueSeedSharesRunnerUploadLimiter`: a download attempt and a seed attempt both receive the same non-nil limiter pointer at 64 KiB/s. Traffic accounting for seeds was measured in BT-08d.2 and was **not** re-run here; no mixed download/seed traffic was measured |
+
+### Gates
+
+- `go test ./internal/torrentqueue/ -race -run TestQueueSeed -count=3 -timeout 800s`
+  → `ok 44.353s`
+- `TestQueueSeedServesWhileDownloadCompletes` (the BT-08d.3 gate) still green:
+  A served 524,288 bytes while B downloaded and was still `serving` at B's completion
+- `make test` (repo-wide, `-race`), `make lint`, `go vet ./...`, `git diff --check`
+  → recorded with this entry
+
+### Still not covered
+
+- Process death **during verification** (only during serving).
+- A seed and a download contending for the same upload budget in one run: wiring is
+  proven, traffic is not.
+- Duplicate records are written directly in the test, because admission dedupes them;
+  the convergent, two-source-form race that would create them is not exercised.
+- Ratio/time policies and selective seeding remain out of scope.
+
+### Next
+
+BT-09, starting with non-destructive removal: drop a queue entry without touching its
+workspace, payload or capture.
