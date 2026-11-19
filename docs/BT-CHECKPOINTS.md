@@ -2861,7 +2861,7 @@ selected share only.
 
 ## BT-13 — Measured cost of the selected-progress sampler
 
-**Starting SHA** `3b3c27d` (clean). **Production code unchanged**: the benchmarks were
+**Starting SHA** `3b3c27d` (clean). **End SHA** `6720b44`. **Production code unchanged**: the benchmarks were
 the slice, and the measurement says the sampler is acceptable for the queue's intended
 workload. No ETA, stall policy or bandwidth work.
 
