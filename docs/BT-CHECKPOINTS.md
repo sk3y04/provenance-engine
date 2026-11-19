@@ -2901,14 +2901,14 @@ section. All numbers are ns/op, B/op and allocs/op from `-benchmem`.
 | `Complete512` | 512 | 265–302 µs | 86.9 kB | 96 |
 | `Complete2048` | 2,048 | 1.14–1.22 ms | 397 kB | 360–361 |
 
-Within a regime the repetitions are tight (≤7 % spread); **across** regimes the
-storage-backed cases differ by 2.6–2.8× at 2,048 pieces and 5.6–6.4× at 512 pieces, while
-`B/op` and `allocs/op` also rise (397 kB/360 allocs versus 275 kB/82). The two storage-less
-cases are stable across regimes (they do not appear in the 500x table because the second
-command filters to `Complete`). **The cause is unknown.** The difference was not
-established to be warm-up, GC, storage backing or completion state in isolation, and the
-default-duration numbers are *not* called steady state: they are the results of the
-documented command, nothing more.
+The tables give the observed range for each case; compare those directly rather than
+through a single figure. **Across** regimes the storage-backed cases differ by roughly
+2.6–2.8× at 2,048 pieces and 5.6–6.5× at 512 pieces, and `B/op` and `allocs/op` rise with
+them (397 kB and 360–361 allocs versus 274–277 kB and 79–85 allocs). The storage-less
+cases were not measured in the 500x runs reported here. **The cause of the regime
+difference is unknown.** It was not established to be warm-up, GC, storage backing or
+completion state in isolation, and the default-duration numbers are *not* called steady
+state: they are the results of the documented command, nothing more.
 
 An earlier run of this slice recorded only the `-benchtime=500x` numbers (271–288 µs and
 1.12–1.22 ms) and derived the per-piece slope from them. Those figures are retained here
