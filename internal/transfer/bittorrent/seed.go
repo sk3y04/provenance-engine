@@ -159,10 +159,10 @@ func OpenSeedSession(ctx context.Context, cfg Config, jobID string) (*SeedSessio
 		return nil, fmt.Errorf("%w: %d of %d pieces are not on disk; rerun the fetch to repair them",
 			ErrSeedDataIncomplete, bad, verified+bad)
 	}
-	// Verified: from here on this torrent must never download anything, and it may
-	// serve what was just checked.
+	// Verified. Download stays closed for good; upload stays closed until Serve is
+	// called, so a peer that connected during verification - or during a slot wait -
+	// gets nothing from a session that has not been told to serve.
 	tor.DisallowDataDownload()
-	tor.AllowDataUpload()
 
 	s.report = &SeedInfo{
 		JobID:          id.JobID(),
@@ -237,8 +237,14 @@ func (s *SeedSession) Address() string { return s.report.Address }
 // JobID is the job being served.
 func (s *SeedSession) JobID() string { return s.id.JobID() }
 
-// Serve blocks until ctx is cancelled. Closing is the caller's job.
+// Serve enables upload for a verified session and blocks until ctx is cancelled.
+// Upload is enabled here rather than at open so that nothing is served before the
+// caller decides to serve - which is what keeps "verified" and "serving" separate.
+// Closing is the caller's job.
 func (s *SeedSession) Serve(ctx context.Context) error {
+	if s.tor != nil {
+		s.tor.AllowDataUpload()
+	}
 	<-ctx.Done()
 	return ctx.Err()
 }

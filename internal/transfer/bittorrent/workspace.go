@@ -291,6 +291,9 @@ func openWorkspaceAt(ws string, id Identity, cfg Config) (*Session, error) {
 	if clientLifecycleHook != nil {
 		clientLifecycleHook("open:payload")
 	}
+	if clientOpenHook != nil {
+		clientOpenHook(client)
+	}
 	s.client = client
 	s.ownStorage = st
 	return s, nil

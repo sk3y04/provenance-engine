@@ -509,6 +509,10 @@ var clientConfigHook func(*at.ClientConfig)
 // an attempt never holds two clients at once. Nil in production.
 var clientLifecycleHook func(event string)
 
+// clientOpenHook receives the client itself, so a test can dial it while its
+// startup is still in progress. Nil in production.
+var clientOpenHook func(*at.Client)
+
 // newClient builds the library client. Limits are conservative; the library
 // defaults assume a long-lived desktop client, not one short job.
 func newClient(staging string, cfg Config) (*at.Client, error) {
