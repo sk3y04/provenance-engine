@@ -1012,7 +1012,8 @@ before. With it, the runner keeps serving after downloads drain and exits when n
 is left to run: an entry that is blocked (damaged, selective, ineligible) does not keep
 the runner alive, because it is waiting for a person rather than for a slot. A blocked
 seed is not retried automatically and never triggers repair, a fetch or a new capture.
-While it is serving, the pass does **not** take new downloads — see "Start saves intent;
+Once its downloads have drained, the pass stops claiming new downloads and waits on the
+seed pool — whether or not a seed is currently serving. See "Start saves intent;
 a pass claims work it already knows about" above.
 
 `SIGINT` cancels both pools, waits for both to close, and preserves intent: a seed

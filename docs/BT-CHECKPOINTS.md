@@ -2501,7 +2501,8 @@ and BT-08d.3, and this checkpoint does not re-claim it.
 
 Same fixture through the CLI and a scripted PTY (`drive8.py`, 80 columns): A completed
 and seeded, B added, started and throttled to 512 KiB/s, runner launched with
-`--max-active 1 --max-seeds 1`. One screen after a single `r`:
+`--max-active 1 --max-seeds 1`. The driver refreshes until both rows are live; the
+screen below is one captured screen, not a view stitched from several refreshes:
 
 ```
 live: runner pid 1972809, started 17:21:28   download slots 1/1   seed slots 1/1
@@ -2526,9 +2527,11 @@ download slot are reported by the endpoint, not inferred by the view.
 The runner is a **drain**: once the download pool is empty it waits on the seed pool, so
 an entry started *after* that point is never claimed in that pass. The first version of
 this test started B after A was already serving and B stayed `phase=queued,
-Attempts=0`; starting B before `Run` is what makes the overlap observable. That is the
-behaviour BT-08d.3 documented, recorded here because it changes how a user reaches
-overlap: record both intents, then run.
+Attempts=0`; starting B before `Run` is what makes the overlap observable. That is
+consistent with the exit behaviour BT-08d.3 documented (serve until no seed is left),
+which implies but never stated the part that matters here: a drained pass does not go
+back to claiming downloads. Recorded because it changes how a user reaches overlap:
+record both intents, then run.
 
 ### Gates
 
@@ -2537,9 +2540,41 @@ overlap: record both intents, then run.
 - `make test`, `make lint`, `go vet ./...`, `git diff --check`
 - Platform: Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3
 
+### Review follow-up (`f6ec52e`, from `8d8c6ff`)
+
+The review of `c503ccf` blocked on one item: this entry claimed the snapshot condition
+required "exactly two attempts" while the test only logged the count. `f6ec52e` adds
+that assertion (`internal/torrentqueue/overlap_test.go:161-167`) **after** the single
+qualifying snapshot is obtained, deliberately outside the polling predicate so a third
+attempt fails at once instead of timing the poll out; the failure prints the count and
+each attempt's id, kind, phase and stopping flag. Discrimination was checked by
+inverting the constant for one run, which failed with
+
+```
+  unexpected attempt entry=queued-000002-ad4dabf5 kind=download phase=running stopping=false
+  unexpected attempt entry=queued-000001-4a465669 kind=seed phase=serving stopping=false
+  the snapshot carried 2 attempts, want exactly 2
+```
+
+and the constant was then restored (`grep -n 'got != 2'` → line 161).
+
+The same commit removes the dead `attemptUploaded` helper and the unused `waitSnapshot`
+parameter, corrects the uploaded-bytes note (absent, logged as `-1`, not a measured
+zero), and routes cancellation plus the wait for runner exit through one bounded helper
+that records the attempt, so the deferred safety net never waits twice. The endpoint and
+durable-state checks still run only after a confirmed exit.
+
+Rerun at this tip: `go test ./internal/torrentqueue/ -run '^TestLiveOverlapDownloadAndSeed$'
+-race -count=3` → `ok 2.145s`; `make test` exit 0; `make lint` → 0 issues;
+`go vet ./...` clean; `git diff --check` clean. No production code changed and no
+`--watch` work was started in this pass.
+
 ### Not covered
 
 - Uploaded bytes during overlap (no leecher for A in this fixture).
 - The BT-10a Close barrier remains the separate proof of slot lifetime during teardown;
   this checkpoint measures neither the stopping interval nor teardown ordering.
 - The BT-10f ad-hoc metadata timeout: still unexplained, unchanged in status.
+- The PTY driver (`drive8.py`) is not tracked in this repository, so the terminal
+  evidence above cannot be regenerated from a checkout; it ran from a scratch directory
+  against the binary built at the time of that run, not against a build of this commit.
