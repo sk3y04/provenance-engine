@@ -930,3 +930,128 @@ Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores, on `d3bac30`:
 **BT-08 continuation** (aggregate limits, managed seeding, stall diagnosis) or
 **BT-09** (selection, priorities, safe removal). The BT-02/04 matrix rows remain
 unproven and untouched.
+
+## BT-08 (second slice) — One aggregate download and upload budget
+
+**Starting SHA** `8884b5e` (tree clean). **Ending SHA** `0aa3b09` (+ a test-race fix
+and this entry).
+
+Scope shipped: `queue run --download-rate R --upload-rate R`, one pair of limiters
+per runner shared by every attempt. Not shipped: peer-count limits, per-job
+fairness or static division of the budget, dynamic rate changes, managed seeding,
+RPC/TUI.
+
+### Where each limiter is installed
+
+| client | built by | receives |
+|--------|----------|----------|
+| metadata-only resolver (unresolved magnet) | `resolveMetainfo` → `clientConfig(tmp, cfg)` | both shared instances |
+| payload session | `openWorkspace` → `clientConfig(ws, cfg)` | both shared instances |
+| persisted-workspace reopen (restart) | `openWorkspace` | both shared instances |
+| foreground `fetch` / legacy job | `New` → `clientConfig` | only if `Config` carries them, which the fetch CLI never sets - unchanged |
+
+`clientConfig` is the single install point, so a new client path inherits the
+budget by construction. The runner builds the limiters once in `NewRunner` and
+passes the pointers through `Request`; nothing clones a limiter, divides the rate by
+`--max-active`, or builds one per attempt or per job.
+
+### Byte-accounting scope (what the budget is, and is not)
+
+- **Counted:** the client's payload read path - the library wraps the reader the
+  client reads torrent data through (`newDownloadRateLimitedReader`) - and the
+  chunks written to peers (the upload path reserves tokens per peer request before
+  `sendChunk`).
+- **Not counted:** tracker and DHT traffic, handshakes, keepalives, message framing
+  overhead, piece verification reads from disk, and anything outside these clients.
+  Web seeds are disabled by this adapter (`DisableWebseeds`), so no web-seed
+  limiting is advertised. This is **not** a whole-process network cap.
+- **Units:** bytes per second, `--max-bytes` suffix convention (`KB`/`MB`/`GB` are
+  powers of 1024). Omitted = unlimited; `0`, negative and unparsable values are
+  refused by the flag. Flags are not persisted: supply them on each restart.
+
+### Bursts, and why they are not zero
+
+| direction | burst | rationale |
+|-----------|-------|-----------|
+| download | 256 KiB | the library truncates each read to the burst and `panicif`-es on a failed reservation, so a zero burst panics; 256 KiB is far above the 16 KiB block read and bounds idle credit |
+| upload | 1 MiB | a peer request is reserved as one lump and the library panics with `upload rate limiter burst size < N` when the request exceeds the burst; `MaxAllocPeerRequestDataPerConn` defaults to 1 MiB, which is also the burst upstream gives itself |
+
+Consequence measured, not assumed: a 160 KiB fixture at a 32 KiB/s cap finished in
+0.15 s because it fits entirely in the burst, which is why the low-rate test now uses
+640 KiB.
+
+### Verified
+
+Pointer wiring (no network - says nothing about bytes):
+
+| Test | Result |
+|------|--------|
+| `TestQueueSharedLimiterWiring` | two attempts of one runner receive identical `*rate.Limiter` pointers for both directions; limits and bursts are the documented values; an unconfigured runner passes nil for both |
+| `TestQueueRateValidation` | negative, above-max and 1<<62 values rejected; zero and at-max accepted; an invalid rate is refused before anything is claimed |
+| `TestClientConfigInstallsSharedLimiters` | `clientConfig` installs the exact instances, and an unconfigured client keeps the library default rather than a zero-rate limiter (which the library's own config check rejects) |
+| `TestFetchIsolatedSharesOneLimiter` | a magnet fetch builds at least two clients (resolver + payload) and both carry the same pointers |
+| `TestQueuePauseWithSharedBudget` | pausing one attempt leaves the shared limiter instance intact for the sibling (same pointer, same limit) and releases only its own slot, after its client closes |
+| `TestParseQueueRate` | flag parsing: empty = unlimited, `1MB`/`512kb`/`2G` parse, `0`/`0KB`/`-1MB`/`fast` refused |
+
+Real traffic measurement (loopback seeders, two torrents with the same display name
+and relative path but different bytes, 2 MiB each, cap 512 KiB/s, `--max-active` 2):
+
+- total delivered **4,194,304 bytes in 7.647 s** (under `-race`);
+- steady-state **538,331 B/s** over a 6.3 s window sampled from allocated blocks
+  (cap 524,288 B/s: +2.7 %, inside the 1.3× tolerance);
+- the token-bucket bound `burst + rate × elapsed` holds, and the run is materially
+  slower than the `2 × rate` that two independent per-client limiters would have
+  allowed;
+- `TestQueueLowRateMakesProgress`: 640 KiB at 96 KiB/s completed in **4.124 s**
+  (expected ≥ 4.0 s after the burst), so a low rate neither stalls nor panics.
+
+### Not verified
+
+- **Upload enforcement against real traffic.** The upload limiter is wired through
+  the same install point and pointer-tested, but no test makes a controlled peer
+  request chunks from an active queue client, and seeding is out of scope - so
+  upload *enforcement* is **unverified**. It is not claimed at parity with download.
+- **Web-seed limiting.** Web seeds are disabled by this adapter; not advertised.
+- **Aggregate peer counts, per-job fairness, dynamic rates.** Out of scope.
+- **Whole-process accounting.** No claim: the budget covers the paths above, not
+  every byte the process moves.
+
+### Regression covered, and one test correction
+
+Existing process-death tests (`TestQueueRunnerKilledMidTransfer`,
+`TestQueueRunnerKilledAfterPublish`), capture adoption, the slot/FIFO suites and
+`make test` all ran on this revision.
+
+Two defects were in the new tests, not in the product, and both were found by
+`make test` under `-race` rather than by a normal run:
+
+1. `TestQueuePauseDuringWork` polled for the transient `stopping` phase and could miss
+   it when the fake worker returned instantly on cancellation. The worker now parks
+   after observing the cancellation and the test asserts `stopping` through that
+   barrier (`-race -count=5` green). Loosening the assertion instead would have hidden
+   a real slot-ordering regression later.
+2. The budget measurement tripped the race detector on its own sampler: the goroutine
+   appended to the samples slice while the assertions read it, and closing the stop
+   channel orders nothing. A second channel closed by the sampler gives the assertions
+   a happens-before edge; the numbers below are from a `-race` run.
+
+Commits: `42b7e96` (stopping barrier), `f82575a` (sampler race).
+
+### Gates
+
+Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores:
+
+- `go test ./internal/torrentqueue/ -count=2` → `ok 72.087s`
+- `go test ./internal/transfer/bittorrent/ ./cmd/provenance/ -count=1` → `ok 44.164s`, `ok 0.036s`
+- `go test ./internal/torrentqueue/ -race -run '<pause tests>' -count=5` → ok 2.201s
+- `go vet ./...` clean, `gofmt -l ./cmd ./internal` empty, `golangci-lint run ./...` → `0 issues`, `git diff --check` clean
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok, `internal/torrentqueue 37.449s`
+- CLI smoke: `--download-rate 0` → `must be a positive size in bytes per second`;
+  `--upload-rate -1MB` → `size "-1" must not be negative`;
+  `--download-rate fast` → parse error; `--download-rate 1MB --upload-rate 256KB
+  --max-active 2` accepted and the drain ran.
+
+### Next
+
+Upload enforcement against a controlled peer, then BT-09 (selection, priorities,
+safe removal). BT-02/04 matrix rows remain unproven and untouched.
