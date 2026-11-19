@@ -118,6 +118,10 @@ type Request struct {
 	// They are applied before payload requests begin and cannot change the
 	// selection.
 	Priorities map[string]string
+	// OnProgress receives the transfer's own progress samples for this attempt:
+	// verified bytes of the selected payload and the selected total. It is called
+	// from the transfer's poll loop and must not block; nil disables reporting.
+	OnProgress func(verified, total int64)
 	// PeersPerAttempt and HalfOpenPerAttempt are the per-job peer limits; zero
 	// keeps the adapter default.
 	PeersPerAttempt    int
@@ -276,6 +280,12 @@ type Runner struct {
 func (r *Runner) liveAdd(id, kind, phase string) {
 	if r.live != nil {
 		r.live.add(id, kind, phase)
+	}
+}
+
+func (r *Runner) liveProgress(id string, verified, total int64) {
+	if r.live != nil {
+		r.live.progress(id, verified, total)
 	}
 }
 
@@ -745,6 +755,8 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sy
 		UploadLimiter:   r.uploadLimiter,
 
 		Priorities: map[string]string{},
+
+		OnProgress: func(verified, total int64) { r.liveProgress(entry.ID, verified, total) },
 
 		PeersPerAttempt:    r.opts.PeersPerJob,
 		HalfOpenPerAttempt: r.opts.HalfOpenPerJob,

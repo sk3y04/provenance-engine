@@ -479,6 +479,15 @@ func queueLiveCmd() *cobra.Command {
 				if a.UploadedBytes != nil {
 					extra += fmt.Sprintf("  uploaded=%d bytes", *a.UploadedBytes)
 				}
+				// Selected progress only when the transfer reported it: an absent
+				// measurement is not printed as a zero. The rate is the change in
+				// verified selected bytes, not network throughput.
+				if a.SelectedBytes != nil && a.SelectedTotal != nil {
+					extra += fmt.Sprintf("  selected=%d/%d bytes", *a.SelectedBytes, *a.SelectedTotal)
+					if a.ProgressRate != nil {
+						extra += fmt.Sprintf("  progress=%d B/s", *a.ProgressRate)
+					}
+				}
 				fmt.Fprintf(&b, "%s  %s %s%s\n", a.EntryID, a.Kind, a.Phase, extra)
 			}
 			_, _ = io.WriteString(os.Stdout, b.String())

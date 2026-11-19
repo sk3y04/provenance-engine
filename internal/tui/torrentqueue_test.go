@@ -248,3 +248,46 @@ func TestQueueReopenInvalidatesPreviousGenerations(t *testing.T) {
 		t.Fatalf("a message from the previous visit was applied: %+v", m.queue.entries)
 	}
 }
+
+// TestQueueViewProgressRendering: selected progress and rate appear in the live
+// overlay when the snapshot carried them, and absent values stay absent.
+func TestQueueViewProgressRendering(t *testing.T) {
+	done, total, rate := int64(2<<20), int64(8<<20), int64(512<<10)
+	m := queueTestModel(entry("queued-000001-aaaaaaaa", torrentqueue.PhaseRunning))
+	snap := liveSnap(torrentqueue.LiveAttempt{
+		EntryID: "queued-000001-aaaaaaaa", Kind: "download", Phase: "running",
+		SelectedBytes: &done, SelectedTotal: &total, ProgressRate: &rate,
+	})
+	m.queue.live = &snap
+	out := m.viewTorrentQueue()
+	if !strings.Contains(out, "selected=") || !strings.Contains(out, "progress=") {
+		t.Fatalf("progress not rendered:\n%s", out)
+	}
+	if !strings.Contains(out, "2.0 MB") || !strings.Contains(out, "8.0 MB") {
+		t.Fatalf("progress values not rendered:\n%s", out)
+	}
+
+	// Bytes measured but no rate yet: the rate stays absent rather than showing 0.
+	m2 := queueTestModel(entry("queued-000001-aaaaaaaa", torrentqueue.PhaseRunning))
+	snap2 := liveSnap(torrentqueue.LiveAttempt{
+		EntryID: "queued-000001-aaaaaaaa", Kind: "download", Phase: "running",
+		SelectedBytes: &done, SelectedTotal: &total,
+	})
+	m2.queue.live = &snap2
+	out2 := m2.viewTorrentQueue()
+	if strings.Contains(out2, "progress=") || strings.Contains(out2, "0 B/s") {
+		t.Fatalf("an absent rate was rendered as a value:\n%s", out2)
+	}
+
+	// A measured zero rate is a value, not an absence.
+	zero := int64(0)
+	m3 := queueTestModel(entry("queued-000001-aaaaaaaa", torrentqueue.PhaseRunning))
+	snap3 := liveSnap(torrentqueue.LiveAttempt{
+		EntryID: "queued-000001-aaaaaaaa", Kind: "download", Phase: "running",
+		SelectedBytes: &done, SelectedTotal: &total, ProgressRate: &zero,
+	})
+	m3.queue.live = &snap3
+	if out3 := m3.viewTorrentQueue(); !strings.Contains(out3, "progress=") {
+		t.Fatalf("a measured zero rate was dropped:\n%s", out3)
+	}
+}

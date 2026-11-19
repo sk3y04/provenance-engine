@@ -195,8 +195,17 @@ type Config struct {
 
 // Update is one progress sample.
 type Update struct {
+	// Written is bytes present in storage for the selected files. It includes a
+	// partially received piece at a file boundary and data retained from an earlier
+	// attempt, so it is a storage counter, not a verification signal.
 	Written int64
-	Total   int64
+	// Total is the sum of the selected files' lengths.
+	Total int64
+	// Verified is bytes of the selected files covered by pieces the library has
+	// hash-verified complete. A piece crossing into an unselected file contributes
+	// only the selected file's share, and padding never contributes, so this
+	// isolates the selected byte ranges. It moves in piece-sized steps.
+	Verified int64
 }
 
 // File describes one file in a torrent, as listed by metainfo.
@@ -1484,6 +1493,9 @@ func (s *Session) waitComplete(ctx context.Context, o *opened, selected []valida
 	var settledSince time.Time
 	peerRetryAt := time.Now().Add(peerRetryInterval)
 	for {
+		// Sample first, so the tick that observes completion reports the final value
+		// rather than the state one tick earlier.
+		s.report(o, selected)
 		// Re-offer the caller's peers while nothing is connected. Only when no
 		// peer is active, so a healthy transfer never causes duplicate dials.
 		if len(s.peers) > 0 && !time.Now().Before(peerRetryAt) {
@@ -1518,7 +1530,6 @@ func (s *Session) waitComplete(ctx context.Context, o *opened, selected []valida
 		} else {
 			settledSince = time.Time{}
 		}
-		s.report(o, selected)
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("%w: %w", ErrTransferTimeout, ctx.Err())
@@ -1615,7 +1626,25 @@ func (s *Session) report(o *opened, selected []validatedFile) {
 		written += sf.file.BytesCompleted()
 		total += sf.file.Length()
 	}
-	s.cfg.OnUpdate(Update{Written: written, Total: total})
+	s.cfg.OnUpdate(Update{Written: written, Total: total, Verified: selectedVerified(selected)})
+}
+
+// selectedVerified counts the selected payload the library has verified: for each
+// selected file, the in-file byte length of every covering piece whose state is
+// Complete. File.State() reports each piece's byte length *within that file*, so a
+// piece shared with an unselected neighbour contributes only the selected share and
+// padding contributes nothing. Resumed pieces count, and a piece still downloading
+// counts nothing until it verifies, so the value moves in piece-sized steps.
+func selectedVerified(selected []validatedFile) int64 {
+	var verified int64
+	for _, sf := range selected {
+		for _, ps := range sf.file.State() {
+			if ps.Complete {
+				verified += ps.Bytes
+			}
+		}
+	}
+	return verified
 }
 
 // persistMetainfo writes the exact metainfo bytes the client holds. Re-reading

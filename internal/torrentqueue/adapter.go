@@ -47,6 +47,11 @@ func (a Adapter) config(req Request) bittorrent.Config {
 		// adapter builds (metadata resolver, payload session) inherits them.
 		DownloadLimiter: req.DownloadLimiter,
 		UploadLimiter:   req.UploadLimiter,
+		OnUpdate: func(u bittorrent.Update) {
+			if req.OnProgress != nil {
+				req.OnProgress(u.Verified, u.Total)
+			}
+		},
 	}
 }
 

@@ -64,6 +64,16 @@ type LiveAttempt struct {
 	// slice has no concurrent-safe read path for their transfer counters, and a zero
 	// would be a lie rather than a measurement.
 	UploadedBytes *int64 `json:"uploaded_bytes,omitempty"`
+	// SelectedBytes is the selected payload covered by verified pieces, and
+	// SelectedTotal is the selected payload's full size. Both are absent when the
+	// transfer cannot report them; absent means unknown, never zero.
+	SelectedBytes *int64 `json:"selected_bytes,omitempty"`
+	SelectedTotal *int64 `json:"selected_total,omitempty"`
+	// ProgressRate is the change in SelectedBytes per second, in bytes/s. It is a
+	// *progress* rate on the selected payload, not network throughput: it is absent
+	// until two samples at least liveRateWindow apart exist, and it stays absent
+	// after a counter rollback or a new attempt.
+	ProgressRate *int64 `json:"progress_rate,omitempty"`
 }
 
 // LiveSlots reports used and configured slots for one pool.
@@ -83,6 +93,18 @@ type LiveSnapshot struct {
 	Attempts  []LiveAttempt `json:"attempts"`
 }
 
+// liveRateWindow is the shortest baseline a progress rate is computed over.
+// Samples arrive from the transfer's 100ms poll; a shorter window would turn
+// scheduling noise into a spike, so a sample inside the window keeps the previous
+// baseline instead of producing a rate.
+const liveRateWindow = 250 * time.Millisecond
+
+// liveSample is the baseline for one attempt's progress rate.
+type liveSample struct {
+	at       time.Time
+	verified int64
+}
+
 // liveState is the runner's mutable view, guarded by one short mutex. Snapshots copy
 // under it and serialize outside it, so a slow reader never delays a claim.
 type liveState struct {
@@ -93,10 +115,63 @@ type liveState struct {
 	attempts  map[string]LiveAttempt
 	order     []string
 	started   time.Time
+	// samples holds one rate baseline per live attempt. It is reset when an attempt
+	// is added or removed, so a retry can never inherit the previous attempt's rate.
+	samples map[string]liveSample
+	// now is the clock seam for tests; nil means time.Now (monotonic reading).
+	now func() time.Time
 }
 
 func newLiveState(root string) *liveState {
-	return &liveState{root: root, attempts: map[string]LiveAttempt{}, started: time.Now().UTC()}
+	return &liveState{
+		root:     root,
+		attempts: map[string]LiveAttempt{},
+		samples:  map[string]liveSample{},
+		started:  time.Now().UTC(),
+	}
+}
+
+// clock returns a monotonic reading: rate deltas must never be computed across a
+// wall-clock step.
+func (l *liveState) clock() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
+}
+
+// progress records one selected-payload sample for a live attempt. Semantics:
+//   - no sample in this attempt yet -> bytes are reported, rate stays absent;
+//   - verified counter went backwards -> rate absent and the baseline restarts;
+//   - less than liveRateWindow since the baseline -> keep the old baseline so the
+//     next rate covers the longer interval (no divide-by-tiny spike);
+//   - otherwise the rate is the delta over the elapsed time, and a delta of zero is
+//     recorded as a measured zero rather than omitted.
+func (l *liveState) progress(id string, verified, total int64) {
+	if verified < 0 || total < 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	a, ok := l.attempts[id]
+	if !ok {
+		// The attempt ended between the sample and this call: never resurrect it.
+		return
+	}
+	v, t := verified, total
+	a.SelectedBytes, a.SelectedTotal = &v, &t
+	now := l.clock()
+	prev, had := l.samples[id]
+	switch {
+	case !had || verified < prev.verified:
+		a.ProgressRate = nil
+		l.samples[id] = liveSample{at: now, verified: verified}
+	case now.Sub(prev.at) >= liveRateWindow:
+		rate := int64(float64(verified-prev.verified) / now.Sub(prev.at).Seconds())
+		a.ProgressRate = &rate
+		l.samples[id] = liveSample{at: now, verified: verified}
+	}
+	l.attempts[id] = a
 }
 
 func (l *liveState) add(id, kind, phase string) {
@@ -104,6 +179,8 @@ func (l *liveState) add(id, kind, phase string) {
 	if _, ok := l.attempts[id]; !ok {
 		l.order = append(l.order, id)
 	}
+	// A new attempt starts with a fresh rate baseline, even for the same entry.
+	delete(l.samples, id)
 	l.attempts[id] = LiveAttempt{EntryID: id, Kind: kind, Phase: phase}
 	l.mu.Unlock()
 }
@@ -144,6 +221,7 @@ func (l *liveState) remove(id string) {
 		return
 	}
 	delete(l.attempts, id)
+	delete(l.samples, id)
 	for i, e := range l.order {
 		if e == id {
 			l.order = append(l.order[:i], l.order[i+1:]...)

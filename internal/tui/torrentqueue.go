@@ -500,6 +500,15 @@ func livePhaseText(a torrentqueue.LiveAttempt) string {
 	if a.UploadedBytes != nil {
 		out += fmt.Sprintf("  uploaded=%s", humanBytes(*a.UploadedBytes))
 	}
+	// Selected progress appears only when the snapshot carried it, and the rate only
+	// when the runner measured one: an absent value stays absent instead of becoming
+	// "0 B". The rate is progress on the selected payload, not network throughput.
+	if a.SelectedBytes != nil && a.SelectedTotal != nil {
+		out += fmt.Sprintf("  selected=%s/%s", humanBytes(*a.SelectedBytes), humanBytes(*a.SelectedTotal))
+		if a.ProgressRate != nil {
+			out += fmt.Sprintf("  progress=%s/s", humanBytes(*a.ProgressRate))
+		}
+	}
 	return out
 }
 
