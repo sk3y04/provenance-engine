@@ -43,6 +43,14 @@ type queueState struct {
 	durableErr string
 	gen        int
 	inflight   int
+	// readSeq orders durable reads within one view instance: a read begun before a
+	// write must never overwrite a read begun after it.
+	readSeq int
+	// appliedSeq is the highest durable read already rendered.
+	appliedSeq int
+	// pendingRefresh is set when a refresh was refused because one was in flight, so
+	// the post-write refresh is not silently dropped until the next tick.
+	pendingRefresh bool
 	// pendingSelect is the id to highlight once it appears in a durable read, so a
 	// just-added entry is selected without guessing its row.
 	pendingSelect string
@@ -58,6 +66,7 @@ type queueState struct {
 
 type queueDurableMsg struct {
 	gen     int
+	seq     int
 	root    string
 	entries []torrentqueue.Entry
 	err     error
@@ -94,6 +103,9 @@ func (m *model) openQueueView() (tea.Model, tea.Cmd) {
 // is in flight another one is refused, so a slow endpoint cannot pile up requests.
 func (m *model) refreshQueue() tea.Cmd {
 	if m.queue.inflight > 0 {
+		// A write just finished while a poll is still in flight: remember that a refresh
+		// is owed instead of dropping it, and run it when the poll drains.
+		m.queue.pendingRefresh = true
 		return nil
 	}
 	// Deliberately NOT bumping the generation here: a poll runs every two seconds and
@@ -101,18 +113,20 @@ func (m *model) refreshQueue() tea.Cmd {
 	// The generation changes only when the view instance, the root or the intent to
 	// display the view changes.
 	m.queue.inflight = 2
-	gen, root := m.queue.gen, m.queue.root
-	return tea.Batch(m.queueDurableCmd(gen, root), m.queueLiveCmd(gen, root))
+	m.queue.pendingRefresh = false
+	m.queue.readSeq++
+	gen, root, seq := m.queue.gen, m.queue.root, m.queue.readSeq
+	return tea.Batch(m.queueDurableCmd(gen, seq, root), m.queueLiveCmd(gen, root))
 }
 
-func (m *model) queueDurableCmd(gen int, root string) tea.Cmd {
+func (m *model) queueDurableCmd(gen, seq int, root string) tea.Cmd {
 	return func() tea.Msg {
 		store, err := torrentqueue.OpenStore(root)
 		if err != nil {
-			return queueDurableMsg{gen: gen, root: root, err: err}
+			return queueDurableMsg{gen: gen, seq: seq, root: root, err: err}
 		}
 		entries, lerr := store.List()
-		return queueDurableMsg{gen: gen, root: root, entries: entries, err: lerr}
+		return queueDurableMsg{gen: gen, seq: seq, root: root, entries: entries, err: lerr}
 	}
 }
 
@@ -235,6 +249,14 @@ func (m *model) updateQueue(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.gen != m.queue.gen {
 			return m, nil // late message from a previous view instance or root
 		}
+		if msg.seq != 0 && msg.seq < m.queue.appliedSeq {
+			// A read begun before a newer one has arrived: applying it would show state
+			// the user already moved past.
+			return m, nil
+		}
+		if msg.seq > m.queue.appliedSeq {
+			m.queue.appliedSeq = msg.seq
+		}
 		if msg.err != nil {
 			// A failed refresh keeps the rows it could not replace: the durable list is
 			// still the last good read, and the failure is reported above it.
@@ -253,8 +275,7 @@ func (m *model) updateQueue(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		m.finishQueueRefresh()
-		return m, nil
+		return m, m.finishQueueRefresh()
 	case queueLiveMsg:
 		if msg.gen != m.queue.gen {
 			return m, nil
@@ -271,8 +292,7 @@ func (m *model) updateQueue(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.queue.live = nil
 			m.queue.liveStatus = "live status: unavailable (" + msg.err.Error() + ")"
 		}
-		m.finishQueueRefresh()
-		return m, nil
+		return m, m.finishQueueRefresh()
 	case queueActionMsg:
 		if msg.gen != m.queue.gen || msg.root != m.queue.root || m.view != viewTorrentQueue {
 			return m, nil // late result: another view, another root, or a newer generation
@@ -298,10 +318,20 @@ func (m *model) updateQueue(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) finishQueueRefresh() {
+// finishQueueRefresh drains one in-flight read and returns the refresh that was owed
+// while it ran, so a write that finished during a poll still gets a post-write read.
+func (m *model) finishQueueRefresh() tea.Cmd {
 	if m.queue.inflight > 0 {
 		m.queue.inflight--
 	}
+	if m.queue.inflight != 0 || !m.queue.pendingRefresh || m.view != viewTorrentQueue {
+		return nil
+	}
+	m.queue.pendingRefresh = false
+	m.queue.inflight = 2
+	m.queue.readSeq++
+	gen, root, seq := m.queue.gen, m.queue.root, m.queue.readSeq
+	return tea.Batch(m.queueDurableCmd(gen, seq, root), m.queueLiveCmd(gen, root))
 }
 
 func (m *model) updateQueueKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

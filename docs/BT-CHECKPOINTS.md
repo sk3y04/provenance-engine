@@ -2264,3 +2264,109 @@ stopping interval — PTY timing is not used for it.
 - The PTY run used a single downloading/seed entry; no multi-entry seed scheduling was
   exercised from the TUI.
 - PTY evidence is scripted (`pty` + keystrokes), not an interactive human session.
+
+## BT-10f — Release-readiness checkpoint for the TUI queue workflow
+
+**Starting SHA** `5932372` (clean). No new queue operations. One defect in the TUI's
+poll/write interleaving was reproduced and fixed; one queue-path defect was found and is
+**not** fixed here.
+
+### Fixed: a post-write refresh could be dropped (and a stale read could win)
+
+`refreshQueue` refused to start while a poll was in flight, so a write that finished
+during a poll lost its post-write read until the next tick — and a durable read begun
+*before* a write could be applied *after* a newer one. Now `finishQueueRefresh` hands
+back the refresh that was owed, deferring it until the poll drains, and every durable
+read carries a sequence number so an older read cannot overwrite a newer one. The view
+generation stays scoped to the view instance and root (BT-10e's fix), so polls no longer
+invalidate action results.
+
+### Verified — deterministic, through top-level `Update`
+
+| test | result |
+|------|--------|
+| `TestQueueActionResultAcceptedAfterReadsAndPoll` | poll + both read results delivered before the action result: the result is accepted and the post-write refresh shows the saved state |
+| `TestQueueStaleReadCannotOverwriteNewer` | a read begun before the write (seq 1) arriving after the post-write read (seq 2) is ignored |
+| `TestQueuePostWriteRefreshNotLostDuringPoll` | the refresh owed during an in-flight poll is deferred, then run once the poll drains, and it reads the saved state |
+| `TestQueueReentryReadsCommittedWriteFromDisk` | leave with a write pending: the obsolete result cannot touch the new view, and re-entry reads the committed write from disk |
+
+The BT-10a Close barrier test remains the proof of slot lifetime; no PTY timing is used
+for the stopping interval.
+
+### Verified — multi-entry PTY workflow (scripted, real terminal, real runner)
+
+Fixture: a disposable root with a completed, seed-eligible entry (64 KiB-piece torrent,
+served by a loopback seeder) and a second torrent offered through the picker.
+
+```
+> queued-000001-8cbc2f3e   desired=run     recorded=completed  seed=on/waiting
+> queued-000002-8f94a7a6   desired=paused  recorded=queued
+```
+```
+saved: saved start intent for queued-000002-8f94a7a6 (desired=run, phase=queued); no runner is runn…
+> queued-000002-8f94a7a6   desired=run     recorded=queued
+```
+```
+live: runner pid 1623001, started 16:44:55   download slots 0/1   seed slots 1/1
+  queued-000001-8cbc2f3e   desired=run     recorded=completed  seed=on/serving  live=seed serving
+> queued-000002-8f94a7a6   desired=run     recorded=failed
+```
+```
+saved: saved pause intent for queued-000002-8f94a7a6 (desired=paused); recorded as paused
+> queued-000002-8f94a7a6   desired=paused  recorded=failed
+```
+```
+live status: unavailable (no foreground runner is reachable)
+  queued-000001-8cbc2f3e   desired=run  recorded=completed  seed=on/idle
+  queued-000002-8f94a7a6   desired=paused recorded=failed
+```
+
+What this shows: the picker added exactly one paused entry with its own id; start saved
+intent **without launching a runner**; the live refresh reached the terminal and named
+the correct durable ids; the action went to the highlighted row only — the other entry's
+download and seed intent were unchanged; and after the runner exited both rows stayed
+browsable with no stale live overlay (the seed settled at `idle`, as an interruption
+should).
+
+### Gap found, not fixed: queue downloads of a local `.torrent` time out on metadata
+
+The second entry never downloaded, so **simultaneous download+seed slots were not
+demonstrated** and no overlap is claimed. Its recorded error:
+
+```
+error: timed out waiting for torrent metadata: context deadline exceeded
+```
+
+`torrent fetch` with the same source, peer and profile succeeds repeatedly on the same
+fixtures, and a 64 KiB torrent *did* complete through the queue earlier in this session.
+Reproductions: an 8 MiB single-file torrent and an 8.25 MiB two-file torrent, both
+against a loopback seeder, both failing identically; the successful queue runs used
+small payloads. The queue's resolution path therefore needs its own investigation — it is
+a download-path defect, not a TUI one, and it is out of scope for this checkpoint.
+
+### Terminal usability
+
+At 80 columns the action status is clipped (`…the runner is not acknowledg…`). The
+information a user needs — *which id*, *saved vs observed*, *which phase* — appears
+before the clipping point, and the row itself shows `desired=`, `recorded=` and the live
+column, so the clip hides only the trailing explanation. Layout was left unchanged; if
+the wording grows, the status line should wrap rather than truncate.
+
+Also documented for users: the view uses the process working directory as the queue
+root (no flag), a runner must be started separately (`torrent queue run [--max-seeds N]`),
+and a saved action never means the runner has acted.
+
+### Gates
+
+- `go test ./internal/tui/ ./internal/torrentqueue/ -race -run 'TestQueue|TestTorrent|TestLive|TestSeedPool|TestRunJoins' -count=3 -timeout 900s`
+  → `torrentqueue 229.961s`; `tui` passed after the deferred-refresh drain was added to
+  the live branch as well (`go test ./internal/tui/ -race -count=3` → `ok 2.100s`)
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok
+- `make lint` → `0 issues`; `go vet ./...` clean; `git diff --check` clean
+- Platform: Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3
+
+### Not covered
+
+- Simultaneous download and seed activity (see the gap above).
+- Removal, selection editing, runner launch and streaming remain out of scope.
+- PTY evidence is scripted (`pty` + keystrokes), not an interactive human session.

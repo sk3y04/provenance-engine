@@ -183,8 +183,22 @@ func TestQueueRefreshSingleFlight(t *testing.T) {
 	if again := m.refreshQueue(); again != nil {
 		t.Fatal("a second refresh started while one was in flight")
 	}
-	_, _ = m.updateQueue(queueDurableMsg{gen: 0, root: m.queue.root, entries: nil})
-	_, _ = m.updateQueue(queueLiveMsg{gen: 0, root: m.queue.root, err: torrentqueue.ErrNoLiveRunner})
+	if !m.queue.pendingRefresh {
+		t.Fatal("a refresh refused while one was in flight was not remembered")
+	}
+	_, follow := m.updateQueue(queueDurableMsg{gen: 0, root: m.queue.root, entries: nil})
+	_, follow2 := m.updateQueue(queueLiveMsg{gen: 0, root: m.queue.root, err: torrentqueue.ErrNoLiveRunner})
+	// The deferred refresh is handed back and, once drained, leaves nothing in flight.
+	owed := follow
+	if owed == nil {
+		owed = follow2
+	}
+	if owed == nil {
+		t.Fatalf("the deferred refresh was dropped (inflight=%d pending=%v view=%v)", m.queue.inflight, m.queue.pendingRefresh, m.view)
+	}
+	for _, msg := range drainCmd(t, owed) {
+		_, _ = m.updateQueue(msg)
+	}
 	if m.queue.inflight != 0 {
 		t.Fatalf("inflight count did not drain: %d", m.queue.inflight)
 	}
