@@ -7,6 +7,8 @@ package bittorrent
 // calls once per attempt. Fixtures are built outside the timed loop.
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -84,9 +86,15 @@ func syntheticTorrent(b *testing.B, total int64, pieceLen int64) (*at.Torrent, i
 		b.Fatalf("setup: synthetic torrent has no info")
 	}
 	// No payload may be created: the point of this fixture is piece count without a
-	// proportional file on disk.
-	if entries, derr := os.ReadDir(filepath.Join(dataDir, "synthetic")); derr == nil && len(entries) > 0 {
+	// proportional file on disk. A missing directory (storage never opened) or an
+	// empty one both mean no payload; anything else, including an unreadable path,
+	// fails the benchmark.
+	entries, derr := os.ReadDir(filepath.Join(dataDir, "synthetic"))
+	switch {
+	case derr == nil && len(entries) > 0:
 		b.Fatalf("setup: the deferred-storage fixture created %d payload entries", len(entries))
+	case derr != nil && !errors.Is(derr, fs.ErrNotExist):
+		b.Fatalf("setup: cannot check for payload: %v", derr)
 	}
 	return tor, info.NumPieces()
 }
@@ -107,6 +115,9 @@ func benchSelectedVerified(b *testing.B, files []validatedFile) {
 func BenchmarkSelectedVerifiedComplete512(b *testing.B) {
 	tor, pieces := completeFixtureClient(b, 8<<20, 16<<10)
 	files := benchFilesFor(tor)
+	if pieces != 512 {
+		b.Fatalf("setup: %d pieces, want 512", pieces)
+	}
 	if got := selectedVerified(files); got != int64(8<<20) {
 		b.Fatalf("setup: verified = %d, want %d", got, 8<<20)
 	}
@@ -118,6 +129,12 @@ func BenchmarkSelectedVerifiedComplete512(b *testing.B) {
 func BenchmarkSelectedVerifiedComplete2048(b *testing.B) {
 	tor, pieces := completeFixtureClient(b, 32<<20, 16<<10)
 	files := benchFilesFor(tor)
+	if pieces != 2048 {
+		b.Fatalf("setup: %d pieces, want 2048", pieces)
+	}
+	if got := selectedVerified(files); got != int64(32<<20) {
+		b.Fatalf("setup: verified = %d, want %d: the fixture must be fully verified", got, 32<<20)
+	}
 	b.Logf("files=%d pieces=%d verified=%d", len(files), pieces, selectedVerified(files))
 	benchSelectedVerified(b, files)
 }
@@ -126,6 +143,9 @@ func BenchmarkSelectedVerifiedComplete2048(b *testing.B) {
 func BenchmarkSelectedVerifiedIncomplete65536(b *testing.B) {
 	tor, pieces := syntheticTorrent(b, 1<<30, 16<<10)
 	files := benchFilesFor(tor)
+	if pieces != 65536 {
+		b.Fatalf("setup: %d pieces, want 65536", pieces)
+	}
 	if got := selectedVerified(files); got != 0 {
 		b.Fatalf("setup: verified = %d, want 0", got)
 	}
@@ -137,6 +157,12 @@ func BenchmarkSelectedVerifiedIncomplete65536(b *testing.B) {
 func BenchmarkSelectedVerifiedIncomplete262144(b *testing.B) {
 	tor, pieces := syntheticTorrent(b, 4<<30, 16<<10)
 	files := benchFilesFor(tor)
+	if pieces != 262144 {
+		b.Fatalf("setup: %d pieces, want 262144", pieces)
+	}
+	if got := selectedVerified(files); got != 0 {
+		b.Fatalf("setup: verified = %d, want 0", got)
+	}
 	b.Logf("files=%d pieces=%d verified=0", len(files), pieces)
 	benchSelectedVerified(b, files)
 }
