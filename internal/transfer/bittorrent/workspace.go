@@ -240,6 +240,13 @@ func openWorkspace(root string, id Identity, cfg Config) (*Session, error) {
 			return nil, fmt.Errorf("create workspace %s: %w", dir, err)
 		}
 	}
+	return openWorkspaceAt(ws, id, cfg)
+}
+
+// openWorkspaceAt opens a workspace whose directory is already known, taking its
+// lock and validating any existing record. Seeds use it for an existing workspace;
+// everything else goes through openWorkspace, which derives the path first.
+func openWorkspaceAt(ws string, id Identity, cfg Config) (*Session, error) {
 	peers, err := parsePeers(cfg.Peers)
 	if err != nil {
 		return nil, err
