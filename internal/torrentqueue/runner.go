@@ -254,6 +254,41 @@ type Runner struct {
 	// getting its own.
 	downloadLimiter *rate.Limiter
 	uploadLimiter   *rate.Limiter
+	// live is the in-memory view this process publishes over its local endpoint. It
+	// is nil when no endpoint is running.
+	live *liveState
+}
+
+// liveAdd, livePhase, liveStopping, liveUploaded and liveRemove are no-ops without an
+// endpoint, so the runner has one code path with or without live status.
+func (r *Runner) liveAdd(id, kind, phase string) {
+	if r.live != nil {
+		r.live.add(id, kind, phase)
+	}
+}
+
+func (r *Runner) livePhase(id, phase string) {
+	if r.live != nil {
+		r.live.phase(id, phase)
+	}
+}
+
+func (r *Runner) liveStopping(id string) {
+	if r.live != nil {
+		r.live.stopping(id)
+	}
+}
+
+func (r *Runner) liveUploaded(id string, n int64) {
+	if r.live != nil {
+		r.live.uploaded(id, n)
+	}
+}
+
+func (r *Runner) liveRemove(id string) {
+	if r.live != nil {
+		r.live.remove(id)
+	}
 }
 
 // newSharedLimiter builds one limiter for a rate, or nil for unlimited. The burst
@@ -313,6 +348,27 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 		return sum, err
 	}
 	defer func() { _ = l.Release() }()
+
+	// Publish the live endpoint only while this process owns the queue, and stop
+	// accepting readers before the workers finish shutting down.
+	live := newLiveState(r.store.root)
+	live.mu.Lock()
+	live.downloads = LiveSlots{Max: r.opts.maxActive()}
+	live.seeds = LiveSlots{Max: r.opts.maxSeeds()}
+	live.mu.Unlock()
+	r.live = live
+	srv, lerr := startLiveServer(r.store.root, live)
+	if lerr != nil {
+		// Live status is an observer, never a precondition: log and run without it.
+		r.logf("live status unavailable: %v", lerr)
+		r.live = nil
+	} else {
+		r.logf("live endpoint %s", srv.sockPath)
+		defer func() {
+			r.logf("live endpoint closing")
+			srv.close()
+		}()
+	}
 
 	adopted, err := r.reconcile()
 	if err != nil {
@@ -569,6 +625,8 @@ func (r *Runner) reconcile() (int, error) {
 // bad job cannot block the ones behind it.
 func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sync.Mutex, sum *Summary) {
 	r.logf("%s: running (%s)", entry.ID, entry.JobID)
+	r.liveAdd(entry.ID, "download", "running")
+	defer r.liveRemove(entry.ID)
 
 	raw, peers, rerr := r.store.RestrictedSource(entry.ID)
 	if rerr != nil {
@@ -770,6 +828,7 @@ func (r *Runner) watchPause(ctx context.Context, id, token string, cancel contex
 				continue
 			}
 			paused.set(true)
+			r.liveStopping(id)
 			if _, uerr := r.updateAttempt(id, token, func(e *Entry) error {
 				if e.Phase == PhaseRunning {
 					e.Phase = PhaseStopping

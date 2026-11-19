@@ -157,7 +157,8 @@ owns the root.`,
 			"picks the work back up. Nothing in this command group deletes payload or data.",
 	}
 	queue.AddCommand(queueAddCmd(), queueListCmd(), queueStartCmd(), queuePauseCmd(), queueRetryCmd(),
-		queueSeedCmd(), queueUnseedCmd(), queuePriorityCmd(), queueRemoveCmd(), queueRunCmd())
+		queueSeedCmd(), queueUnseedCmd(), queuePriorityCmd(), queueRemoveCmd(),
+		queueLiveCmd(), queueRunCmd())
 	cmd.AddCommand(queue)
 
 	return cmd
@@ -481,6 +482,59 @@ func queueUnseedCmd() *cobra.Command {
 			return nil
 		},
 	}
+	return cmd
+}
+
+func queueLiveCmd() *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "live",
+		Short: "Show what the foreground runner is doing right now",
+		Long: "Asks the running foreground runner for one read-only snapshot over its local Unix\n" +
+			"socket. `queue list` remains the durable view: a recorded phase is never reported as\n" +
+			"live, and if no runner answers this command says so instead of guessing.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
+			defer cancel()
+			snap, lerr := torrentqueue.LiveSnapshotFor(ctx, store.Root())
+			if lerr != nil {
+				return lerr
+			}
+			if asJSON {
+				out, merr := json.MarshalIndent(snap, "", "  ")
+				if merr != nil {
+					return merr
+				}
+				_, _ = io.WriteString(os.Stdout, string(out)+"\n")
+				return nil
+			}
+			var b strings.Builder
+			fmt.Fprintf(&b, "runner pid %d on %s since %s\n", snap.PID, snap.Root, snap.StartedAt.Format(time.RFC3339))
+			fmt.Fprintf(&b, "download slots %d/%d   seed slots %d/%d\n",
+				snap.Downloads.Used, snap.Downloads.Max, snap.Seeds.Used, snap.Seeds.Max)
+			if len(snap.Attempts) == 0 {
+				fmt.Fprintf(&b, "no active attempts\n")
+			}
+			for _, a := range snap.Attempts {
+				extra := ""
+				if a.Stopping {
+					extra = "  (slot held until the client closes)"
+				}
+				if a.UploadedBytes != nil {
+					extra += fmt.Sprintf("  uploaded=%d bytes", *a.UploadedBytes)
+				}
+				fmt.Fprintf(&b, "%s  %s %s%s\n", a.EntryID, a.Kind, a.Phase, extra)
+			}
+			_, _ = io.WriteString(os.Stdout, b.String())
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Print the snapshot as JSON")
 	return cmd
 }
 

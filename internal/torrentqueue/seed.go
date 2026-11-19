@@ -164,6 +164,8 @@ func (r *Runner) claimSeed(entry Entry) (Entry, error) {
 // release of the workspace lock. The coordinator reaps it only after done closes.
 func (r *Runner) runSeed(ctx context.Context, entry Entry, mu *sync.Mutex, sum *Summary) {
 	token := entry.SeedAttempt
+	r.liveAdd(entry.ID, "seed", "verifying")
+	defer r.liveRemove(entry.ID)
 	sess, err := r.seedOpener().OpenSeed(entry, r.seedRequest(entry))
 	if err != nil {
 		r.seedFailed(entry, token, err, mu, sum)
@@ -180,6 +182,7 @@ func (r *Runner) runSeed(ctx context.Context, entry Entry, mu *sync.Mutex, sum *
 		return
 	}
 
+	r.livePhase(entry.ID, "serving")
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	watchDone := make(chan struct{})
@@ -207,6 +210,11 @@ func (r *Runner) runSeed(ctx context.Context, entry Entry, mu *sync.Mutex, sum *
 	serr := sess.Serve(serveCtx)
 	cancel()
 	<-watchDone
+	// Closing is the part a reader must see: the slot is still held.
+	r.liveStopping(entry.ID)
+	if n := sess.UploadedBytes(); n > 0 {
+		r.liveUploaded(entry.ID, n)
+	}
 	r.closeSeed(sess, entry, token)
 	_ = serr
 }
