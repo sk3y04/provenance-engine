@@ -649,8 +649,8 @@ returning.
 
 - **Download pool empty** → rescan every `200ms` (the same interval the runner already
   uses to re-read pause intent). An entry added and started from another shell, or from
-  the TUI, is claimed on the next scan. A blocked entry becomes claimable when its
-  backoff elapses, without a restart.
+  the TUI, is claimed on the next scan that finds a free slot. A blocked entry becomes
+  claimable when its backoff elapses, without a restart.
 - **Seed pool empty** → it keeps scanning too, so `queue seed` issued by another process
   starts serving inside the same session.
 - **Both idle** → the process stays alive and keeps publishing its live endpoint;
@@ -658,8 +658,10 @@ returning.
 
 Pickup needs no IPC and no in-process wakeup: every scan re-reads the store under its
 lock, so a record that another process made durable is visible on the next tick. The
-cost is latency, not correctness — work is picked up within one interval (200ms by
-default) plus claim time; it does not queue behind an active attempt.
+`200ms` is the default **idle rescan cadence**, not a wall-clock pickup guarantee:
+eligible work is claimed on a scan when a slot is available, and if every slot is
+occupied the entry waits for capacity — eligibility, backoff and slot limits are
+unchanged by the mode, so new work can queue behind an active attempt.
 
 Stop it with `SIGINT` (`Ctrl-C`). It stops claiming, cancels and joins the active
 attempts, keeps their slots and the runner ownership until every client has closed, and

@@ -2599,9 +2599,10 @@ same shapes as before.
   running, so `queue seed` from another process starts serving in the same session.
 - **Pickup mechanism**: every scan calls `store.List()` / `SeedCandidates()` under the
   store lock, so durability is the transport. Nothing in the runner is notified; a
-  record written by another process is simply visible on the next tick. The documented
-  pickup bound is one `PollInterval` (200 ms by default; it is not a flag) plus claim
-  time.
+  record written by another process is simply visible on the next tick. `PollInterval`
+  (200 ms by default; not a flag) is the **idle rescan cadence**, not a wall-clock
+  pickup guarantee: work is claimed on a scan when a slot is free, otherwise it waits
+  for capacity, and eligibility/backoff still apply. Corrected in BT-11a after review.
 - **Shutdown** is the existing path: stop claiming, `shutdown(inflight, done, active)`
   cancels and joins, the seed pool joins after cancellation, then the deferred
   `srv.close()` removes the live endpoint. Slot and ownership release therefore still
@@ -2668,11 +2669,106 @@ that drive the same CLI operations, and not from the scratch smoke.
 
 - No daemon, service install, socket control or mutation IPC: the session is a foreground
   process, and stopping it is SIGINT (or process death, which releases the flock).
-- `PollInterval` is not a flag; 200 ms is the only documented cadence and the tests use
-  20 ms to keep the suite fast, so the numbers above are not a latency specification.
-- Pickup is bounded by one interval *per scan*, not a latency SLO: a large queue is
-  re-read on each tick exactly as the drain re-reads it.
+- `PollInterval` is not a flag; 200 ms is the default idle rescan cadence and the tests
+  use 20 ms to keep the suite fast, so the numbers above are not a latency specification.
+- Pickup is bounded by one rescan *per idle tick*, not a latency SLO, and only when a
+  slot is free: with every slot occupied an eligible entry waits for capacity. A large
+  queue is re-read on each tick exactly as the drain re-reads it.
 - Watch mode does not add retry semantics: a failed entry still needs `retry`, a blocked
   one still waits out its backoff (now observable inside one session).
 - The ad-hoc-fixture metadata timeout (BT-10f) is untouched and still unexplained.
 - No TUI change; the TUI still cannot start a runner, and `--watch` is CLI-only.
+
+## BT-11a — Watch review blockers: fatal-error shutdown, pickup promise, test synchronisation
+
+**Starting SHA** `70655fb` (clean). Review of `2a49f84..70655fb` blocked on two items: a
+fatal store error could return out of `Run` while a seed still owned a slot, and the
+docs promised pickup that does not queue behind an active attempt. Both are fixed here;
+no scheduler policy changed.
+
+### Fatal errors now end the session in both directions
+
+- `runFatal` (`internal/torrentqueue/runner.go`) records the **first** error, calls an
+  optional boundary hook, then cancels the sibling pool. Later errors are dropped, so a
+  sibling's cancellation can never replace the cause.
+- `Run` derives `runCtx` from the caller's context and hands it to both pools, so a
+  failure in either one wakes the other (`idleWait`, `take(true)` and every attempt
+  context select on it). The download loop's `nextExcept` error now records the failure
+  and breaks out of the loop instead of returning, so it reaches the shared join:
+  `r.shutdown(...)` → `<-seedDone` → return the recorded error. Ownership release
+  (`defer l.Release()`, registered first) and endpoint removal (`defer srv.close()`,
+  registered later) therefore happen *after* both pools are joined, in LIFO order.
+- The seed pool distinguishes the two outcomes that were conflated: `SeedPending`
+  returning an **error** is fatal (`fatal.fail(fmt.Errorf("seed pending: %w", perr))`);
+  only a successful "nothing pending" lets a watch session keep scanning, and a drain
+  still returns there. `SeedCandidates` errors are fatal for the same reason — they used
+  to be logged and retried every interval, which under `--watch` is an unbounded loop.
+- `Options.BeforeFatal func(error)` exists so a test can observe the fatal boundary
+  deterministically; it is nil in production, like `BeforeSeedClose`.
+
+### Regression evidence (before → after)
+
+The two discriminating tests were run against a surgical revert of the fix (the error
+paths restored, the hook kept so the tests still compile):
+
+| test | before the fix | after the fix |
+|------|----------------|---------------|
+| `TestSeedPoolEndsOnStoreError` | FAIL "the seed pool kept polling after a store error" (5.00 s bound) | PASS 0.00 s, `seed candidates: read queue: … permission denied` |
+| `TestWatchFatalDownloadErrorJoinsHeldSeed` | FAIL "Run returned while the seed was still inside Close (err=… permission denied)" (0.08 s) | PASS: fatal held with `stopping` seed at `1/1`, ownership refused, then Run returns the injected error |
+
+`TestWatchFatalStoreErrorEndsIdleSession` stays green in both versions by design: the
+download pool's old early return already surfaced that error. It is kept as the
+end-to-end proof that an idle session cannot poll forever and cannot return success; the
+seed-side discrimination lives in the first two rows.
+
+The held-Close case uses the BT-10a barrier session for the exact entry under test and
+proves ordering without sleeps: `BeforeFatal` fires, then the test asserts Run has not
+returned, `LockRunner` is refused, and the real live endpoint still reports one
+`stopping` attempt with `seeds.used == 1`; only `release` ends it, after which the
+endpoint is gone and ownership is reacquirable.
+
+### Pickup promise corrected
+
+`docs/TORRENT.md` no longer claims new work "does not queue behind an active attempt".
+The 200 ms interval is documented as the default **idle rescan cadence**, not a
+wall-clock guarantee: work is claimed on a scan when a slot is free, otherwise it waits
+for capacity, with eligibility, backoff and slot limits unchanged. The BT-11 entry above
+was corrected in place.
+
+### Test tightening in the same slice
+
+- Late admission now synchronises on a completed empty scan: the runner's log line
+  `idle: watching for eligible work` (captured through `Options.Log`) is awaited before
+  the external `queue start`, because an empty snapshot is satisfied from the moment the
+  endpoint is published.
+- The drain-compatibility test now requires a successful `liveProbe` after starting B,
+  so an early-exiting drain fails instead of passing.
+- The held-Close cleanup waits with a 60 s bound instead of blocking indefinitely.
+- Subprocesses are bounded: `go build` 180 s, each CLI call 60 s, both via
+  `exec.CommandContext`.
+- **Race scope**: the spawned CLI is built without `-race`, so a `-race` run instruments
+  the test process (which hosts the runner under test) and not the child binary.
+
+### Commands actually run
+
+- `go test ./internal/torrentqueue/ -run 'TestWatch|TestDrainDoesNotClaim|TestSeedPoolEndsOnStoreError' -count=1 -timeout 350s` → `ok 6.022s`
+- `go test ./internal/torrentqueue/ -race -run '^(TestWatch|TestDrainDoesNotClaim|TestSeedPoolEndsOnStoreError|TestLiveOverlap|TestLiveCloseBarrier|TestLiveStopping|TestQueueRunnerKilled|TestQueueSeed|TestSeedPool|TestRunJoinsClosing)' -count=3 -timeout 1500s`
+  → `ok 109.663s`
+- `make test`, `make lint`, `go vet ./...`, `git diff --check`, `gofmt -l .`
+- Pre-fix runs: the two tests above against the reverted error paths (`-count=1`, 5 s and
+  0.08 s to fail), then the fix restored and the same tests green.
+- Platform: Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3.
+
+### Remaining gaps
+
+- The pre-fix demonstration reverts the two error paths rather than checking out
+  `70655fb`; the hook is kept so the tests compile against both shapes.
+- `TestWatchFatalStoreErrorEndsIdleSession` cannot say which pool reported first — by
+  design either is fatal — so it asserts the outcome, not the reporter.
+- Cancellation is still checked between scan rounds, not inside the claim loop: a scan
+  already in progress can claim up to the slot limit after ctx is cancelled, and those
+  attempts are then cancelled and recorded as interruptions.
+- A persistent store error now ends the session instead of being retried, which is the
+  intended contract but also means a transient permission blip ends a watch session;
+  there is no retry policy for it.
+- The BT-10f ad-hoc metadata timeout remains unexplained and untouched.
