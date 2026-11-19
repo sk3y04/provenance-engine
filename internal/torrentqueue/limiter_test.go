@@ -214,7 +214,11 @@ func TestQueueAggregateDownloadBudget(t *testing.T) {
 	var samples []sample
 	start := time.Now()
 	sampling := make(chan struct{})
+	// sampled closes when the sampler has returned, so the assertions below read
+	// samples with a happens-before edge instead of racing the goroutine.
+	sampled := make(chan struct{})
 	go func() {
+		defer close(sampled)
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -238,6 +242,7 @@ func TestQueueAggregateDownloadBudget(t *testing.T) {
 		DownloadLimit: capPerSecond,
 	}).Run(context.Background())
 	close(sampling)
+	<-sampled
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("drain: %v", err)
