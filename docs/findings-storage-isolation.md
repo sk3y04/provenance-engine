@@ -1,9 +1,10 @@
-# Storage isolation: baseline survey (BT-05, step 1)
+# Storage isolation: baseline, shipped layout and evidence (BT-05)
 
-Read-only survey before any code. Nothing here is a proposal yet; it is what the
-current layout is keyed by, which collisions are already refused, and what
-"isolated per-job workspace" would have to change. Written from the code at
-`95fc83e`.
+The first half is the read-only survey taken before any code (at `95fc83e`): what
+the legacy layout is keyed by, what is already refused, and what it cannot do.
+The second half is what shipped: the isolated workspace, its ownership and lock
+order, how a capture is located, the legacy-conflict policy, and what the tests
+demonstrate.
 
 ## What is keyed by what
 
@@ -51,28 +52,99 @@ that keeps two jobs apart today is that a root admits one writer at a time.
    `captureKey` is content/job-derived and not timestamp-derived, but the file
    name still is.
 
-## What "isolated workspace" would mean
+## The shipped workspace
 
-The shape that fits the constraints above, for the new runner only (BT-07), not
-for the current `fetch`:
+Implemented in `internal/transfer/bittorrent/workspace.go`. The baseline above is
+unchanged: legacy jobs keep it exactly.
 
 ```
-<root>/.provenance/torrent/jobs/<jobID>/
-    job.json            job record
-    metainfo.torrent    exact metainfo (0600)
-    payload/            this job's DataDir: <payload>/<info.Name>/…
-    .torrent.db         this job's piece completion
+<root>/.provenance/torrent/jobs/<jobID>/          session root == library DataDir
+    <torrent name>/<path>                          payload and .part files
+    .provenance/completion/.torrent.db             piece completion, job-scoped
+    .provenance/torrent/<hash>.torrent             exact metainfo, 0600
+    .provenance/torrent/<jobID>.job.json           job record
+    .provenance/torrent/staging.lock               workspace ownership
+    .provenance/items/<identity>_<path>.json       capture items
+    .provenance/runs/<ts>.json                     published run (commit point)
 ```
 
-- One library client per active job, `DataDir = <payload>`, so the payload
-  directory and completion DB become job-scoped and two same-named torrents
-  cannot meet.
-- The job id is the full identity (`bt-<40hex>` / `bt2-<64hex>`), never a
-  truncated hash, and the path is derived from it, so the namespace is
-  collision-resistant by construction rather than by the conflict check.
-- A capture item id would also carry the job id, so two jobs cannot overwrite
-  each other's items; run manifests keep their format (archive import depends on
-  it) but are written under the job's own directory.
+A real one, from `TestIsolatedCaptureIsReadableByExistingReaders`:
+
+```
+.provenance/
+  completion/.torrent.db                                 12288 bytes
+  items/9af1d6c1..._fixture_a.bin.json                     723 bytes
+  runs/2026-11-19T014306Z.json                            1558 bytes
+  torrent/9af1d6c1....torrent                              288 bytes
+  torrent/bt-9af1d6c1....job.json                         1150 bytes
+  torrent/staging.lock                                       0 bytes
+fixture/a.bin                                           30000 bytes
+```
+
+Two properties keep this small instead of introducing a second path scheme:
+
+- The session's root **is** the workspace, so every path the adapter already
+  derives - `statePath`, `jobPath`, `lockPath`, the capture namespace,
+  `joinWithin` containment, `finalizedPath` - becomes job-scoped without change.
+  Capture paths stay `<torrent name>/<path>`, so items and manifests keep their
+  existing shape and the capture key format does not move.
+- The payload base and the completion database are settable independently of
+  `DataDir`: `storage.NewFileOpts(storage.NewFileClientOpts{ClientBaseDir,
+  PieceCompletion})`, with the completion database built by
+  `NewDefaultPieceCompletionForDir` on `.provenance/completion`. `DataDir` stays
+  the workspace so the library writes `<ws>/<name>/...` exactly as it writes
+  `<root>/<name>/...` for a legacy job, and the database stays out of the payload
+  namespace. The session closes that storage itself, after the client stops,
+  because the library does not close a caller-provided `DefaultStorage`.
+
+## Ownership and lock order
+
+| What | Legacy | Isolated |
+|------|--------|----------|
+| Lock | `<root>/.provenance/torrent/staging.lock` | `<ws>/.provenance/torrent/staging.lock` |
+| Writers admitted | one per root | one per workspace |
+| Root-level writes | all of them | none; the root's record directory is only read |
+
+An isolated session takes exactly one lock, its workspace lock. It does not take
+the root lock, so there is no lock order to define: nothing takes both, and a busy
+workspace cannot block an unrelated workspace. The one root read is
+`checkLegacyConflict`, which reads a record published by atomic rename, so it sees
+a complete old or new record.
+
+## How a capture is found, and what readers see
+
+- `Capture.StagingDir` is the workspace; `Capture.ManifestPath` is
+  **workspace-relative** (`.provenance/runs/<ts>.json`). No raw path string
+  crosses a workspace boundary.
+- Existing readers work when pointed at the workspace, because a workspace is a
+  complete provenance root: `torrent status -o <ws>` lists its one job,
+  `manifest verify <ws>` and `archive import <ws>` read its runs. Nothing is
+  mirrored into the root, and no shared mutable index exists.
+- Pointed at the **root**, `torrent status` and `archive import` see only legacy
+  jobs. Isolated captures are not enumerable from the root in this PR: the queue
+  and the index that would list them are BT-07, deliberately out of scope.
+- `archive import` stays opt-in: a workspace is imported only when a caller names
+  it.
+
+## Legacy conflict policy
+
+`ErrLegacyJobConflict` when the root already holds a legacy record for the same
+canonical job id. No adoption, no migration, no relocation, no second job over the
+same capture intent, and the legacy record is not modified (asserted
+byte-for-byte). An isolated workspace whose own record describes a different
+identity is also a hard error (`validateJobRecord`), never a rename.
+
+## Identity and metadata ordering
+
+The workspace path comes from the canonical job id only - `bt-<40 hex>` or
+`bt2-<64 hex>`, validated by `validateJobID` - so a bare hash, a display name or a
+truncated storage key cannot become a path. A magnet is resolved metadata-only
+first (`resolveMetainfo`: no payload storage, no workspace, an in-memory
+completion), and only the resolved identity picks the workspace. A btmh-only
+magnet naming a hybrid therefore lands in its canonical `bt-<v1>` workspace
+instead of creating a provisional `bt2-` job. The discovery profile used for that
+resolution is the profile the job will run with; a private torrent is refused
+before any workspace exists.
 
 ## What must not change
 
@@ -95,13 +167,35 @@ case-insensitive filesystem (or an explicit refusal with a reason); a
 file/directory conflict (`a/b` as file vs directory); a migration dry run, a
 crash between move and record update, and a rollback.
 
-## Open decisions (need a call before code)
+## Decisions taken
 
-1. Per-job client and `DataDir` — accepted cost is one client per active job
-   (goroutines, sockets) against losing the root-scoped completion DB. The
-   alternative, a path-rewriting storage wrapper, is more code and more risk.
-2. Whether `fetch` itself moves to the new layout, or only runner-managed jobs
-   do. The roadmap says the new runner only, until a finer-grained ownership
-   model exists.
-3. Whether the run-manifest file name changes (it is format-visible) or stays
-   timestamp-based inside the job directory.
+1. **One client per active job**, with its own payload base and completion
+   database. No path-rewriting storage wrapper.
+2. **Foreground `fetch` keeps the legacy layout.** Only the isolated entry point
+   (`OpenIsolated`, `FetchIsolated`) uses workspaces: no migration, no fallback,
+   no relocation.
+3. **Run manifests keep their name and format** (`<ts>.json` in the workspace's
+   `.provenance/runs/`), so nothing that reads them changes.
+
+## Evidence
+
+Acceptance runs in `isolated_workspace_test.go`. Every case uses real sessions
+over loopback, and synchronization is a channel or a condition poll, never a
+sleep.
+
+| Test | Demonstrates |
+|------|--------------|
+| `TestIsolatedTwoConcurrentJobsSameName` | two sessions under one root on distinct torrents that share display name and relative paths: distinct workspaces, payloads, completion databases, job records and capture keys; both digests correct; the root grows nothing |
+| `TestIsolatedWorkspaceBusyAndRecovery` | a held workspace refuses a second writer (`ErrStagingBusy`); an unrelated workspace transfers while it is held; a cancelled transfer publishes nothing; reopening recovers on retained bytes with exactly one run |
+| `TestIsolatedWorkspacesKeyedByFullIdentity` | two identities colliding on the 20-byte storage key get distinct workspaces and distinct databases; a legacy record for one does not block the other; nothing is adopted by the truncated key |
+| `TestIsolatedHybridResolvesToOneWorkspace` | `.torrent`, `btih`, `btih+btmh` and btmh-only all resolve to the same canonical `bt-<v1>` workspace and reconcile to one capture |
+| `TestIsolatedLegacyConflictIsRefused` | conflict refused, no workspace created, legacy record byte-identical |
+| `TestIsolatedCaptureIsReadableByExistingReaders` | workspace-relative manifest path; status, items and runs readable from the workspace; the root has none |
+
+Not demonstrated, and not claimed: process-kill recovery for a workspace (the
+cancel path above is in-process; the same `filelock` primitive is covered for
+legacy roots by `ownership_process_test.go`), and resistance to another process
+changing the workspace between the symlink checks and the library's writes. The
+adapter rejects existing symlinks on the workspace path, re-resolves containment
+for its own reads, and refuses a payload name that would merge with the job's
+records, but library-owned I/O is not re-validated per write.

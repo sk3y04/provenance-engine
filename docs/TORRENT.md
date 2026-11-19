@@ -548,6 +548,64 @@ before the run manifest, so a reader that runs mid-capture can see item files
 that are not part of a published capture yet. That is pre-existing behavior;
 this slice only prevents two writers from interleaving.
 
+## Isolated job workspaces
+
+A foreground `torrent fetch` uses the layout above: one root, one writer, payload
+at `<root>/<name>`, one `.torrent.db` for the root. Runner-managed jobs use a
+separate entry point with a job-scoped layout, so two jobs under one root cannot
+share payload, completion state or capture namespace:
+
+```go
+job, err := bittorrent.OpenIsolated(ctx, cfg, source)   // resolves identity, takes the workspace
+defer job.Close()
+cap, err := job.Fetch(ctx, []string{"release/track.flac"})
+
+// or the one-shot form
+cap, err := bittorrent.FetchIsolated(ctx, cfg, source, selection)
+```
+
+```
+<root>/.provenance/torrent/jobs/<jobID>/          session root == library DataDir
+    <torrent name>/<path>                          payload and .part files
+    .provenance/completion/.torrent.db             piece completion, job-scoped
+    .provenance/torrent/<hash>.torrent             exact metainfo, 0600
+    .provenance/torrent/<jobID>.job.json           job record
+    .provenance/torrent/staging.lock               workspace ownership
+    .provenance/items/<identity>_<path>.json       capture items
+    .provenance/runs/<ts>.json                     published run (commit point)
+```
+
+Rules this layout enforces, each covered by a test in `isolated_workspace_test.go`:
+
+- **Keyed by full identity.** The directory name is `bt-<40 hex>` (v1 and hybrid)
+  or `bt2-<64 hex>` (v2-only), derived from the canonical identity and validated
+  before use. A display name, a magnet string or a 20-byte storage key never
+  becomes a path, so two identities that collide on the library's truncated key
+  still get separate workspaces and separate completion databases.
+- **One writer per workspace.** The workspace lock replaces the root lock; a busy
+  workspace returns `ErrStagingBusy` and cannot block a different workspace.
+  Switching an existing workspace to another identity is a hard error, not a
+  rename.
+- **Nothing is shared with the root.** Payload, `.part` files, completion
+  database, records, items and runs all live inside the workspace. The root's
+  record directory is only read, to detect the legacy conflict below.
+- **Magnet identity is resolved before the workspace exists.** A magnet is
+  fetched metadata-only under the job's own discovery profile, then the resolved
+  identity picks the workspace. A btmh-only magnet naming a hybrid lands in its
+  canonical `bt-<v1>` workspace rather than creating a `bt2-` job; the private
+  torrent policy is applied before any workspace is created.
+- **Legacy jobs are untouched.** If the root already has a legacy job with the
+  same canonical id, `OpenIsolated` refuses with `ErrLegacyJobConflict`: no
+  adoption, no migration, no second job over the same capture intent.
+- **Captures stay in their own namespace.** `Capture.ManifestPath` is
+  workspace-relative. A workspace is a complete provenance root, so
+  `torrent status -o <ws>`, `manifest verify <ws>` and `archive import <ws>` all
+  read it as-is, while `-o <root>` still lists only legacy jobs. Import remains
+  opt-in.
+
+There is no migration path and no fallback: an identity is either legacy or
+isolated, and the layout it was created with is the one it keeps.
+
 ## Read-only status
 
 `provenance torrent status` answers "what does the local record say about this

@@ -452,3 +452,113 @@ ticket: full identities already map to job ids, so the namespace work can start.
 One BT-03 follow-up remains: make the fake tracker's announce response acceptable
 to the pinned client so "peers learned from the tracker are dialled" gets a test
 of its own.
+
+## BT-05 — Per-job storage isolation (partially shipped: layout, not migration)
+
+**Starting SHA** `6852bf7` (tree clean, survey only). **Ending SHA** `6cc4328`.
+
+Scope shipped: an isolated workspace for future runner-managed jobs, exercised
+through the real transfer and capture pipeline. Not shipped, by decision:
+migration of existing jobs, the queue, an index, scheduler, RPC and TUI.
+
+### Changed paths
+
+- `internal/transfer/bittorrent/workspace.go` (new, 377 lines) — workspace
+  layout, `WorkspacePath`, `validateJobID`, `OpenIsolated`, `FetchIsolated`,
+  `checkLegacyConflict`, `openWorkspace`, `resolveMetainfo`, `metainfoSource`.
+- `internal/transfer/bittorrent/isolated_workspace_test.go` (new, 561 lines) —
+  the six acceptance tests below.
+- `internal/transfer/bittorrent/bittorrent.go` — `Session.isolated`,
+  `Session.workspaceID`, `Session.ownStorage`; `Fetch` split into parse +
+  `fetchSource`; a `case "metainfo"` source in `open()`; the reserved
+  `.provenance` payload-name refusal; `Close` now closes workspace storage
+  between the client and the lock.
+- `docs/findings-storage-isolation.md` — survey retained, shipped layout,
+  ownership, reader story, conflict policy, evidence added.
+- `docs/TORRENT.md` — "Isolated job workspaces" section.
+
+### Traced before editing
+
+- **What the library derives from `DataDir`:** the payload (`<DataDir>/<name>/…`)
+  and, by default, the piece completion database at `<DataDir>/.torrent.db`.
+  Both are settable independently: `storage.NewFileOpts(NewFileClientOpts{
+  ClientBaseDir, PieceCompletion})` plus `NewDefaultPieceCompletionForDir(dir)`
+  (sqlite, bolt under `nosqlite`), so `DataDir` can stay the workspace while the
+  database lives in `.provenance/completion`. A caller-provided
+  `DefaultStorage` is **not** closed by the library — the session closes it.
+- **When identity is known:** a local `.torrent` at parse time; a magnet only
+  after a metadata exchange. Hence `OpenIsolated` resolves a magnet metadata-only
+  (temp dir, in-memory completion, `DeferStorageOpen`, data up and down
+  disallowed, the job's own discovery profile) and only then picks the
+  workspace. A btmh-only hybrid magnet resolves to `bt-<v1>`, and no `bt2-`
+  workspace is ever created for it.
+- **Root ownership:** the root lock exists to protect root-level files
+  (`<root>/.torrent.db`, `staging.lock`, records, captures). A workspace never
+  writes a root-level file, so it takes only its own lock and the root stays
+  readable to a concurrent legacy writer. No path takes both locks.
+
+### Layout shipped (real, from the test log)
+
+```
+<root>/.provenance/torrent/jobs/bt-9af1d6c1…/
+  .provenance/
+    completion/.torrent.db                     12288 bytes
+    items/9af1d6c1…_fixture_a.bin.json           723 bytes
+    runs/2026-11-19T014306Z.json                1558 bytes
+    torrent/9af1d6c1….torrent                    288 bytes
+    torrent/bt-9af1d6c1….job.json               1150 bytes
+    torrent/staging.lock                           0 bytes
+  fixture/a.bin                                30000 bytes
+```
+
+### Verified
+
+`go test ./internal/transfer/bittorrent/ -run TestIsolated -count=1 -v`
+(the second column is measured, not asserted):
+
+| Test | Result |
+|------|--------|
+| `TestIsolatedTwoConcurrentJobsSameName` | PASS 0.19s — two sessions under one root, same display name and relative path, different bytes: distinct workspaces, payloads, completion DBs, records, capture keys; both digests correct; root has no `fixture/`, no record, no `.torrent.db` |
+| `TestIsolatedWorkspaceBusyAndRecovery` | PASS 2.35s — held workspace → `ErrStagingBusy`; unrelated workspace transferred while held; cancelled transfer published 0 manifests; reopen recovered on retained bytes with exactly 1 run |
+| `TestIsolatedWorkspacesKeyedByFullIdentity` | PASS 0.03s — equal `StorageKey`, distinct job ids → distinct workspaces and DBs; legacy record for the v1 form does not block the v2 form; `checkLegacyConflict` refuses only the exact identity |
+| `TestIsolatedHybridResolvesToOneWorkspace` | PASS 0.16s — `.torrent`, `btih`, `btih+btmh`, `btmh-only` → one workspace, one capture key, 1 run manifest |
+| `TestIsolatedLegacyConflictIsRefused` | PASS 0.04s — `ErrLegacyJobConflict`, no workspace created, legacy record byte-identical |
+| `TestIsolatedCaptureIsReadableByExistingReaders` | PASS 0.16s — workspace-relative manifest path, status/items/runs readable from the workspace, none at the root |
+
+Full gates on `6cc4328` (Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32
+cores):
+
+- `go test ./internal/transfer/bittorrent/ -count=1` → `ok 45.492s`
+- `go test … -run 'TestIsolated|TestFetchCapturesOnlySelectedFiles|TestInterruptedFetchResumesAndReusesVerifiedBytes|TestStagingRootIsExclusiveOwner|TestSecondSessionOnSameRootIsBusy|TestReadJobStatus|TestSharedPieceCorruptionIsRepairedNotCaptured|TestDirectMagnetFailsBoundedWithoutContactingTracker|TestTrackerPolicy' -count=3` → `ok 25.045s`
+- `make test` (repo-wide, `-race`) → all packages ok, `internal/transfer/bittorrent 58.210s`
+- `go vet ./...` clean, `gofmt -l ./cmd ./internal` empty, `make lint` → `0 issues`, `git diff --check` clean
+- CLI: no surface change in this PR (no new flags, no new commands), so no CLI smoke; `cmd/provenance` tests pass under `make test`.
+
+### Not verified (explicit)
+
+- **Process-kill recovery for a workspace.** The accepted evidence is an
+  in-process cancel plus a reopen. The lock primitive is covered under process
+  death for legacy roots by `ownership_process_test.go`, but that helper does not
+  know about workspaces, and this PR does not extend it.
+- **Hostile filesystem races.** Existing symlinks on the workspace path are
+  rejected before creation and the adapter re-resolves containment for its own
+  reads, but library-owned I/O is not re-validated per write. No claim is made
+  about another process changing a workspace mid-transfer.
+- **Migration, queue, index.** Out of scope by decision; no legacy job was read,
+  moved or rewritten, and no data on this machine was touched.
+
+### Limits
+
+- One client per active job: each workspace costs its own goroutines, sockets and
+  completion database handle. That is the accepted cost of not writing a
+  path-rewriting storage wrapper.
+- A workspace is not enumerable from the root: `torrent status -o <root>` still
+  lists only legacy jobs. Pointed at the workspace, the existing readers work.
+- Foreground `fetch` is unchanged: legacy layout, legacy lock, no workspace.
+
+### Next eligible ticket
+
+**BT-06** (offline-first `torrent recheck`, read-only inspection, typed storage
+errors). It only needs persisted metainfo and the selected-file set, and it is
+independent of the queue. BT-07 (durable queue) is the consumer of this PR's
+workspace entry point and should follow BT-06.
