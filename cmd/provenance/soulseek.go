@@ -54,6 +54,8 @@ download jobs and the provenance records of what was imported.`,
 	cmd.AddCommand(soulseekClearCompletedCmd())
 	cmd.AddCommand(soulseekRecoverCmd())
 	cmd.AddCommand(soulseekWebhookListenCmd())
+	cmd.AddCommand(soulseekSharesCmd())
+	cmd.AddCommand(soulseekUploadsCmd())
 	return cmd
 }
 

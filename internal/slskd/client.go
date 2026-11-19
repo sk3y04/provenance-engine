@@ -147,6 +147,9 @@ func Redact(secrets []string, s string) string {
 	return s
 }
 
+// ErrNoClient is returned by operations that need a configured client.
+var ErrNoClient = errors.New("no slskd client is configured")
+
 // APIError is a non-2xx response.
 type APIError struct {
 	Op         string
