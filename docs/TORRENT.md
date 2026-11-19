@@ -620,6 +620,27 @@ provenance torrent queue retry ID...        # clears failed/blocked, desired=run
 provenance torrent queue run [-o ROOT]      # drain once, one worker, then exit
 ```
 
+### Start saves intent; a pass claims work it already knows about
+
+`start` makes an entry eligible. It does **not** guarantee that a runner already
+running will pick it up. A pass is a drain: it claims entries while the download pool
+has room, and once that pool is empty it has nothing left to claim. With `--max-seeds`
+it then stays alive to serve seeds, but it does not go back to looking for new
+downloads:
+
+```
+queue start A; queue seed A; queue run --max-seeds 1   # A downloads, then serves
+                                     ^ another shell: queue start B
+                                       B stays queued until the next `queue run`
+```
+
+So `phase=queued` with `desired=run` after a pass has drained is expected, not a lost
+intent: the next `queue run` claims it. To watch a download and a seed active at the
+same time, record both intents before launching the runner — start the download, enable
+the seed, then run once. Making a single pass take new work after the download pool
+drains would change when a pass is finished, and is a runner-lifecycle decision, not a
+TUI detail.
+
 ### Records and state
 
 ```
@@ -805,6 +826,12 @@ semantics cannot drift between the two front ends.
   result for another root, another generation or after navigation is ignored.
 - On completion the view refreshes and re-selects the entry by id. A failure keeps the
   row and shows a redacted, actionable error.
+- `s` saves intent; it does not bind a runner that is already past the download phase.
+  If the pass has drained its downloads and is serving seeds, the new entry stays
+  `queued` until the next run — the row shows exactly that rather than claiming the
+  runner picked it up. Record both intents before launching `run` when you need to
+  watch a download and a seed together (see "Start saves intent; a pass claims work it
+  already knows about").
 
 ### Adding a torrent from the TUI
 
@@ -985,6 +1012,8 @@ before. With it, the runner keeps serving after downloads drain and exits when n
 is left to run: an entry that is blocked (damaged, selective, ineligible) does not keep
 the runner alive, because it is waiting for a person rather than for a slot. A blocked
 seed is not retried automatically and never triggers repair, a fetch or a new capture.
+While it is serving, the pass does **not** take new downloads — see "Start saves intent;
+a pass claims work it already knows about" above.
 
 `SIGINT` cancels both pools, waits for both to close, and preserves intent: a seed
 interrupted this way returns to `idle` and resumes on the next run, while an unseeded
