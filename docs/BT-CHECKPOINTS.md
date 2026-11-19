@@ -2923,9 +2923,10 @@ as the second regime, not as the primary measurement.
 ### Per-piece figures and the extrapolation
 
 From the **default-duration** storage-backed measurements: 512 pieces → ~92 ns/piece,
-2,048 pieces → ~213 ns/piece. At the 100 ms cadence, 2,048 pieces is ~0.44 ms per sample
-(≈0.44 % of the transfer goroutine, ~4.4 % of one core-second per second across ten
-samples); 512 pieces is ~0.047 ms.
+2,048 pieces → ~213 ns/piece. At the 100 ms cadence, 2,048 pieces is ~0.44 ms of sampler
+time per sample, about 0.44 % of the sampling interval; 512 pieces is ~0.047 ms. These
+come from the setup-inflated timings this entry is superseded for — BT-14 has the
+corrected figures.
 
 The 60 GiB example — 60 GiB at 16 MiB pieces ≈ 3,800 pieces → ~0.8 ms per sample — is an
 **extrapolation beyond the largest measured storage-backed case (2,048 pieces)**, using
@@ -3002,12 +3003,13 @@ storage, so they could not answer what the sampler costs on a *real* many-piece 
 
 BT-13's benchmarks called `selectedVerified` in the timed loop without
 `b.ResetTimer()`, so fixture construction (writing and hashing the payload) was charged
-to the measured operation. That inflated every figure and, worse, inflated the
-short-iteration regime far more than the default one — which is where BT-13's "the two
-regimes differ by 2.6–6.5×" came from. `benchSelectedVerified` now restarts the timer
-after setup. With that fix the two regimes agree within about 10 % on the same fixtures
-(512 pieces: 41.5–44.7 µs default vs 40.4–45.9 µs at `-benchtime=500x`), so the regime
-gap is a measurement artefact, not a property of the sampler.
+to the measured operation and inflated both figures. `benchSelectedVerified` now
+restarts the timer after setup. With that fix the corrected timing ranges **overlap for
+all three storage-backed fixtures** (512 pieces: 41.5–44.7 µs default vs 40.4–45.9 µs at
+`-benchtime=500x`; 2,048: 231–236 µs vs 214.8–251.7 µs; 65,536: 5.51–5.79 ms vs
+4.87–5.80 ms), and the multi-fold gap BT-13 reported no longer appears. How much of that
+gap came from setup and how much from anything else is not separately measured, so the
+correction is stated as a range overlap, not as a quantified decomposition.
 
 ### Fixture construction
 
@@ -3032,10 +3034,13 @@ gap is a measurement artefact, not a property of the sampler.
 | `Incomplete65536` | 65,536 | none (deferred) | 3.50–4.05 ms | 13.91 MB | 27 |
 | `Incomplete262144` | 262,144 | none (deferred) | 13.69–14.85 ms | 55.64 MB | 33 |
 
-Per piece: ~81–87 ns at 512, ~113–115 ns at 2,048 and ~84–88 ns at 65,536 — flat within
-about 1.4× across a 128× range of piece counts, so the cost is linear in selected piece
-count and there is no cliff at high counts. The storage-less 65,536 case (53–62 ns per
-piece) is cheaper, but it is not the measured target.
+Per piece: ~81–87 ns at 512, ~113–115 ns at 2,048 and ~84–88 ns at 65,536 — within about
+1.4× across a 128× range of piece counts. That is **consistent with roughly linear
+scaling across the tested fixtures**; it does not establish a general curve, and no
+fixture here tests a small selection taken from a large torrent (these single-file
+fixtures select the whole file, so selected and total piece counts are equal). The
+storage-less 65,536 case (53–62 ns per piece) is cheaper, but it is not the measured
+target.
 
 Fixed-iteration regime, recorded separately:
 `go test ./internal/transfer/bittorrent/ -run '^$' -bench '^BenchmarkSelectedVerifiedComplete' -benchmem -benchtime=500x -count=3`
@@ -3047,11 +3052,16 @@ unchanged: 48.8 kB/10, 245.4 kB/13, 13.91 MB/27).
 Labels: these are extrapolations from single-sample cost, not measured production
 behaviour.
 
-- 2,048 pieces: ~0.23 ms per sample → ~2.3 ms and ~2.45 MB allocated per second (~0.23 %
-  of one core).
-- 65,536 pieces: ~5.6 ms per sample → ~56 ms and ~139 MB allocated per second (~5.6 % of
-  one core).
+- 2,048 pieces: ~0.23 ms of benchmarked sampler time per sample → ~2.3 ms and ~2.45 MB
+  allocated per second, about 0.23 % of the 100 ms sampling interval.
+- 65,536 pieces: ~5.5–5.8 ms per sample → ~55–58 ms and ~139 MB allocated per second,
+  about 5.5–5.8 % of the interval.
+- Four attempts, if the cost is simply added: ~220–232 ms and ~556 MB per second. This is
+  an additive extrapolation, not a concurrency measurement.
 - 262,144 pieces (storage-less, lower bound): ~14.3 ms per sample → ~143 ms/s, ~556 MB/s.
+
+These are sampler wall-clock time and allocation volume. They are not measured core
+utilisation, lock contention or transfer-throughput impact.
 
 Not measured: lock contention (`File.State()` holds `cl.rLock` for the walk), effect on
 transfer throughput, behaviour with several concurrent attempts sampling at once, or any
@@ -3059,17 +3069,19 @@ storage-backed case above 65,536 pieces.
 
 ### Decision
 
-Keep the sampler; document a workload limit.
+Keep the sampler for the intended workload; no production change.
 
 - The intended workload (media torrents, 1–16 MiB pieces, at most a few thousand pieces
-  per file) costs ≤ ~0.24 ms per sample, i.e. ≤ ~0.25 % of the transfer goroutine per
+  per file) costs ≤ ~0.24 ms per sample, about 0.24 % of the 100 ms sampling interval per
   active download. That fits and does not justify changing production code.
-- **Workload limit:** the measured comfortable range ends at a few thousand selected
-  pieces. At 65,536 pieces one attempt spends ~5.6 % of a core sampling and allocates
-  ~139 MB/s; with four concurrent attempts that is ~22 % of a core and ~0.5 GB/s of
-  allocation, which is not acceptable headroom. Treat more than ~32,000 selected pieces
-  per attempt as outside the measured envelope, and do not add sampling on top (ETA
-  smoothing, extra rates) until the walk is bounded.
+- **Measured ceiling:** the largest real-storage fixture measured here has **65,536 total
+  pieces** (one 1 GiB file, 16 KiB pieces). These fixtures select the whole file, so they
+  say nothing about how a small selection from a large torrent scales, and no piece-count
+  cutoff is set here. At 65,536 pieces a sample costs ~5.5–5.8 ms, ~55–58 ms/s and
+  ~139 MB/s of allocation per attempt.
+- No further sampling (ETA smoothing, extra rates) should be added until the walk is
+  bounded: four attempts, if the cost were simply added, would be ~220–232 ms and
+  ~556 MB/s — an additive extrapolation, not a measured concurrency result.
 - **Proposed follow-up (not implemented here):** bound the walk per attempt — cache the
   last verified count and only re-walk pieces whose state changed, or subscribe to the
   client's piece-state changes. It must preserve the verified selected-byte semantics
