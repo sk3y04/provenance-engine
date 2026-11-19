@@ -101,6 +101,10 @@ func syntheticTorrent(b *testing.B, total int64, pieceLen int64) (*at.Torrent, i
 
 func benchSelectedVerified(b *testing.B, files []validatedFile) {
 	b.Helper()
+	// Every caller builds and verifies its fixture before this call, so the timer must
+	// restart here: without it the setup (up to 1 GiB of writes and hashing for the
+	// many-piece case) is charged to the measured operation.
+	b.ResetTimer()
 	b.ReportAllocs()
 	var sink int64
 	for i := 0; i < b.N; i++ {
@@ -165,4 +169,79 @@ func BenchmarkSelectedVerifiedIncomplete262144(b *testing.B) {
 	}
 	b.Logf("files=%d pieces=%d verified=0", len(files), pieces)
 	benchSelectedVerified(b, files)
+}
+
+// writePatternedFile writes size deterministic bytes in chunks: the 1 GiB fixture must
+// not need 1 GiB of RAM to build.
+func writePatternedFile(b *testing.B, path string, size int) {
+	b.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		b.Fatalf("setup: create payload: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	const chunk = 1 << 20
+	buf := make([]byte, chunk)
+	for off := 0; off < size; off += chunk {
+		n := chunk
+		if size-off < n {
+			n = size - off
+		}
+		for i := 0; i < n; i++ {
+			buf[i] = byte((off+i)%251 + 1)
+		}
+		if _, werr := f.Write(buf[:n]); werr != nil {
+			b.Fatalf("setup: write payload at %d: %v", off, werr)
+		}
+	}
+	if serr := f.Sync(); serr != nil {
+		b.Fatalf("setup: sync payload: %v", serr)
+	}
+}
+
+// manyPieceStorageBacked builds a real, fully verified payload with wantPieces pieces
+// and asserts piece count and verified bytes before the timed loop. Unlike the
+// synthetic fixtures it opens the file backend, so every piece it walks has storage
+// backing.
+func manyPieceStorageBacked(b *testing.B, size int, pieceLen int64, wantPieces int) (*at.Torrent, int) {
+	b.Helper()
+	root := b.TempDir()
+	dir := filepath.Join(root, "fixture")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		b.Fatalf("setup: mkdir: %v", err)
+	}
+	writePatternedFile(b, filepath.Join(dir, "data.bin"), size)
+	info := metainfo.Info{PieceLength: pieceLen, Name: "fixture"}
+	if err := info.BuildFromFilePath(dir); err != nil {
+		b.Fatalf("setup: build info: %v", err)
+	}
+	if got := info.NumPieces(); got != wantPieces {
+		b.Fatalf("setup: %d pieces, want %d", got, wantPieces)
+	}
+	mi := &metainfo.MetaInfo{InfoBytes: bencode.MustMarshal(info)}
+	client, err := at.NewClient(ctlConfig(root))
+	if err != nil {
+		b.Fatalf("setup: client: %v", err)
+	}
+	b.Cleanup(func() { _ = client.Close() })
+	tor, err := client.AddTorrent(mi)
+	if err != nil {
+		b.Fatalf("setup: add: %v", err)
+	}
+	if err := tor.VerifyDataContext(b.Context()); err != nil {
+		b.Fatalf("setup: verify: %v", err)
+	}
+	files := benchFilesFor(tor)
+	if got := selectedVerified(files); got != int64(size) {
+		b.Fatalf("setup: verified = %d, want %d: the fixture must be fully verified", got, size)
+	}
+	b.Logf("storage-backed: files=%d pieces=%d verified=%d bytes", len(files), info.NumPieces(), size)
+	return tor, info.NumPieces()
+}
+
+// 65,536 pieces (1 GiB at 16 KiB pieces) with real storage backing, every piece
+// verified: the many-piece case BT-13 could only build without payload.
+func BenchmarkSelectedVerifiedComplete65536(b *testing.B) {
+	tor, _ := manyPieceStorageBacked(b, 1<<30, 16<<10, 65536)
+	benchSelectedVerified(b, benchFilesFor(tor))
 }
