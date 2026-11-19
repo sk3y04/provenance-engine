@@ -77,7 +77,7 @@ func TestSeedPoolJoinsClosingAttempt(t *testing.T) {
 	poolDone := make(chan struct{})
 	go func() {
 		defer close(poolDone)
-		r.runSeeds(ctx, &mu, &sum)
+		r.runSeeds(ctx, &mu, &sum, &runFatal{})
 	}()
 
 	select {
