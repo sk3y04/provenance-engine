@@ -126,6 +126,10 @@ type Entry struct {
 
 	Capture  *CaptureRef `json:"capture,omitempty"`
 	Attempts int         `json:"attempts,omitempty"`
+	// Attempt is the token of the attempt that currently owns the record, or empty
+	// when no attempt is running. A result is applied only if its token still
+	// matches, so a superseded attempt cannot overwrite a newer command.
+	Attempt string `json:"attempt,omitempty"`
 	// LastError is a redacted, actionable reason. It never holds a tracker URL,
 	// a passkey or an absolute path.
 	LastError string `json:"last_error,omitempty"`
@@ -188,8 +192,28 @@ func (s *Store) restrictedDir() string {
 // lock takes the store lock. It must never be held while awaiting peers,
 // transferring, hashing or closing a client: callers use it only around the short
 // read-modify-write of one record.
+//
+// With more than one worker, a claim and a result write collide regularly. The
+// lock is short, so a bounded retry is the right answer: failing the claim instead
+// would park the coordinator on a transient condition, and spinning without a
+// bound would burn CPU on a stuck owner.
 func (s *Store) lock() (*filelock.Lock, error) {
-	return filelock.TryAcquire(filepath.Join(s.root, filepath.FromSlash(queueDirName), "store"))
+	path := filepath.Join(s.root, filepath.FromSlash(queueDirName), "store")
+	backoff := time.Millisecond
+	for attempt := 0; attempt < 12; attempt++ {
+		l, err := filelock.TryAcquire(path)
+		if err == nil {
+			return l, nil
+		}
+		if !errors.Is(err, filelock.ErrLocked) {
+			return nil, err
+		}
+		time.Sleep(backoff)
+		if backoff < 20*time.Millisecond {
+			backoff *= 2
+		}
+	}
+	return nil, fmt.Errorf("%w: the queue store is locked by another process; retry", ErrStoreBusy)
 }
 
 // Add creates an entry, or returns the existing one when the same capture intent
@@ -210,9 +234,6 @@ func (s *Store) Add(req AddRequest) (Entry, bool, error) {
 
 	l, err := s.lock()
 	if err != nil {
-		if errors.Is(err, filelock.ErrLocked) {
-			return zero, false, fmt.Errorf("%w: the queue store is locked by another process; retry", ErrStoreBusy)
-		}
 		return zero, false, err
 	}
 	defer func() { _ = l.Release() }()
@@ -281,6 +302,16 @@ func sortedSelection(sel []string) []string {
 	return out
 }
 
+// newAttemptToken mints an attempt id. It is not secret; it only has to be unique
+// within a queue.
+func newAttemptToken() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("a-%d", time.Now().UnixNano())
+	}
+	return "a-" + hex.EncodeToString(b[:])
+}
+
 func newEntryID(seq uint64) string {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -341,9 +372,6 @@ func (s *Store) Get(id string) (Entry, error) {
 func (s *Store) Update(id string, mutate func(*Entry) error) (Entry, error) {
 	l, err := s.lock()
 	if err != nil {
-		if errors.Is(err, filelock.ErrLocked) {
-			return Entry{}, fmt.Errorf("%w: the queue store is locked by another process; retry", ErrStoreBusy)
-		}
 		return Entry{}, err
 	}
 	defer func() { _ = l.Release() }()

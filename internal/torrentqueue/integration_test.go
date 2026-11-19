@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,10 +123,12 @@ func enqueue(t *testing.T, store *Store, seed *loopbackSeeder, selection ...stri
 	return entry
 }
 
-func startEntry(t *testing.T, store *Store, id string) {
+func startEntry(t *testing.T, store *Store, ids ...string) {
 	t.Helper()
-	if _, err := store.Update(id, func(e *Entry) error { e.Desired = DesiredRun; return nil }); err != nil {
-		t.Fatal(err)
+	for _, id := range ids {
+		if _, err := store.Update(id, func(e *Entry) error { e.Desired = DesiredRun; return nil }); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -492,4 +495,231 @@ func patternedBytes(n int, seed byte) []byte {
 		out[i] = byte(x >> 24)
 	}
 	return out
+}
+
+// countingAdapter wraps the real backend and records peak concurrency, so overlap
+// is observed rather than inferred from timing.
+type countingAdapter struct {
+	inner   Adapter
+	active  int32
+	maxSeen int32
+}
+
+func (c *countingAdapter) Run(ctx context.Context, req Request) (Outcome, error) {
+	cur := atomic.AddInt32(&c.active, 1)
+	for {
+		max := atomic.LoadInt32(&c.maxSeen)
+		if cur <= max || atomic.CompareAndSwapInt32(&c.maxSeen, max, cur) {
+			break
+		}
+	}
+	defer atomic.AddInt32(&c.active, -1)
+	return c.inner.Run(ctx, req)
+}
+
+func (c *countingAdapter) Adopt(root, jobID string, selection []string) (CaptureRef, bool) {
+	return c.inner.Adopt(root, jobID, selection)
+}
+
+// TestQueueRealConcurrentSameName is acceptance 4's first half: two torrents that
+// share a display name and a relative path but not their bytes transfer with
+// overlapping attempts and stay entirely separate.
+func TestQueueRealConcurrentSameName(t *testing.T) {
+	filesA := map[string][]byte{"a.bin": patternedBytes(200<<10, 43)}
+	filesB := map[string][]byte{"a.bin": patternedBytes(200<<10, 47)}
+	seedA := newLoopbackSeeder(t, "fixture", filesA, 0)
+	seedB := newLoopbackSeeder(t, "fixture", filesB, 0)
+	if seedA.jobID() == seedB.jobID() {
+		t.Fatal("the two fixtures share an infohash; the test proves nothing")
+	}
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := enqueue(t, store, seedA, "fixture/a.bin")
+	b := enqueue(t, store, seedB, "fixture/a.bin")
+	if a.Workspace == b.Workspace {
+		t.Fatalf("two identities share a workspace: %s", a.Workspace)
+	}
+	startEntry(t, store, a.ID, b.ID)
+
+	counter := &countingAdapter{inner: realAdapter()}
+	sum, err := NewRunner(store, counter, Options{MaxActive: 2, PollInterval: 10 * time.Millisecond}).Run(context.Background())
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if sum.Completed != 2 || sum.Failed != 0 || sum.Blocked != 0 {
+		t.Fatalf("summary = %+v", sum)
+	}
+	if max := atomic.LoadInt32(&counter.maxSeen); max != 2 {
+		t.Errorf("peak concurrent attempts = %d, want 2", max)
+	}
+
+	for _, tc := range []struct {
+		entry Entry
+		want  []byte
+	}{
+		{a, filesA["a.bin"]},
+		{b, filesB["a.bin"]},
+	} {
+		got, gerr := store.Get(tc.entry.ID)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		if got.Phase != PhaseCompleted || got.Capture == nil {
+			t.Fatalf("%s = %q capture %+v (%s)", tc.entry.ID, got.Phase, got.Capture, got.LastError)
+		}
+		ws := filepath.Join(root, filepath.FromSlash(got.Workspace))
+		payload, rerr := os.ReadFile(filepath.Join(ws, "fixture", "a.bin"))
+		if rerr != nil {
+			t.Fatalf("%s payload: %v", tc.entry.ID, rerr)
+		}
+		if string(payload) != string(tc.want) {
+			t.Errorf("%s payload does not match its fixture", tc.entry.ID)
+		}
+		db := filepath.Join(ws, ".provenance", "completion", ".torrent.db")
+		if _, serr := os.Stat(db); serr != nil {
+			t.Errorf("%s has no completion database at %s", tc.entry.ID, db)
+		}
+		if n := runManifestCount(t, ws); n != 1 {
+			t.Errorf("%s: %d run manifests, want 1", tc.entry.ID, n)
+		}
+	}
+	gotA, _ := store.Get(a.ID)
+	gotB, _ := store.Get(b.ID)
+	if gotA.Capture.Key == gotB.Capture.Key {
+		t.Error("two distinct payloads produced one capture key")
+	}
+	if gotA.Workspace == gotB.Workspace {
+		t.Error("both jobs recorded the same workspace")
+	}
+}
+
+// TestQueueRealSameWorkspaceRace is acceptance 4's second half: two entries land on
+// one canonical workspace. The queue id is not a workspace lock, so the loser backs
+// off; a later drain adopts the accepted capture instead of writing a second one or
+// silently taking over a different selection.
+func TestQueueRealSameWorkspaceRace(t *testing.T) {
+	files := map[string][]byte{"a.bin": patternedBytes(150<<10, 53), "b.bin": patternedBytes(70<<10, 59)}
+	seed := newLoopbackSeeder(t, "fixture", files, 0)
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Same torrent, two source forms: a magnet and a local .torrent. Both resolve to
+	// bt-<v1>, so both want the same workspace.
+	torrentPath := filepath.Join(t.TempDir(), "fixture.torrent")
+	f, cerr := os.Create(torrentPath)
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
+	if werr := seed.mi.Write(f); werr != nil {
+		t.Fatal(werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	first, _, err := store.Add(AddRequest{
+		Source: Source{Kind: "magnet", Magnet: seed.magnet()}, RawSource: seed.magnet(),
+		Peers: []string{seed.addr}, Discovery: "direct",
+		Selection: []string{"fixture/a.bin"}, JobID: seed.jobID(),
+		InfoHash:  strings.TrimPrefix(seed.jobID(), "bt-"),
+		Workspace: ".provenance/torrent/jobs/" + seed.jobID(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, duplicate, err := store.Add(AddRequest{
+		Source: Source{Kind: "file", Path: torrentPath}, RawSource: torrentPath,
+		Peers: []string{seed.addr}, Discovery: "direct",
+		Selection: []string{"fixture/a.bin"}, JobID: seed.jobID(),
+		InfoHash:  strings.TrimPrefix(seed.jobID(), "bt-"),
+		Workspace: ".provenance/torrent/jobs/" + seed.jobID(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same job and same selection is the same capture intent: the store converges
+	// them instead of queueing a second writer.
+	if !duplicate || second.ID != first.ID {
+		t.Fatalf("duplicate add created %s instead of returning %s", second.ID, first.ID)
+	}
+	startEntry(t, store, first.ID)
+
+	// A conflicting selection for the same torrent is a different intent and does
+	// create a second entry.
+	conflict := seed.magnet()
+	clash, dup2, err := store.Add(AddRequest{
+		Source: Source{Kind: "magnet", Magnet: conflict}, RawSource: conflict,
+		Peers: []string{seed.addr}, Discovery: "direct",
+		Selection: []string{"fixture/b.bin"}, JobID: seed.jobID(),
+		InfoHash:  strings.TrimPrefix(seed.jobID(), "bt-"),
+		Workspace: ".provenance/torrent/jobs/" + seed.jobID(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dup2 || clash.ID == first.ID {
+		t.Fatalf("a differing selection was deduplicated onto %s", first.ID)
+	}
+	startEntry(t, store, clash.ID)
+
+	sum, err := NewRunner(store, realAdapter(), Options{MaxActive: 2, PollInterval: 10 * time.Millisecond, Backoff: time.Minute}).Run(context.Background())
+	if err != nil {
+		t.Fatalf("first drain: %v", err)
+	}
+	winner, _ := store.Get(first.ID)
+	if winner.Phase != PhaseCompleted || winner.Capture == nil {
+		t.Fatalf("the accepted intent did not complete: %q %+v (%s)", winner.Phase, winner.Capture, winner.LastError)
+	}
+	loser, _ := store.Get(clash.ID)
+	switch loser.Phase {
+	case PhaseBlocked, PhaseFailed:
+	default:
+		t.Fatalf("the conflicting entry ended %q, want blocked (busy) or failed (selection)", loser.Phase)
+	}
+
+	// Second drain: whatever the loser's path, it must not produce a second capture
+	// for this workspace, and a blocked loser is adopted rather than refetched.
+	if _, uerr := store.Update(clash.ID, func(e *Entry) error {
+		e.NotBefore = time.Time{}
+		e.Phase = PhaseQueued
+		e.Desired = DesiredRun
+		e.Attempt = ""
+		return nil
+	}); uerr != nil {
+		t.Fatal(uerr)
+	}
+	sum, err = NewRunner(store, realAdapter(), Options{MaxActive: 1, PollInterval: 10 * time.Millisecond, Backoff: time.Minute}).Run(context.Background())
+	if err != nil {
+		t.Fatalf("second drain: %v", err)
+	}
+	final, _ := store.Get(clash.ID)
+	if final.Phase == PhaseCompleted {
+		// Completing is only acceptable if it adopted the same capture.
+		if final.Capture == nil || final.Capture.Key != winner.Capture.Key {
+			t.Fatalf("a conflicting selection completed with a different capture: %+v", final.Capture)
+		}
+	}
+	ws := filepath.Join(root, filepath.FromSlash(winner.Workspace))
+	if n := runManifestCount(t, ws); n != 1 {
+		t.Errorf("%d run manifests, want exactly 1 for this workspace", n)
+	}
+	if n := countCaptureItems(t, ws); n != 1 {
+		t.Errorf("%d capture items, want 1", n)
+	}
+	if len(sum.Ran) > 1 {
+		t.Errorf("second drain claimed %v", sum.Ran)
+	}
+	// The conflicting selection never overwrote the job's recorded selection.
+	job, jerr := os.ReadFile(filepath.Join(ws, filepath.FromSlash(".provenance/torrent/"+seed.jobID()+".job.json")))
+	if jerr != nil {
+		t.Fatal(jerr)
+	}
+	if !strings.Contains(string(job), "fixture/a.bin") || strings.Contains(string(job), "fixture/b.bin") {
+		t.Errorf("job record selection changed: %s", job)
+	}
 }

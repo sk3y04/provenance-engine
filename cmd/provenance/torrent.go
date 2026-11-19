@@ -26,6 +26,7 @@ var (
 	flagTorrentTimeout   time.Duration
 	flagTorrentJSON      bool
 	flagTorrentSeed      bool
+	flagQueueMaxActive   int
 	flagTorrentDiscovery string
 )
 
@@ -422,8 +423,10 @@ func queueRetryCmd() *cobra.Command {
 func queueRunCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run",
-		Short: "Drain the queue in the foreground with one worker",
-		Long: "Runs runnable entries in queue order, one at a time, then exits. This is not a daemon:\n" +
+		Short: "Drain the queue in the foreground",
+		Long: "Claims runnable entries in queue order and runs up to --max-active of them, then exits.\n" +
+			"This is not a daemon: when nothing is running and nothing is eligible it returns. A pause\n" +
+			"frees its slot only when the job's client has closed, not when the request is recorded:\n" +
 			"when there is nothing left to do it returns. SIGINT stops the active job, records it as\n" +
 			"an interruption (not a pause) and leaves every entry's intent intact.",
 		Args: cobra.NoArgs,
@@ -431,13 +434,19 @@ func queueRunCmd() *cobra.Command {
 		// flag table.
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Reject an explicit zero: the runner's zero value means "default", so the
+			// flag has to refuse 0 itself instead of silently meaning 1.
+			if flagQueueMaxActive < 1 {
+				return fmt.Errorf("--max-active must be at least 1, got %d", flagQueueMaxActive)
+			}
 			store, err := queueStore()
 			if err != nil {
 				return err
 			}
 			// --timeout bounds each attempt; the queue has no global deadline so one
 			// slow entry cannot consume the whole run.
-			runner := torrentqueue.NewRunner(store, torrentqueue.Adapter{Timeout: flagTorrentTimeout}, torrentqueue.Options{Log: os.Stdout})
+			runner := torrentqueue.NewRunner(store, torrentqueue.Adapter{Timeout: flagTorrentTimeout},
+				torrentqueue.Options{MaxActive: flagQueueMaxActive, Log: os.Stdout})
 			sum, rerr := runner.Run(cmd.Context())
 			if rerr != nil {
 				return rerr
@@ -450,6 +459,7 @@ func queueRunCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().IntVar(&flagQueueMaxActive, "max-active", 1, "Concurrent attempts to run at once (1-32)")
 	return cmd
 }
 

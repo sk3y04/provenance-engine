@@ -686,13 +686,52 @@ addresses, live in the restricted 0600 record and are handed only to the backend
 per entry and used again on every attempt: a `direct` or `tracker` entry never
 falls back to public discovery on restart.
 
+### Concurrency (`--max-active`)
+
+`queue run --max-active N` runs up to N attempts at once. The default is 1, `0` is
+refused by the flag (the runner's zero value would otherwise read as "default"),
+and anything above 32 is refused as an unreasonable number of clients, sockets,
+completion databases and payload write paths for one foreground process.
+
+```
+provenance torrent queue run --max-active 2
+queued-000001-…: running (bt-…d)      # two claims, FIFO
+queued-000002-…: running (bt-…e)
+queued-000001-…: failed (…)           # its slot frees here
+queued-000003-…: running (bt-…f)      # so the third can start
+```
+
+- **A slot is one active attempt**, from resolution through the client closing and
+  the workspace lock being released. A pause request does not free a slot: the entry
+  is `stopping` until the attempt returns, and only then `paused`. A published
+  capture does not free it either - the attempt still has to close.
+- **FIFO applies to claims, not to completion.** The coordinator claims the lowest
+  eligible sequence number; whichever attempt finishes first frees a slot for the
+  next claim.
+- **Each attempt has its own cancellation and its own token.** Pausing one entry
+  cancels only its attempt. A result is persisted only if the record still carries
+  that attempt's token, so a result arriving after a retry or a pause cannot
+  overwrite the newer command; it is counted as stale instead.
+- **Drained** means nothing is running and nothing is eligible. An entry blocked on
+  a future `not_before`, a failed entry awaiting `retry`, and a paused entry are all
+  ineligible, so a drain ends instead of polling. No busy loop: the coordinator
+  parks on a completion or on the shutdown signal.
+- **Shutdown** stops claiming, cancels every active attempt, waits for each worker to
+  return, and only then exits - a worker can never still be mutating a record when
+  `queue run` returns. Intent is preserved, so a restart resumes interrupted work and
+  an explicitly paused entry stays paused.
+- **The workspace lock remains the final authority.** Two entries can resolve to one
+  workspace; the loser gets `ErrWorkspaceBusy`, backs off with `not_before`, and a
+  later drain adopts the accepted capture instead of writing a second one or taking
+  over a different selection.
+
 ### What this slice does not do
 
-No seeding after completion (a completed entry releases the only worker slot), no
-multi-worker scheduling, no bandwidth limits, no destructive removal, no cancel
-command (delete the entry file by hand or wait for BT-09), no legacy migration, and
-no live telemetry: `list` prints recorded state, plus whether the runner lock is
-currently held.
+No seeding after completion, no aggregate bandwidth or peer limits, no priority or
+starvation policy beyond FIFO eligibility, no destructive removal, no cancel command,
+no legacy migration, and no live telemetry: `list` prints recorded state, plus whether
+the runner lock is currently held. Concurrency is bounded per attempt, not per byte:
+each slot is a full client.
 
 ## Offline recheck
 

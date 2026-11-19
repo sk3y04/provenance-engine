@@ -4,6 +4,12 @@ package torrentqueue
 // loop: it drains the queue once and returns, which is what makes the lifecycle
 // observable and testable without a daemon.
 //
+// Concurrency (BT-08, first slice): one coordinator claims eligible entries in
+// queue order and dispatches up to Options.MaxActive attempts. A slot is an active
+// attempt - from resolution through the client closing and the workspace lock
+// being released - so a slot is never freed early because a pause was requested or
+// a capture was published. FIFO applies to claims, not to completion.
+//
 // Locks, and what each one is for:
 //
 //	runner.lock   one runner per queue, held for the whole run (flock, so process
@@ -22,7 +28,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -43,7 +48,16 @@ var (
 	// ErrWorkspaceBusy is a retryable condition: the job's workspace is owned by
 	// another process, so this entry is deferred with a bounded backoff.
 	ErrWorkspaceBusy = errors.New("job workspace is busy")
+	// errStaleAttempt means the result belongs to an attempt that has been
+	// superseded (retried, paused and restarted, or cancelled), so applying it
+	// would overwrite a newer user command.
+	errStaleAttempt = errors.New("attempt superseded")
 )
+
+// MaxActiveLimit bounds --max-active. Above this a single foreground drain stops
+// being a bounded resource user: every attempt costs a client, sockets, a
+// completion database and a payload write path.
+const MaxActiveLimit = 32
 
 // Request is one unit of work handed to the transfer backend.
 type Request struct {
@@ -92,8 +106,39 @@ type Options struct {
 	PollInterval time.Duration
 	// Backoff is how long a blocked entry waits before it may be claimed again.
 	Backoff time.Duration
+	// MaxActive is the number of concurrent attempts. Zero means the default of 1;
+	// negative is invalid and values above MaxActiveLimit are refused.
+	MaxActive int
 	// Log receives one line per transition. Nil discards.
 	Log io.Writer
+	// BeforeResultPersist runs after a backend returns and before its result is
+	// persisted. It exists so a test can hold a result at the exact
+	// publish-before-queue-update boundary; it is nil in production.
+	BeforeResultPersist func(entryID string)
+}
+
+// Validate rejects a configuration instead of silently clamping it.
+func (o Options) Validate() error {
+	if o.MaxActive < 0 {
+		return fmt.Errorf("max-active must be at least 1, got %d", o.MaxActive)
+	}
+	if o.MaxActive > MaxActiveLimit {
+		return fmt.Errorf("max-active %d is too high: the limit is %d concurrent attempts in one runner", o.MaxActive, MaxActiveLimit)
+	}
+	if o.PollInterval < 0 {
+		return errors.New("poll interval must not be negative")
+	}
+	if o.Backoff < 0 {
+		return errors.New("backoff must not be negative")
+	}
+	return nil
+}
+
+func (o Options) maxActive() int {
+	if o.MaxActive < 1 {
+		return 1
+	}
+	return o.MaxActive
 }
 
 func (o Options) pollInterval() time.Duration {
@@ -130,16 +175,21 @@ type Summary struct {
 	Failed    int
 	Blocked   int
 	Paused    int
+	// Stale counts attempt results that arrived after the attempt was superseded.
+	Stale int
 	// Remaining counts entries that are still runnable or blocked after the drain.
 	Remaining int
 }
 
-// Run drains the queue: reconcile first, then claim and run entries in queue order
-// until nothing runnable is left or ctx is cancelled. Cancelling ctx (SIGINT) stops
-// the active job, records it as interrupted-by-shutdown, and preserves every
-// entry's desired state.
+// Run drains the queue: reconcile first, then claim and dispatch entries in queue
+// order until nothing is running and nothing is claimable, or ctx is cancelled.
+// Cancelling ctx (SIGINT) stops claiming, cancels every active attempt, waits for
+// the workers to return, and preserves every entry's desired state.
 func (r *Runner) Run(ctx context.Context) (Summary, error) {
 	var sum Summary
+	if err := r.opts.Validate(); err != nil {
+		return sum, err
+	}
 	l, err := filelock.TryAcquire(filepath.Join(r.store.root, filepath.FromSlash(queueDirName), "runner"))
 	if err != nil {
 		if errors.Is(err, filelock.ErrLocked) {
@@ -154,30 +204,113 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 		return sum, err
 	}
 	sum.Completed += adopted
+
+	limit := r.opts.maxActive()
+	var mu sync.Mutex
+	done := make(chan string, limit)
+	inflight := map[string]context.CancelFunc{}
+	active := 0
+
+	// take releases the slot of one finished attempt: with wait=false only if one is
+	// already available, otherwise it parks until one finishes (or the run is
+	// cancelled). It takes exactly one, so a finished attempt frees its slot for the
+	// next claim instead of the coordinator waiting for every active attempt.
+	take := func(wait bool) bool {
+		if active == 0 {
+			return false
+		}
+		var id string
+		if wait {
+			select {
+			case id = <-done:
+			case <-ctx.Done():
+				return false
+			}
+		} else {
+			select {
+			case id = <-done:
+			default:
+				return false
+			}
+		}
+		active--
+		delete(inflight, id)
+		return true
+	}
+
 	for {
+		for take(false) {
+		}
 		if ctx.Err() != nil {
-			return sum, nil
+			break
 		}
-		entry, ok, nerr := r.next()
-		if nerr != nil {
-			return sum, nerr
+		// Claim in FIFO order, skipping anything already in flight. A claim that
+		// loses a race with another writer is skipped for this round rather than
+		// retried in a loop.
+		skipped := map[string]bool{}
+		for active < limit {
+			entry, ok, nerr := r.nextExcept(inflight, skipped)
+			if nerr != nil {
+				r.shutdown(inflight, done, active)
+				return sum, nerr
+			}
+			if !ok {
+				break
+			}
+			claimed, cerr := r.claim(entry)
+			if cerr != nil {
+				r.logf("%s: claim failed (%v); trying the next entry this round", entry.ID, cerr)
+				skipped[entry.ID] = true
+				continue
+			}
+			attemptCtx, cancel := context.WithCancel(ctx)
+			inflight[claimed.ID] = cancel
+			active++
+			mu.Lock()
+			sum.Ran = append(sum.Ran, claimed.ID)
+			mu.Unlock()
+			go func(e Entry, token string, c context.Context) {
+				defer func() { done <- e.ID }()
+				r.runEntry(c, e, token, &mu, &sum)
+			}(claimed, claimed.Attempt, attemptCtx)
 		}
-		if !ok {
-			return sum, nil
+		if active == 0 {
+			// Drained: nothing is running and nothing is eligible. An entry blocked
+			// on a future not_before is not eligible, so a drain ends instead of
+			// polling until the backoff expires - the same contract as the
+			// single-worker runner.
+			break
 		}
-		sum.Ran = append(sum.Ran, entry.ID)
-		r.runEntry(ctx, entry, &sum)
+		take(true)
+	}
+	r.shutdown(inflight, done, active)
+	return sum, nil
+}
+
+// shutdown cancels every active attempt and waits for the workers to return, so
+// Run never returns while a worker could still mutate a record.
+func (r *Runner) shutdown(inflight map[string]context.CancelFunc, done chan string, active int) {
+	for id, cancel := range inflight {
+		cancel()
+		delete(inflight, id)
+	}
+	for ; active > 0; active-- {
+		<-done
 	}
 }
 
-// next returns the first runnable entry in deterministic queue order.
-func (r *Runner) next() (Entry, bool, error) {
+// nextExcept returns the first runnable entry in queue order that is not already
+// in flight and was not skipped this round.
+func (r *Runner) nextExcept(inflight map[string]context.CancelFunc, skipped map[string]bool) (Entry, bool, error) {
 	entries, err := r.store.List()
 	if err != nil {
 		return Entry{}, false, err
 	}
 	now := time.Now()
 	for _, e := range entries {
+		if _, busy := inflight[e.ID]; busy || skipped[e.ID] {
+			continue
+		}
 		// Completed work is done; a failed entry needs an explicit retry, so it is
 		// never re-claimed automatically. Both rules keep a drain from looping on
 		// one job while later entries wait behind it.
@@ -190,6 +323,40 @@ func (r *Runner) next() (Entry, bool, error) {
 		return e, true, nil
 	}
 	return Entry{}, false, nil
+}
+
+// claim takes ownership of one attempt: it re-reads the record under the store
+// lock, re-checks eligibility, and stamps a fresh attempt token so a result from a
+// superseded attempt cannot overwrite a newer one.
+func (r *Runner) claim(entry Entry) (Entry, error) {
+	token := newAttemptToken()
+	return r.store.Update(entry.ID, func(e *Entry) error {
+		if e.Desired != DesiredRun {
+			return errors.New("entry is no longer runnable")
+		}
+		if e.Phase == PhaseCompleted || e.Phase == PhaseFailed {
+			return errors.New("entry is no longer runnable")
+		}
+		if e.Phase == PhaseBlocked && !e.NotBefore.IsZero() && time.Now().Before(e.NotBefore) {
+			return errors.New("entry is still backing off")
+		}
+		e.Phase = PhaseRunning
+		e.Attempts++
+		e.Attempt = token
+		e.Note = ""
+		e.LastError = ""
+		return nil
+	})
+}
+
+// updateAttempt applies a mutation only to the attempt that produced it.
+func (r *Runner) updateAttempt(id, token string, mutate func(*Entry) error) (Entry, error) {
+	return r.store.Update(id, func(e *Entry) error {
+		if e.Attempt != token {
+			return errStaleAttempt
+		}
+		return mutate(e)
+	})
 }
 
 // reconcile brings recorded observations back in line with reality after a
@@ -207,6 +374,7 @@ func (r *Runner) reconcile() (int, error) {
 				if _, uerr := r.store.Update(e.ID, func(x *Entry) error {
 					x.Capture = &ref
 					x.Phase = PhaseCompleted
+					x.Attempt = ""
 					x.LastError = ""
 					x.Note = "adopted a capture published before the queue recorded it"
 					return nil
@@ -226,6 +394,7 @@ func (r *Runner) reconcile() (int, error) {
 			}
 			if _, uerr := r.store.Update(e.ID, func(x *Entry) error {
 				x.Phase = phase
+				x.Attempt = ""
 				x.Note = "interrupted while the runner was not running; desired state kept"
 				return nil
 			}); uerr != nil {
@@ -237,25 +406,10 @@ func (r *Runner) reconcile() (int, error) {
 	return adopted, nil
 }
 
-// runEntry executes one entry and records the outcome. It never returns an error:
-// a failed entry is a recorded state, not a reason to stop draining, so one bad
-// job cannot block the ones behind it.
-func (r *Runner) runEntry(ctx context.Context, entry Entry, sum *Summary) {
-	entry, err := r.store.Update(entry.ID, func(e *Entry) error {
-		if e.Desired == DesiredPaused {
-			return errors.New("entry was paused before it started")
-		}
-		e.Phase = PhaseRunning
-		e.Attempts++
-		e.Note = ""
-		e.LastError = ""
-		return nil
-	})
-	if err != nil {
-		// Paused between selection and claim: nothing ran, nothing to report.
-		sum.Paused++
-		return
-	}
+// runEntry executes one attempt and records the outcome. It never returns an
+// error: a failed entry is a recorded state, not a reason to stop draining, so one
+// bad job cannot block the ones behind it.
+func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sync.Mutex, sum *Summary) {
 	r.logf("%s: running (%s)", entry.ID, entry.JobID)
 
 	raw, peers, rerr := r.store.RestrictedSource(entry.ID)
@@ -281,15 +435,21 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, sum *Summary) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		r.watchPause(runCtx, entry.ID, cancel, &paused)
+		r.watchPause(runCtx, entry.ID, token, cancel, &paused)
 	}()
 
 	out, runErr := r.transfer.Run(runCtx, req)
+	// Cancelling and waiting here is what makes the slot release honest: Run only
+	// returns once the backend has closed its client and released the workspace.
 	cancel()
 	wg.Wait()
 
+	if r.opts.BeforeResultPersist != nil {
+		r.opts.BeforeResultPersist(entry.ID)
+	}
+
 	if runErr == nil {
-		r.finishCompleted(entry.ID, out, sum)
+		r.finishCompleted(entry.ID, token, out, mu, sum)
 		return
 	}
 
@@ -301,7 +461,7 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, sum *Summary) {
 			jobID = entry.JobID
 		}
 		if ref, ok := r.transfer.Adopt(r.store.root, jobID, entry.Selection); ok {
-			if _, uerr := r.store.Update(entry.ID, func(e *Entry) error {
+			if _, uerr := r.updateAttempt(entry.ID, token, func(e *Entry) error {
 				e.JobID = jobID
 				e.Capture = &ref
 				e.Phase = PhaseCompleted
@@ -313,10 +473,10 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, sum *Summary) {
 				e.LastError = ""
 				return nil
 			}); uerr != nil {
-				sum.Failed++
+				r.recordStale(entry.ID, uerr, mu, sum)
 				return
 			}
-			sum.Completed++
+			r.count(mu, sum, func(s *Summary) { s.Completed++ })
 			r.logf("%s: adopted capture after failure: %s", entry.ID, ref.Key)
 			return
 		}
@@ -326,20 +486,20 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, sum *Summary) {
 	switch {
 	case paused.load():
 		// The user asked for this. Record it as a pause, not a failure.
-		if _, uerr := r.store.Update(entry.ID, func(e *Entry) error {
+		if _, uerr := r.updateAttempt(entry.ID, token, func(e *Entry) error {
 			e.Phase = PhasePaused
 			e.Note = "paused at request; the client closed and the workspace was released"
 			return nil
-		}); uerr == nil {
-			sum.Paused++
-			r.logf("%s: paused", entry.ID)
-		} else {
-			sum.Failed++
+		}); uerr != nil {
+			r.recordStale(entry.ID, uerr, mu, sum)
+			return
 		}
+		r.count(mu, sum, func(s *Summary) { s.Paused++ })
+		r.logf("%s: paused", entry.ID)
 	case errors.Is(runErr, context.Canceled) && ctx.Err() != nil:
 		// Runner shutdown. Desired state is the user's intent and is untouched, so
 		// the next runner resumes instead of reading this as a pause.
-		if _, uerr := r.store.Update(entry.ID, func(e *Entry) error {
+		if _, uerr := r.updateAttempt(entry.ID, token, func(e *Entry) error {
 			e.Phase = PhaseQueued
 			if e.Desired == DesiredPaused {
 				e.Phase = PhasePaused
@@ -347,41 +507,42 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, sum *Summary) {
 			e.Note = "interrupted by runner shutdown; intent preserved"
 			return nil
 		}); uerr != nil {
-			sum.Failed++
+			r.recordStale(entry.ID, uerr, mu, sum)
+			return
 		}
 	case errors.Is(runErr, ErrWorkspaceBusy):
 		backoff := r.opts.backoff()
-		if _, uerr := r.store.Update(entry.ID, func(e *Entry) error {
+		if _, uerr := r.updateAttempt(entry.ID, token, func(e *Entry) error {
 			e.Phase = PhaseBlocked
 			e.LastError = reason
 			e.NotBefore = time.Now().UTC().Add(backoff)
 			e.Note = fmt.Sprintf("retryable: workspace busy; retry after %s or run the queue again", backoff)
 			return nil
-		}); uerr == nil {
-			sum.Blocked++
-			r.logf("%s: blocked (%s)", entry.ID, reason)
-		} else {
-			sum.Failed++
+		}); uerr != nil {
+			r.recordStale(entry.ID, uerr, mu, sum)
+			return
 		}
+		r.count(mu, sum, func(s *Summary) { s.Blocked++ })
+		r.logf("%s: blocked (%s)", entry.ID, reason)
 	default:
-		if _, uerr := r.store.Update(entry.ID, func(e *Entry) error {
+		if _, uerr := r.updateAttempt(entry.ID, token, func(e *Entry) error {
 			e.Phase = PhaseFailed
 			e.LastError = reason
 			e.Note = "failed; fix the cause and run `torrent queue retry` to try again"
 			return nil
-		}); uerr == nil {
-			sum.Failed++
-			r.logf("%s: failed (%s)", entry.ID, reason)
-		} else {
-			sum.Failed++
+		}); uerr != nil {
+			r.recordStale(entry.ID, uerr, mu, sum)
+			return
 		}
+		r.count(mu, sum, func(s *Summary) { s.Failed++ })
+		r.logf("%s: failed (%s)", entry.ID, reason)
 	}
 }
 
 // finishCompleted records a successful run, attaching the canonical identity only
 // now that the backend has validated it.
-func (r *Runner) finishCompleted(id string, out Outcome, sum *Summary) {
-	if _, err := r.store.Update(id, func(e *Entry) error {
+func (r *Runner) finishCompleted(id, token string, out Outcome, mu *sync.Mutex, sum *Summary) {
+	if _, err := r.updateAttempt(id, token, func(e *Entry) error {
 		e.JobID = out.JobID
 		e.InfoHash = out.InfoHash
 		e.InfoHashV2 = out.InfoHashV2
@@ -397,18 +558,36 @@ func (r *Runner) finishCompleted(id string, out Outcome, sum *Summary) {
 		}
 		return nil
 	}); err != nil {
-		sum.Failed++
+		r.recordStale(id, err, mu, sum)
 		return
 	}
-	sum.Completed++
+	r.count(mu, sum, func(s *Summary) { s.Completed++ })
 	r.logf("%s: completed (%s)", id, out.CaptureKey)
+}
+
+// recordStale counts a result that arrived too late to apply. It is not a failure:
+// the record was already moved on by a newer command or attempt.
+func (r *Runner) recordStale(id string, err error, mu *sync.Mutex, sum *Summary) {
+	if errors.Is(err, errStaleAttempt) {
+		r.count(mu, sum, func(s *Summary) { s.Stale++ })
+		r.logf("%s: stale attempt result ignored", id)
+		return
+	}
+	r.count(mu, sum, func(s *Summary) { s.Failed++ })
+}
+
+func (r *Runner) count(mu *sync.Mutex, sum *Summary, fn func(*Summary)) {
+	mu.Lock()
+	fn(sum)
+	mu.Unlock()
 }
 
 // watchPause polls recorded intent while a job runs. A pause request switches the
 // entry to "stopping" (the client may still be closing) and cancels the worker;
 // the phase only becomes "paused" once Run has returned and the workspace lock is
-// released.
-func (r *Runner) watchPause(ctx context.Context, id string, cancel context.CancelFunc, paused *syncFlag) {
+// released. It only ever acts on its own attempt: a superseded attempt stops
+// watching without touching the record.
+func (r *Runner) watchPause(ctx context.Context, id, token string, cancel context.CancelFunc, paused *syncFlag) {
 	ticker := time.NewTicker(r.opts.pollInterval())
 	defer ticker.Stop()
 	for {
@@ -421,7 +600,7 @@ func (r *Runner) watchPause(ctx context.Context, id string, cancel context.Cance
 				continue
 			}
 			paused.set(true)
-			if _, uerr := r.store.Update(id, func(e *Entry) error {
+			if _, uerr := r.updateAttempt(id, token, func(e *Entry) error {
 				if e.Phase == PhaseRunning {
 					e.Phase = PhaseStopping
 					e.Note = "pause requested; waiting for the client to close"
@@ -528,6 +707,3 @@ func RunnerHeld(root string) bool {
 	_ = l.Release()
 	return false
 }
-
-// ensure os is used even when the file is trimmed by build tags in the future.
-var _ = os.Getenv
