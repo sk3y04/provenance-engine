@@ -92,6 +92,17 @@ func (s *loopbackSeeder) magnet() string {
 
 func (s *loopbackSeeder) jobID() string { return "bt-" + s.mi.HashInfoBytes().HexString() }
 
+// activePeers is the number of established peer connections this seeder currently
+// serves, summed over its torrents. It is the observation point for peer-limit
+// tests: a connection the downloader opened shows up here.
+func (s *loopbackSeeder) activePeers() int {
+	total := 0
+	for _, tor := range s.client.Torrents() {
+		total += tor.Stats().ActivePeers
+	}
+	return total
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

@@ -21,12 +21,21 @@ type Adapter struct {
 	Timeout         time.Duration
 }
 
+// defaultPeersPerJob is the established-peer cap an unconfigured runner has always
+// used.
+const defaultPeersPerJob = 40
+
 func (a Adapter) config(req Request) bittorrent.Config {
+	peers := req.PeersPerAttempt
+	if peers <= 0 {
+		peers = defaultPeersPerJob
+	}
 	return bittorrent.Config{
 		StagingDir:      req.Root,
 		Peers:           req.Peers,
 		Discovery:       bittorrent.Discovery(req.Discovery),
-		MaxPeers:        40,
+		MaxPeers:        peers,
+		MaxHalfOpen:     req.HalfOpenPerAttempt,
 		Timeout:         a.Timeout,
 		MetadataTimeout: a.MetadataTimeout,
 		// Seeding is deliberately out of this slice: a queue entry completes at

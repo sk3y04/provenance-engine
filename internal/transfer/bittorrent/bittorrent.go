@@ -139,8 +139,16 @@ type Config struct {
 	MaxSelectedBytes int64
 
 	// MaxPeers bounds established connections per torrent. Zero uses the
-	// library default.
+	// library default. The library enforces it per torrent, on both inbound and
+	// outbound connections, by closing its worst connection to admit a new one -
+	// so the count holds at the cap but connections may churn.
 	MaxPeers int
+
+	// MaxHalfOpen bounds outbound dials that have not completed their handshake,
+	// per torrent. Zero derives it from MaxPeers, as every caller did before this
+	// knob existed. It never bounds inbound connections that have been accepted but
+	// not yet associated with a torrent.
+	MaxHalfOpen int
 
 	// MetadataTimeout bounds the wait for metainfo from peers. Zero uses
 	// two minutes.
@@ -416,9 +424,11 @@ func (s *Session) StagingDir() string { return s.staging }
 // writer can outlive ownership.
 func (s *Session) Close() error {
 	var err error
+	closedPayload := false
 	if s.client != nil {
 		errs := s.client.Close()
 		s.client = nil
+		closedPayload = true
 		for _, e := range errs {
 			err = errors.Join(err, e)
 		}
@@ -428,6 +438,9 @@ func (s *Session) Close() error {
 	if s.ownStorage != nil {
 		err = errors.Join(err, s.ownStorage.Close())
 		s.ownStorage = nil
+	}
+	if closedPayload && clientLifecycleHook != nil {
+		clientLifecycleHook("close:payload")
 	}
 	return errors.Join(err, s.releaseOwnership())
 }
@@ -461,6 +474,14 @@ func clientConfig(staging string, cfg Config) *at.ClientConfig {
 		cc.TorrentPeersHighWater = cfg.MaxPeers * 4
 		cc.TorrentPeersLowWater = max(cfg.MaxPeers, 1)
 	}
+	if cfg.MaxHalfOpen > 0 {
+		cc.HalfOpenConnsPerTorrent = cfg.MaxHalfOpen
+		// A client-wide total below the per-torrent cap would make that cap
+		// unreachable, so keep the total at least as large.
+		if cc.TotalHalfOpenConns < cfg.MaxHalfOpen {
+			cc.TotalHalfOpenConns = cfg.MaxHalfOpen
+		}
+	}
 	// Shared budgets, installed on every client this adapter builds. A nil limiter
 	// leaves the library default (unlimited) untouched, and a non-nil one is never
 	// copied or re-created: two attempts of one runner must contend on the same
@@ -483,6 +504,10 @@ func clientConfig(staging string, cfg Config) *at.ClientConfig {
 // nil in production and exists so a test can prove that one shared limiter reaches
 // both the metadata resolver and the payload session.
 var clientConfigHook func(*at.ClientConfig)
+
+// clientLifecycleHook observes client creation and close, so a test can prove that
+// an attempt never holds two clients at once. Nil in production.
+var clientLifecycleHook func(event string)
 
 // newClient builds the library client. Limits are conservative; the library
 // defaults assume a long-lived desktop client, not one short job.

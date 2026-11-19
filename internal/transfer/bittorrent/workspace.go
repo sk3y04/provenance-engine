@@ -281,6 +281,9 @@ func openWorkspace(root string, id Identity, cfg Config) (*Session, error) {
 		_ = s.releaseOwnership()
 		return nil, fmt.Errorf("start workspace client: %w", err)
 	}
+	if clientLifecycleHook != nil {
+		clientLifecycleHook("open:payload")
+	}
 	s.client = client
 	s.ownStorage = st
 	return s, nil
@@ -320,7 +323,15 @@ func resolveMetainfo(ctx context.Context, cfg Config, src source) (*metainfo.Met
 	if err != nil {
 		return nil, Identity{}, fmt.Errorf("resolve metadata: start client: %w", err)
 	}
-	defer func() { _ = client.Close() }()
+	if clientLifecycleHook != nil {
+		clientLifecycleHook("open:resolver")
+	}
+	defer func() {
+		_ = client.Close()
+		if clientLifecycleHook != nil {
+			clientLifecycleHook("close:resolver")
+		}
+	}()
 	t, _, err := client.AddTorrentSpec(spec)
 	if err != nil {
 		return nil, Identity{}, errors.New("resolve metadata: " + sanitizeSourceText(err.Error(), src.magnet))

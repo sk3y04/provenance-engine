@@ -73,6 +73,10 @@ const (
 	// MaxRateBytes is the largest accepted rate per direction, in bytes per second.
 	// It exists to reject nonsense and overflow, not to be a meaningful ceiling.
 	MaxRateBytes = 1 << 40
+
+	// MaxPeersPerJob is the largest accepted per-attempt peer limit. Each attempt is
+	// a full client, so a big number is a big number of sockets, not a budget.
+	MaxPeersPerJob = 200
 )
 
 // MaxActiveLimit bounds --max-active. Above this a single foreground drain stops
@@ -101,6 +105,10 @@ type Request struct {
 	// attempt of one runner receives the same pointers; nil means unlimited.
 	DownloadLimiter *rate.Limiter
 	UploadLimiter   *rate.Limiter
+	// PeersPerAttempt and HalfOpenPerAttempt are the per-job peer limits; zero
+	// keeps the adapter default.
+	PeersPerAttempt    int
+	HalfOpenPerAttempt int
 }
 
 // Outcome is what a backend reports after a successful run.
@@ -140,6 +148,13 @@ type Options struct {
 	// attempt may use all of it.
 	DownloadLimit int64
 	UploadLimit   int64
+	// PeersPerJob and HalfOpenPerJob are per-attempt limits: established peers per
+	// torrent, and outbound handshakes in progress per torrent. Zero keeps the
+	// adapter defaults. They are per job, not a runner-wide pool, so the runner's
+	// observed bound is MaxActive x PeersPerJob - which holds only because an
+	// attempt never holds a resolver and a payload client at the same time.
+	PeersPerJob    int
+	HalfOpenPerJob int
 	// Log receives one line per transition. Nil discards.
 	Log io.Writer
 	// BeforeResultPersist runs after a backend returns and before its result is
@@ -173,6 +188,12 @@ func (o Options) Validate() error {
 	}
 	if o.UploadLimit > MaxRateBytes {
 		return fmt.Errorf("upload rate %d bytes/s is above the supported maximum %d", o.UploadLimit, int64(MaxRateBytes))
+	}
+	if o.PeersPerJob < 0 || o.PeersPerJob > MaxPeersPerJob {
+		return fmt.Errorf("peers-per-job must be between 1 and %d, got %d", MaxPeersPerJob, o.PeersPerJob)
+	}
+	if o.HalfOpenPerJob < 0 || o.HalfOpenPerJob > MaxPeersPerJob {
+		return fmt.Errorf("half-open-per-job must be between 1 and %d, got %d", MaxPeersPerJob, o.HalfOpenPerJob)
 	}
 	return nil
 }
@@ -494,6 +515,9 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sy
 		// the whole budget.
 		DownloadLimiter: r.downloadLimiter,
 		UploadLimiter:   r.uploadLimiter,
+
+		PeersPerAttempt:    r.opts.PeersPerJob,
+		HalfOpenPerAttempt: r.opts.HalfOpenPerJob,
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)

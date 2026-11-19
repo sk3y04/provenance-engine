@@ -29,6 +29,8 @@ var (
 	flagQueueMaxActive   int
 	flagQueueDownRate    string
 	flagQueueUpRate      string
+	flagQueuePeers       int
+	flagQueueHalfOpen    int
 	flagTorrentDiscovery string
 )
 
@@ -457,10 +459,12 @@ func queueRunCmd() *cobra.Command {
 			// slow entry cannot consume the whole run.
 			runner := torrentqueue.NewRunner(store, torrentqueue.Adapter{Timeout: flagTorrentTimeout},
 				torrentqueue.Options{
-					MaxActive:     flagQueueMaxActive,
-					DownloadLimit: downRate,
-					UploadLimit:   upRate,
-					Log:           os.Stdout,
+					MaxActive:      flagQueueMaxActive,
+					DownloadLimit:  downRate,
+					UploadLimit:    upRate,
+					PeersPerJob:    flagQueuePeers,
+					HalfOpenPerJob: flagQueueHalfOpen,
+					Log:            os.Stdout,
 				})
 			sum, rerr := runner.Run(cmd.Context())
 			if rerr != nil {
@@ -477,6 +481,8 @@ func queueRunCmd() *cobra.Command {
 	cmd.Flags().IntVar(&flagQueueMaxActive, "max-active", 1, "Concurrent attempts to run at once (1-32)")
 	cmd.Flags().StringVar(&flagQueueDownRate, "download-rate", "", "Aggregate download budget shared by every attempt, e.g. 2MB (bytes/second; empty means unlimited)")
 	cmd.Flags().StringVar(&flagQueueUpRate, "upload-rate", "", "Aggregate upload budget shared by every attempt, e.g. 512KB (bytes/second; empty means unlimited)")
+	cmd.Flags().IntVar(&flagQueuePeers, "peers-per-job", 0, "Established peers per torrent per attempt (0 keeps the default of 40; max 200)")
+	cmd.Flags().IntVar(&flagQueueHalfOpen, "half-open-per-job", 0, "Outbound handshakes in progress per torrent per attempt (0 derives it from the peer limit)")
 	return cmd
 }
 
