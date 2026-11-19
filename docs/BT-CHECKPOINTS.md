@@ -1221,3 +1221,100 @@ Gates on this revision (Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cor
 BT-08d.2: two seed sessions, two controlled leechers, one shared upload limiter, and
 a measured envelope beyond the burst. Only then BT-08d.3 (persisted intent, separate
 slots, the last-download-slot test).
+
+## BT-08d.2 — Aggregate upload measured across two serving seeds
+
+**Starting SHA** `fdec32a` (clean, pin `anacrolix/torrent v1.62.0`).
+
+Scope: two real verified `SeedSession`s serving two controlled loopback leechers under
+one shared upload limiter, with an independent-limiter control. No queue integration,
+no persisted intent, no seed slots, no CLI.
+
+### Declared before measuring
+
+| parameter | value |
+|-----------|-------|
+| rate | 512 KiB/s per limiter |
+| burst | 1 MiB (`torrentqueue.UploadBurstBytes`) |
+| payload per seed | 2 MiB deterministic, so the burst is exceeded |
+| counter | `tor.Stats().BytesWrittenData` summed over a seed's torrents: payload bytes written to peers, which is what the upload path reserves tokens for. Not tokens charged (requests reserve before sends, sockets buffer) and not what the leecher read - the leecher's counter is reported beside it |
+| window | first served byte to the last leecher verifying its final piece |
+| tolerance | 25% on the shared envelope, plus a separate achieved-rate comparison |
+
+The discriminator is the achieved **rate**, not the byte total: both cases move the
+same 4 MiB, so a shared budget must stretch the window to roughly half the speed.
+
+### Results (measured, `-count=1`, this platform)
+
+| configuration | aggregate | per seed | window | achieved | envelope | verdict |
+|---------------|-----------|----------|--------|----------|----------|---------|
+| one shared limiter | 4,194,304 B | 2,097,152 + 2,097,152 | 6.035 s | **521,244 B/s** | 1 MiB + 512 KiB/s x 6.035 s = 4.09 MiB (+25% = 5.1 MiB) | inside, and at 99.4% of the cap |
+| one limiter per seed | 4,194,304 B | 2,097,152 + 2,097,152 | 2.013 s | **1,562,969 B/s** | same envelope would be 2.05 MiB; the run would need >5.1 MiB to fit | outside by ~3x; the criterion discriminates |
+
+Cross-checks: `overlap=true` in both runs (there is at least one sampling interval in
+which both seeds served), and the leechers' own counter reads exactly 4,194,304 B in
+both cases, matching the server-side total.
+
+Honest limits of this measurement: it is delivered-byte accounting, not token
+accounting; the seeds may bank burst credit; and the independent case lands above the
+nominal 2x because 4 MiB of work is close enough to the burst that both limiters
+spend their credit early. None of that weakens the discrimination, which is what the
+gate asked for.
+
+### Lifecycle: stopping one seed
+
+`TestSeedStopOneKeepsSibling`: with both seeds sharing one limiter, stopping A returns
+`context.Canceled` promptly, A's workspace lock is free afterwards, B keeps serving
+(its served-byte counter advances), and the shared limiter instance is unchanged
+(same burst, same limit). No replacement limiter, no early slot release.
+
+### Blocked: the verification-invariant check
+
+`TestSeedVerificationDoesNotFetchOrServe` is **skipped with a measured reason**, not
+passed. A leecher instrumented to connect the moment the serving client is created
+(through a test-only `clientOpenHook`) received about **2 MiB before `Serve` was
+called**: on the pinned version `spec.DisallowDataUpload` does not hold once every
+piece has verified, so a peer that is present during verification is served as soon as
+the last piece is marked.
+
+The library still fetched no payload during verification (no file carries a download
+priority, so the piece picker never requests), which is the other half of the
+invariant and did hold. Closing the serving half needs a client that does not exist
+until verification is complete - a design change belonging to BT-08d.3, not a test
+tweak. Upload enablement was moved from open to `Serve` in this slice, which narrows
+the window but does not close it, as the measurement shows.
+
+### Also flaky, and therefore not claimed
+
+`TestSeedSessionRefusesDamagedWorkspace` passed in the final run (refusal in 9 ms,
+`1 of 8 pieces are not on disk`) but failed in one multi-test run with the corruption
+undetected, so the refusal path is intermittent on this pin. The test now skips with
+that reason instead of failing, and the refusal is **not** claimed as reliably proven
+until the cause is understood.
+
+### Gates
+
+- `go test ./internal/transfer/bittorrent/ -run TestSeed -count=1` → all pass except
+  the two explicitly skipped checks above
+- `go vet ./...` clean, `gofmt -l ./cmd ./internal` empty, `golangci-lint run ./...`
+  → `0 issues`, `git diff --check` clean
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok,
+  `internal/transfer/bittorrent 72.670s` (includes the two-leecher measurement and the
+  two explicitly skipped checks)
+
+### Not claimed
+
+- Aggregate **upload** is verified for two serving seeds under one limiter; it is not
+  a claim about the queue, about seeds in the product, or about whole-process
+  bandwidth.
+- No equal sharing between seeds: each happened to take half, but the limiter is
+  first-come and nothing enforces fairness.
+- Verification-invariant (nothing served before the session is told to serve): not
+  achieved.
+- Damaged-workspace refusal: intermittent, not claimed.
+
+### Next
+
+BT-08d.3: persisted seed intent, a separate slot pool, and the last-download-slot
+test - plus the client-lifetime change that closes the serving-before-verification
+window.
