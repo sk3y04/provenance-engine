@@ -562,3 +562,102 @@ cores):
 errors). It only needs persisted metainfo and the selected-file set, and it is
 independent of the queue. BT-07 (durable queue) is the consumer of this PR's
 workspace entry point and should follow BT-06.
+
+## BT-06 — Offline recheck (shipped: read-only check, repair stays a fetch)
+
+**Starting SHA** `d371367` (tree clean). **Ending SHA** `111c587`.
+
+Scope shipped: `provenance torrent recheck JOB_ID --output ROOT [--json]`, a
+read-only integrity check of one job's selected working files against the digests
+recorded at capture time. Not shipped, by decision: piece-level re-verification,
+`.part` inspection, auto-repair, a repair command for isolated workspaces, queue
+and vault checks.
+
+### Changed paths
+
+- `internal/transfer/bittorrent/recheck.go` (new, 433 lines) — `Recheck`,
+  `RecheckReport`, `hashFileContext`, attestation lookup, ownership handling.
+- `internal/transfer/bittorrent/recheck_test.go` (new, 547 lines) — the
+  acceptance tests below.
+- `internal/transfer/bittorrent/status.go` — `lookupJob` factored out of
+  `ReadJobStatus`, so recheck resolves records and the hybrid alias through the
+  same validated lookup.
+- `internal/transfer/bittorrent/bittorrent.go` — `jobLockPath` extracted so a
+  fetch and a recheck contend on the same lock key.
+- `cmd/provenance/torrent.go` — the `recheck` subcommand, JSON and human
+  rendering, nonzero exit for any non-verified outcome.
+- `docs/TORRENT.md` — "Offline recheck" section.
+
+### Traced before editing (pinned v1.62.0)
+
+- **`Torrent.VerifyDataContext` is a mutating path.** It needs a `Client` and an
+  added `Torrent`; it hashes through the storage implementation, which opens the
+  piece-completion database for writing; it marks pieces and can move `.part`
+  data into place; and it updates persisted completion state. It is also
+  whole-torrent, not whole-selection. So it is not a read-only verifier and
+  recheck does not call it. The honest consequence is stated everywhere: there is
+  no piece-level recheck in this ticket.
+- **Attestations live in the capture items**, keyed `<identity>:<staging-relative
+  path>` (`manifest.ItemPath`), holding `sha256`, `byte_size`, `downloaded_path`.
+  The job record holds only the capture *reference* (`key`, `manifest`,
+  `committed_at`, `reconciled`).
+- **`verifyStagedAssets` is the existing read-only comparison** (no client), but
+  it is fail-fast and returns one error for a set; recheck reports per file, so it
+  reuses the same comparison rather than the function.
+- **Paths:** `resolveCaptured` re-resolves symlinks but fails on a missing file, so
+  recheck does lexical containment first (`joinWithin`), a non-following
+  `os.Lstat` (missing/partial/symlink/non-regular), and only then the
+  symlink-resolved re-check before hashing.
+- **Locks:** `filelock` keys its sidecar on `path+".lock"`, and `Session.lockPath`
+  names `…/torrent/staging`, so the real sidecar is `…/torrent/staging.lock`. My
+  first implementation passed `staging.lock` and created `staging.lock.lock`; the
+  before/after snapshot test caught it, which is why `jobLockPath` is now shared.
+
+### Verified (real runs)
+
+| Test | Result |
+|------|--------|
+| `TestRecheckHealthyWorkspaceChangesNothing` | PASS — committed isolated workspace rechecks to exact agreement; job record, metainfo, completion DB, payload, items and run manifest byte- and mtime-identical afterwards; no new file appears |
+| `TestRecheckDetectsCorruptionAndRepairReconciles` | PASS — one byte flipped at the same length: `mismatch`, `verified=false`, manifest and items unchanged; `FetchIsolated` repair restores the bytes, reconciles to the same capture key, leaves exactly one run manifest; the repaired workspace then rechecks clean offline |
+| `TestRecheckNeverReportsUncheckedFilesVerified` | PASS — missing, `.part`-only (`partial`, nothing hashed), unattested (`unverifiable`), escaping path (no hash, `error`), symlink at a selected path (`error`), invalid record (error, no report), record for another identity (error) |
+| `TestRecheckCancellationDuringHashing` | PASS — the chunk hook cancels mid-file; `context.Canceled` is returned, `verified=false`, and the report carries the error so JSON does not hide it |
+| `TestRecheckRefusesLiveOwner` | PASS — a workspace owner gets `ErrStagingBusy`; after the owner exits, a leftover `staging.lock` does not make the job look busy and recheck verifies |
+| `TestRecheckLegacyAndHybridAlias` | PASS — legacy staged job verified (and busy while its session is live); hybrid isolated workspace verified when asked by its v2 hash |
+
+Gates on `111c587` (Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3, 32 cores):
+
+- `go test ./internal/transfer/bittorrent/ -run 'TestRecheck' -count=1` → ok
+- `go test ./internal/transfer/bittorrent/ -run 'TestRecheck|TestFetchCapturesOnlySelectedFiles|TestInterruptedFetchResumesAndReusesVerifiedBytes|TestStagingRootIsExclusiveOwner|TestSecondSessionOnSameRootIsBusy|TestReadJobStatus|TestSharedPieceCorruptionIsRepairedNotCaptured|TestDirectMagnetFailsBoundedWithoutContactingTracker|TestTrackerPolicy|TestIsolated' -count=3` → `ok 28.329s`
+- `go test ./internal/transfer/bittorrent/ ./cmd/provenance/ -count=1` → `ok 44.126s`, `ok 0.039s`
+- `make test` (repo-wide, `-race`) → all ok
+- `go vet ./...` clean, `gofmt -l ./cmd ./internal` empty, `golangci-lint run ./...` → `0 issues`, `git diff --check` clean
+- CLI smoke (`bt06-smoke`, synthetic job root with a 102400-byte payload):
+  clean → `MATCH`, `verified: yes`, exit 0; one byte flipped at the same length →
+  `MISMATCH … (digest differs at the same length)`, `verified: no`, exit 1;
+  `--json` on the damaged run parses with `verified=false, mismatch=1` and the
+  file's detail; an unknown job id parses with an `error` field and exits 1;
+  restoring the bytes returns exit 0. Usage text is suppressed on a mismatch so
+  the finding is not buried under the flag table.
+
+### Not verified (explicit)
+
+- **Piece-level recheck.** No piece layers or completion metadata are consulted,
+  so this is not parity with a client force-recheck and cannot say which pieces
+  are bad. Only the selected payload bytes are compared, to their recorded
+  digests.
+- **`.part` contents.** A partial is reported as `partial` and not hashed: it has
+  no attestation, and hashing it would imply a progress claim this code cannot
+  back.
+- **Repair CLI for isolated workspaces.** Repair is demonstrated through
+  `FetchIsolated`; there is no `provenance torrent` command that resumes a
+  runner-managed workspace yet (BT-07).
+- **ENOSPC, storage-error redesign, vault verification.** Untouched, as scoped.
+- **Hostile filesystem races.** Path containment is checked lexically, then with
+  `Lstat`, then with symlink resolution; another process swapping a file between
+  those steps is not defeated, and no such claim is made.
+
+### Next eligible ticket
+
+**BT-07** (durable queue and desired-state controller). It consumes this ticket's
+`Recheck` as the offline check an operator or the runner can call before
+idle/selection changes, and the isolated workspace entry point shipped in BT-05.

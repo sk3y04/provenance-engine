@@ -606,6 +606,76 @@ Rules this layout enforces, each covered by a test in `isolated_workspace_test.g
 There is no migration path and no fallback: an identity is either legacy or
 isolated, and the layout it was created with is the one it keeps.
 
+## Offline recheck
+
+`provenance torrent recheck JOB_ID --output ROOT [--json]` answers one question
+with no client and no network: do this job's selected working files still hash to
+the digests recorded when the capture was published?
+
+```
+$ provenance torrent recheck bt-9af1... -o downloads
+job bt-9af1...
+  btih 9af1...
+capture (historical): .provenance/runs/2026-11-19T014306Z.json  key 9af1...:fixture/a.bin  committed 2026-11-19T01:43:06Z  manifest present
+selected: 1 file(s)
+  MATCH        fixture/a.bin  30000 bytes  sha256 3f2a...
+recheck (now): 1 match, 0 mismatch, 0 missing, 0 partial, 0 unverifiable, 0 error
+verified: yes (every selected file matches its recorded digest)
+```
+
+A damaged copy, exit status 1:
+
+```
+  MISMATCH     fixture/a.bin  102400 bytes  sha256 5c45...  attested 2778...  (digest differs at the same length)
+recheck (now): 0 match, 1 mismatch, 0 missing, 0 partial, 0 unverifiable, 0 error
+verified: no
+repair: rerun the fetch that created this job with the same source and selection;
+        recheck itself never repairs, re-downloads or rewrites a capture
+```
+
+What it does and does not do:
+
+| | |
+|---|---|
+| Hashed | each selected, finalized, regular file, SHA-256, streamed in 1 MiB chunks |
+| Compared against | the per-file capture item (`sha256`, `byte_size`) written at capture time |
+| Not hashed | `.part` data, unselected files, piece layers, the vault blob |
+| Not done | no client, no peer/tracker/web seed contact, no completion-database write, no repair, no manifest or record write |
+| Exit 0 | only when every selected file matched; missing, partial, unattested and errored files are all nonzero |
+
+Per-file outcomes are deterministic: `match`, `mismatch`, `missing`, `partial`
+(no finalized file but a `.part` exists), `unverifiable` (no recorded digest, for
+example a job whose capture was never published) and `error` (the path escapes the
+root, is not a regular file, or could not be read). Nothing is reported as
+verified by omission.
+
+Why not the library's verifier: `Torrent.VerifyDataContext` requires a client and
+an added torrent, hashes through the storage backend — which opens the
+piece-completion database for writing and can mark pieces and promote `.part`
+data — and updates completion state. Calling it from a command advertised as
+read-only would be a false claim, so recheck does not use it, and it does not
+claim parity with a client force-recheck (there is no piece-level re-verification
+here).
+
+Ownership and side effects: recheck takes the job's existing flock — the same
+sidecar a fetch takes (`<root>/.provenance/torrent/staging.lock`) — because a
+lock-free read of the job record does not make concurrent hashing safe. A live
+owner gets `ErrStagingBusy` instead of a report about bytes that may be changing.
+The sidecar is opened and locked for the duration and is created if absent; no
+other file appears or changes. Job, metainfo, completion database, payload,
+capture items and run manifests are byte-identical afterwards (asserted).
+
+`--output` is the job root: a legacy staging root, or a directly supplied isolated
+workspace (`<root>/.provenance/torrent/jobs/<jobID>`). Nothing walks a tree looking
+for jobs, and the hybrid alias rule applies — a hybrid job answers to its v2 hash
+as well.
+
+Repair is a separate operation and always explicit: rerun the fetch that created
+the job with the same source and selection, which re-verifies retained pieces and
+reconciles to the same capture key. There is no `recheck --repair`, and no repair
+CLI exists yet for a runner-managed isolated workspace (the tests repair one
+through `FetchIsolated`); adding that command is queue work, not recheck work.
+
 ## Read-only status
 
 `provenance torrent status` answers "what does the local record say about this
