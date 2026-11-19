@@ -765,6 +765,45 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
+### Managed seeding in the queue (opt-in)
+
+Seeding is a second pool with its own slots. It is **off unless asked for twice**: an
+entry needs persisted seed intent (`torrent queue seed ID`) *and* the invocation needs
+`--max-seeds N`. Intent is durable, the flag is not - that split is deliberate, so a
+routine `queue run` never starts uploading because of what some earlier command
+recorded.
+
+```
+provenance torrent queue seed queued-000001-ab12cd34
+provenance torrent queue run --max-seeds 2           # downloads and serves
+provenance torrent queue unseed queued-000001-ab12cd34
+```
+
+| state | meaning |
+|-------|---------|
+| `seed_desired` | `on`/`off` - user intent, persisted before the command is acknowledged. Records written before this field existed read as off. |
+| `seed_phase` | `idle`, `waiting`, `verifying`, `serving`, `stopping`, `stopped`, `blocked` - the last *observation*, never the intent. |
+
+Only a completed entry with a published capture can be given seed intent; the command
+refuses anything else with an actionable error, and never changes download intent.
+Unseeding never deletes the payload, workspace or capture.
+
+A seed slot is held from claim through verification, `Serve` and `Close`, and released
+only after the workspace lock is gone. A seed waiting for a slot holds no lock and
+consumes no download slot, and two entries naming one canonical workspace cannot both
+hold it - the second waits.
+
+**Exit behaviour.** Without `--max-seeds`, `queue run` is the same finite drain as
+before. With it, the runner keeps serving after downloads drain and exits when no seed
+is left to run: an entry that is blocked (damaged, selective, ineligible) does not keep
+the runner alive, because it is waiting for a person rather than for a slot. A blocked
+seed is not retried automatically and never triggers repair, a fetch or a new capture.
+
+`SIGINT` cancels both pools, waits for both to close, and preserves intent: a seed
+interrupted this way returns to `idle` and resumes on the next run, while an unseeded
+one stays `stopped`. Seeding shares the runner's upload limiter and per-job peer limits
+with downloads - there is no second upload budget.
+
 ### Managed seeding (internal, startup-safe)
 
 `OpenSeedSession` (`internal/transfer/bittorrent/seed.go`) serves one isolated

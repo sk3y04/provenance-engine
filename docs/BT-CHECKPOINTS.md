@@ -1400,3 +1400,87 @@ always hashes every piece.
 
 BT-08d.3: persisted seed intent, a separate seed slot pool, and the scheduler test that
 a live seed leaves the last download slot available.
+
+## BT-08d.3 — Managed seeding in the queue: intent, slots, and a serving gate
+
+**Starting SHA** `c6ff605` (clean). No redesign of seed verification or upload
+accounting: this is a scheduler slice on top of BT-08d.2a.
+
+### Design
+
+- **Intent is separate from the runner flag.** `queue seed|unseed` writes
+  `seed_desired` durably; `queue run --max-seeds N` (1-32, default 0 = off) decides
+  whether this invocation serves anything. Old records have no field and therefore read
+  off. Download intent is never touched by either command.
+- **Own slot pool.** `Options.MaxSeeds` sizes it. A seed slot is held from claim through
+  verification, `Serve` and `Close`, and released only after the workspace lock is gone
+  (`closeSeed` records `stopping`, closes, then records the durable phase). A waiting
+  seed holds no lock and no download slot; the pool skips an entry whose canonical
+  workspace is already owned by another active seed.
+- **Attempt identity.** `SeedAttempt` carries a per-dispatch token and `UpdateSeed`
+  applies only if it still matches, so a late result from a superseded attempt cannot
+  overwrite a newer `unseed`/`seed`.
+- **Intent polling.** While serving, the attempt polls its record every `PollInterval`
+  and cancels on `seed_desired=off`; that is how `unseed` stops a live seed without
+  touching the download pool.
+- **Exit behaviour.** Without `--max-seeds` the drain is unchanged. With it, the
+  download loop waits for the seed pool when downloads are done and the runner exits
+  when the pool has nothing left; blocked seeds do not keep it alive.
+- **Shared budgets.** `seedRequest` passes the runner's existing `UploadLimiter` and
+  peer settings, so seeding never gets a second budget.
+
+Transitions observed in the gate test: `waiting` → `verifying` → `serving` →
+(interrupt) `stopping` → `idle`, with `seed_desired` still `on`; `unseed` produces
+`stopping` → `stopped`; an ineligible workspace produces `blocked` with an actionable
+note and a `SeedNotBefore` backoff that only the pool consults, never an automatic retry.
+
+### The release gate, measured
+
+`TestQueueSeedServesWhileDownloadCompletes`, `--max-active 1 --max-seeds 1`, one
+controlled leecher dialling A's serving session and B downloading from a throttled
+seeder:
+
+```
+A served 524288 bytes while B downloaded; A phase="serving" at B's completion; leecher read 524288
+runner summary: completed=1 seeded=[queued-000001-913d5abc]
+```
+
+So: B published a capture while A was still `serving`, A's payload counter advanced
+during that interval (not merely a phase), the leecher read exactly A's 512 KiB, and
+after cancellation A's intent survived (`on`), its phase settled at `idle`, the session
+closed and the workspace lock was acquirable again.
+
+### Verified
+
+| test | result |
+|------|--------|
+| `TestQueueSeedServesWhileDownloadCompletes` | the release gate above |
+| `TestQueueSeedCommandRules` | new entries read off; seeding an incomplete entry is refused; seed/unseed leave download intent untouched; unseed records `stopped` |
+| CLI smoke | `queue run --max-seeds 99` refused (`between 1 and 32`); `queue seed` on an incomplete entry refused with the actionable message; `queue unseed` cleared intent and recorded `stopped`; `queue list --json` unchanged in shape |
+
+Gates: `go test ./internal/torrentqueue/ -race -run TestQueueSeed -count=3 -timeout 450s`
+→ `ok 33.844s`; `make test` repo-wide `-race` → exit 0 at this commit (all packages ok) and `make lint`
+→ `0 issues`; `go vet`,
+`gofmt -l`, `golangci-lint` and `git diff --check` clean.
+
+### Not covered by a test, and therefore not claimed
+
+- **Duplicate-workspace single ownership** is implemented (the pool keys active seeds by
+  canonical workspace) but no test drives two entries onto one workspace.
+- **Repeated seed/unseed and stale-result races** are implemented through
+  `SeedAttempt`/`UpdateSeed`; only the sequential CLI path is exercised.
+- **Damaged, missing and selective workspaces through the queue** take the `blocked`
+  path and the BT-08d.2a refusals are unchanged, but no queue-level test asserts the
+  blocked diagnostics while other downloads proceed.
+- **Process death during serving** is not tested; graceful shutdown is.
+- **Runner wiring of the upload limiter into both pools** is code (`seedRequest`
+  forwards the pointer) but no test asserts the pointer identity, and the two-seed
+  shared-budget measurement was not re-run in this slice.
+- **Mixed download/seed traffic** was never measured; the BT-08d.2 numbers stand for two
+  seeds alone.
+- Ratio/time policies and selective seeding remain out of scope.
+
+### Next
+
+BT-08d.4 (or BT-09 if you prefer to close the gaps first): the blocked/duplicate/stale
+cases above, plus process death while serving.
