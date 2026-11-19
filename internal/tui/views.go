@@ -139,7 +139,7 @@ func (m *model) renderStatusBar() string {
 func (m *model) viewFooter() string {
 	switch m.view {
 	case viewTorrentQueue:
-		return "↑/↓ move • s start • p pause • t retry • a add • r refresh • esc back"
+		return "↑/↓ move • s start • p pause • t retry • e seed • d unseed • a add • r • esc back"
 	case viewTorrentAdd:
 		return "esc back • enter confirm"
 	case viewMain:

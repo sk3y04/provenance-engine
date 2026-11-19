@@ -85,7 +85,7 @@ func (m *model) openQueueView() (tea.Model, tea.Cmd) {
 	m.view = viewTorrentQueue
 	// The generation counter survives re-entry, so a message from a previous visit to
 	// this view can never match the generation of the new one.
-	gen := m.queue.gen
+	gen := m.queue.gen + 1
 	m.queue = queueState{root: root, gen: gen, liveStatus: "live status: not polled yet"}
 	return m, m.refreshQueue()
 }
@@ -96,7 +96,10 @@ func (m *model) refreshQueue() tea.Cmd {
 	if m.queue.inflight > 0 {
 		return nil
 	}
-	m.queue.gen++
+	// Deliberately NOT bumping the generation here: a poll runs every two seconds and
+	// would otherwise invalidate an action that is still in flight, dropping its result.
+	// The generation changes only when the view instance, the root or the intent to
+	// display the view changes.
 	m.queue.inflight = 2
 	gen, root := m.queue.gen, m.queue.root
 	return tea.Batch(m.queueDurableCmd(gen, root), m.queueLiveCmd(gen, root))
@@ -160,6 +163,10 @@ func (m *model) queueActionCmd(gen int, root, id, action string) tea.Cmd {
 			entry, aerr = store.Pause(id)
 		case "retry":
 			entry, aerr = store.Retry(id)
+		case "seed-enable":
+			entry, aerr = store.EnableSeed(id)
+		case "seed-disable":
+			entry, aerr = store.DisableSeed(id)
 		default:
 			aerr = fmt.Errorf("unknown queue action %q", action)
 		}
@@ -202,6 +209,22 @@ func (m *model) describeAction(msg queueActionMsg) string {
 		return fmt.Sprintf("saved pause intent for %s (desired=paused)%s", id, detail)
 	case "retry":
 		return fmt.Sprintf("saved retry for %s (desired=run, phase=%s, errors cleared)", id, msg.entry.Phase)
+	case "seed-enable":
+		live := ""
+		if a, ok := m.liveAttemptFor(id); ok {
+			live = fmt.Sprintf("; the runner is already %s with this seed", a.Phase)
+		} else {
+			live = "; seeding starts only in a run with --max-seeds"
+		}
+		return fmt.Sprintf("saved seed intent: enabled for %s (seed_desired=%s, phase=%s)%s",
+			id, msg.entry.SeedDesired, msg.entry.SeedPhase, live)
+	case "seed-disable":
+		detail := "; recorded as disabled"
+		if a, ok := m.liveAttemptFor(id); ok {
+			detail = fmt.Sprintf("; the runner has not acknowledged yet — it is still %s and keeps its slot until it closes", a.Phase)
+		}
+		return fmt.Sprintf("saved seed intent: disabled for %s (seed_desired=%s, phase=%s)%s",
+			id, msg.entry.SeedDesired, msg.entry.SeedPhase, detail)
 	}
 	return "saved"
 }
@@ -301,6 +324,8 @@ func (m *model) updateQueueKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.openTorrentAdd()
 	case "s", "p", "t":
 		return m.queueAction(msg.String())
+	case "e", "d":
+		return m.queueAction(msg.String())
 	case "r":
 		return m, m.refreshQueue()
 	}
@@ -321,7 +346,10 @@ func (m *model) queueAction(key string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	id := rows[m.queue.cursor].ID
-	action := map[string]string{"s": "start", "p": "pause", "t": "retry"}[key]
+	action := map[string]string{
+		"s": "start", "p": "pause", "t": "retry",
+		"e": "seed-enable", "d": "seed-disable",
+	}[key]
 	m.queue.actionBusy = true
 	m.queue.status = action + " requested…"
 	m.queue.statusErr = false
@@ -404,7 +432,11 @@ func (m *model) viewTorrentQueue() string {
 		if recorded == "" {
 			recorded = "recorded: ?"
 		}
-		fmt.Fprintf(&b, "%s%-26s desired=%-6s recorded=%-9s", marker, trim(e.ID, 26), string(e.Desired), recorded)
+		seed := ""
+		if e.SeedDesired != "" || e.SeedPhase != "" {
+			seed = fmt.Sprintf("  seed=%s/%s", seedText(e.SeedDesired), e.SeedPhase)
+		}
+		fmt.Fprintf(&b, "%s%-26s desired=%-6s recorded=%-9s%s", marker, trim(e.ID, 26), string(e.Desired), recorded, seed)
 		if a, ok := byID[e.ID]; ok {
 			fmt.Fprintf(&b, "  live=%s %s", a.Kind, livePhaseText(a))
 		}
@@ -416,12 +448,20 @@ func (m *model) viewTorrentQueue() string {
 			fmt.Fprintf(&b, "  %-26s %s %s\n", trim(a.EntryID, 26), a.Kind, livePhaseText(a))
 		}
 	}
-	b.WriteString("\n↑/↓ move • s start • p pause • t retry • a add torrent • r refresh • esc back\n")
+	b.WriteString("\n↑/↓ move • s start • p pause • t retry • e seed • d unseed • a add • r refresh • esc back\n")
 	return clipLines(b.String(), width)
 }
 
 // livePhaseText renders exactly what the snapshot reported, and nothing else: a
 // missing counter stays absent instead of becoming a zero.
+// seedText renders seed intent, which is independent of download intent.
+func seedText(d torrentqueue.SeedDesired) string {
+	if d == "" {
+		return "off"
+	}
+	return string(d)
+}
+
 func livePhaseText(a torrentqueue.LiveAttempt) string {
 	out := a.Phase
 	if a.Stopping {

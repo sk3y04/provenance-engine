@@ -393,7 +393,7 @@ func queueSeedCmd() *cobra.Command {
 			var b strings.Builder
 			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
 			for _, id := range args {
-				entry, uerr := store.SetSeedIntent(id, true)
+				entry, uerr := store.EnableSeed(id)
 				if uerr != nil {
 					return uerr
 				}
@@ -422,7 +422,7 @@ func queueUnseedCmd() *cobra.Command {
 			var b strings.Builder
 			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
 			for _, id := range args {
-				entry, uerr := store.SetSeedIntent(id, false)
+				entry, uerr := store.DisableSeed(id)
 				if uerr != nil {
 					return uerr
 				}

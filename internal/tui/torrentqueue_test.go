@@ -172,17 +172,19 @@ func TestQueueRefreshSingleFlight(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("the first refresh produced no command")
 	}
-	if m.queue.inflight != 2 || m.queue.gen != 1 {
-		t.Fatalf("first refresh: inflight=%d gen=%d", m.queue.inflight, m.queue.gen)
+	if m.queue.inflight != 2 {
+		t.Fatalf("first refresh: inflight=%d", m.queue.inflight)
+	}
+	// A refresh must NOT bump the generation: the poll would otherwise invalidate an
+	// action that is still in flight and silently drop its result.
+	if m.queue.gen != 0 {
+		t.Fatalf("a refresh bumped the generation to %d", m.queue.gen)
 	}
 	if again := m.refreshQueue(); again != nil {
 		t.Fatal("a second refresh started while one was in flight")
 	}
-	if m.queue.gen != 1 {
-		t.Fatalf("the refused refresh bumped the generation to %d", m.queue.gen)
-	}
-	_, _ = m.updateQueue(queueDurableMsg{gen: 1, root: m.queue.root, entries: nil})
-	_, _ = m.updateQueue(queueLiveMsg{gen: 1, root: m.queue.root, err: torrentqueue.ErrNoLiveRunner})
+	_, _ = m.updateQueue(queueDurableMsg{gen: 0, root: m.queue.root, entries: nil})
+	_, _ = m.updateQueue(queueLiveMsg{gen: 0, root: m.queue.root, err: torrentqueue.ErrNoLiveRunner})
 	if m.queue.inflight != 0 {
 		t.Fatalf("inflight count did not drain: %d", m.queue.inflight)
 	}

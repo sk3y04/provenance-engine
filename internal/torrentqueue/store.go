@@ -495,6 +495,15 @@ func (s *Store) SetSeedIntent(id string, on bool) (Entry, error) {
 	})
 }
 
+// EnableSeed and DisableSeed are the explicit forms of SetSeedIntent. A toggle would
+// invert intent from a row that may already be stale; both front ends name the
+// direction they mean.
+func (s *Store) EnableSeed(id string) (Entry, error) { return s.SetSeedIntent(id, true) }
+
+// DisableSeed clears seed intent. A serving seed reports stopping until its client
+// closes; the phase written here is not a claim that it already stopped.
+func (s *Store) DisableSeed(id string) (Entry, error) { return s.SetSeedIntent(id, false) }
+
 // SeedCandidates lists entries this runner may start serving, in queue order,
 // excluding anything already in flight and anything in a workspace already owned.
 func (s *Store) SeedCandidates(now time.Time, skip map[string]bool) ([]Entry, error) {

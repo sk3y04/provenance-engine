@@ -765,6 +765,26 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
+### Seed intent from the TUI
+
+In the queue view: `e` enables managed seeding for the highlighted entry, `d` disables
+it. Both call the same store operation the CLI uses (`SetSeedIntent`, via the explicit
+`EnableSeed`/`DisableSeed` forms), so eligibility and effects cannot drift: only a
+completed entry with a published capture can be enabled, and disabling a serving entry
+records `stopping` rather than claiming it stopped.
+
+- Seed intent is its own column (`seed=on/waiting`, `seed=off/stopping`) and is shown
+  separately from download intent, recorded phase and live activity.
+- Enabling never reports "serving": with no runner the status says intent was saved and
+  that seeding starts only in a run with `--max-seeds`.
+
+  Disabling a live seed says the runner has not acknowledged yet and leaves the live
+  column and the slot count alone.
+- The action is single-flight and its result is only applied to the view and root it was
+  issued from. A poll that lands while the write is in flight no longer invalidates the
+  result: the poll generation is per view instance, not per refresh (a bug the PTY run
+  found — see the BT-10e checkpoint).
+
 ### Queue actions from the TUI
 
 In the queue view: `s` start, `p` pause, `t` retry — on the highlighted entry, by its

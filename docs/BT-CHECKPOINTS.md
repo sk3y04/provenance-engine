@@ -2179,3 +2179,88 @@ model tests, not by eye.
   contract (the runner observes durable changes on its next poll), and the PTY run
   exercised it, but no test asserts a specific poll latency.
 - PTY evidence is scripted (`pty` + keystrokes), not an interactive human session.
+
+## BT-10e — Seed intent from the TUI
+
+**Starting SHA** `d4e367d` (clean). No runner launch, no mutation IPC, no new seeding
+policy.
+
+### Shared operations
+
+`SetSeedIntent` was already the CLI's operation; it now has explicit
+`EnableSeed`/`DisableSeed` forms, and both the CLI and the TUI call those, so a toggle
+that could invert intent from a stale row is not offered. Semantics are unchanged:
+enable requires a completed entry with a published capture; disable writes `stopping`
+for a serving/verifying entry and `stopped` otherwise.
+
+### A wiring bug the PTY found
+
+The first PTY run showed the seed action silently doing nothing: the enable status never
+appeared and the runner found no pending seeds. Cause: `refreshQueue` bumped the view
+generation, so the two-second poll invalidated an action that was still in flight and
+its result was dropped by the generation check. Fixed by scoping the generation to the
+view instance and root (bumped on open, on leaving, and on an add's own transitions),
+not to each refresh; `TestQueueActionSurvivesAnInterleavedPoll` pins the case.
+
+### Verified — real PTY, real runner, real sparse seed
+
+A 256 KiB loopback fixture was downloaded to completion, then the TUI drove the seed
+intent and a runner was started with `--max-seeds 1`:
+
+```
+saved: saved seed intent: enabled for queued-000001-e24e019e (seed_desired=on, phase=waiting); seed…
+> queued-000001-e24e019e    desired=run  recorded=completed  seed=on/waiting
+```
+```
+live: runner pid 1471128, started 16:29:25   download slots 0/1   seed slots 1/1
+> queued-000001-e24e019e    desired=run  recorded=completed  seed=on/serving  live=seed serving
+```
+```
+saved: saved seed intent: disabled for queued-000001-e24e019e (seed_desired=off, phase=stopping); t…
+> queued-000001-e24e019e    desired=run  recorded=completed  seed=off/stopping  live=seed serving
+```
+```
+live status: unavailable (no foreground runner is reachable)
+> queued-000001-e24e019e    desired=run  recorded=completed  seed=off/stopped
+```
+
+So: enable saved intent only (no serving claim, no runner running), a subsequent live
+refresh delivered the serving seed with its slot to the screen, disable saved intent
+while the snapshot still showed serving, and after the runner exited the row settled at
+`seed=off/stopped` with no live overlay.
+
+### Verified — barrier test for the slot
+
+`TestLiveStoppingHeldAtClose` (BT-10a barrier, unchanged) holds a seed session inside
+`Close` and now also asserts the durable intent at that moment: `seed_desired=off`,
+`seed_phase=stopping`, the snapshot reports one `stopping` seed with `seeds.used = 1`,
+and the slot frees only after the barrier is released. That is the evidence for the
+stopping interval — PTY timing is not used for it.
+
+### Verified — model and store tests
+
+| test | result |
+|------|--------|
+| `TestQueueSeedIntentParity` | enable on an incomplete entry refused (`ErrUsage`); enable sets on/waiting; repeated enable idempotent; disable of a serving entry gives off/stopping; download intent and capture untouched; an unrelated entry untouched |
+| `TestQueueSeedIntentDoesNotStartRunner` | enabling intent takes no runner ownership and is durable |
+| `TestQueueActionSeedEnableSavesIntentOnly` | via `Update`: status says saved, mentions `--max-seeds`, never "serving"; record on/waiting; no runner; row renders `seed=on/waiting` |
+| `TestQueueActionSeedDisableKeepsLiveObservation` | status says not acknowledged; durable off/stopping; live attempt and slot untouched; render still shows `live=seed serving` and `seed slots 1/1` |
+| `TestQueueActionSeedIneligibleRefused` | refused with an actionable message, entry unchanged |
+| `TestQueueActionSeedRepeatedAndStale` | repeated key starts no write; older generation and another root are ignored |
+| `TestQueueActionSurvivesAnInterleavedPoll` | a poll during the write no longer drops the action result |
+
+### Gates
+
+- Focused: `go test ./internal/tui/ ./internal/torrentqueue/ -race -run 'TestQueue|TestTorrent|TestLive|TestSeedPool|TestRunJoins' -count=3 -timeout 900s`
+  → `torrentqueue 229.417s`; `tui` passed after the generation-scope fix
+  (`go test ./internal/tui/ -race -count=3` → `ok 1.963s`)
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok
+- `make lint` → `0 issues`; `go vet ./...` clean; `git diff --check` clean
+- Platform: Linux 6.18.63-gentoo-dist-bin, x86_64, Go 1.27.3
+
+### Not covered
+
+- Seeding policy (ratio, time limits), removal and selection editing remain out of scope.
+- The PTY run used a single downloading/seed entry; no multi-entry seed scheduling was
+  exercised from the TUI.
+- PTY evidence is scripted (`pty` + keystrokes), not an interactive human session.

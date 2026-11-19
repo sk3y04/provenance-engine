@@ -143,6 +143,10 @@ func TestLiveStoppingHeldAtClose(t *testing.T) {
 	case <-time.After(60 * time.Second):
 		t.Fatal("the session never reached Close")
 	}
+	// The disabled intent is durable before anything else is observed.
+	if e := mustGet(t, store, entry.ID); e.SeedDesired != SeedOff || e.SeedPhase != SeedStopping {
+		t.Fatalf("seed intent after unseed = %q/%q, want off/stopping", e.SeedDesired, e.SeedPhase)
+	}
 
 	// Close is held: Run is still running, ownership is held, and the live client sees
 	// a stopping seed that still occupies its slot.

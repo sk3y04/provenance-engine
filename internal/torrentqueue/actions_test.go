@@ -102,3 +102,87 @@ func TestQueueRetryClearsFailureNotJustStarts(t *testing.T) {
 		t.Fatalf("unhelpful error text: %v", ErrEntryCompleted)
 	}
 }
+
+// TestQueueSeedIntentParity: enable/disable are the CLI's operations, with the same
+// eligibility and the same effect on a serving entry.
+func TestQueueSeedIntentParity(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	incomplete := actionEntry(t, store, PhaseQueued, DesiredRun)
+	if _, serr := store.EnableSeed(incomplete.ID); !errors.Is(serr, ErrUsage) {
+		t.Fatalf("enable on an incomplete entry = %v, want ErrUsage", serr)
+	}
+	if got := mustGet(t, store, incomplete.ID); got.SeedWanted() {
+		t.Fatalf("a refused enable changed the entry: %+v", got)
+	}
+
+	done := actionEntry(t, store, PhaseCompleted, DesiredRun)
+	if _, uerr := store.Update(done.ID, func(e *Entry) error {
+		e.Capture = &CaptureRef{Key: "capture-fixture"}
+		e.Workspace = ".provenance/torrent/jobs/bt-fixture"
+		return nil
+	}); uerr != nil {
+		t.Fatalf("seed capture: %v", uerr)
+	}
+	on, eerr := store.EnableSeed(done.ID)
+	if eerr != nil {
+		t.Fatalf("enable: %v", eerr)
+	}
+	if on.SeedDesired != SeedOn || on.SeedPhase != SeedWaiting {
+		t.Fatalf("enable = %+v", on)
+	}
+	// Repeated enable is idempotent and touches nothing else.
+	again, eerr := store.EnableSeed(done.ID)
+	if eerr != nil || again.SeedDesired != SeedOn || again.Desired != on.Desired || again.Phase != on.Phase {
+		t.Fatalf("repeated enable = %+v err=%v", again, eerr)
+	}
+	// A serving entry reports stopping, not stopped: the runner has not closed yet.
+	if _, uerr := store.Update(done.ID, func(e *Entry) error {
+		e.SeedPhase = SeedServing
+		return nil
+	}); uerr != nil {
+		t.Fatalf("mark serving: %v", uerr)
+	}
+	off, derr := store.DisableSeed(done.ID)
+	if derr != nil {
+		t.Fatalf("disable: %v", derr)
+	}
+	if off.SeedDesired != SeedOff || off.SeedPhase != SeedStopping {
+		t.Fatalf("disable of a serving seed = desired %q phase %q", off.SeedDesired, off.SeedPhase)
+	}
+	// Download intent and the capture are untouched by either direction.
+	if off.Desired != on.Desired || off.Capture == nil || off.Capture.Key != "capture-fixture" {
+		t.Fatalf("seed intent changed download state: %+v", off)
+	}
+	// The other entry is untouched.
+	if got := mustGet(t, store, incomplete.ID); got.SeedDesired == SeedOn {
+		t.Fatalf("an unrelated entry was changed: %+v", got)
+	}
+}
+
+// TestQueueSeedIntentDoesNotStartRunner: enabling intent is durable and inert.
+func TestQueueSeedIntentDoesNotStartRunner(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	done := actionEntry(t, store, PhaseCompleted, DesiredRun)
+	if _, uerr := store.Update(done.ID, func(e *Entry) error {
+		e.Capture = &CaptureRef{Key: "k"}
+		e.Workspace = ".provenance/torrent/jobs/bt-fixture"
+		return nil
+	}); uerr != nil {
+		t.Fatalf("capture: %v", uerr)
+	}
+	if _, eerr := store.EnableSeed(done.ID); eerr != nil {
+		t.Fatalf("enable: %v", eerr)
+	}
+	if RunnerHeld(store.Root()) {
+		t.Fatal("enabling seed intent took runner ownership")
+	}
+	if got := mustGet(t, store, done.ID); got.SeedDesired != SeedOn {
+		t.Fatalf("intent not durable: %+v", got)
+	}
+}
