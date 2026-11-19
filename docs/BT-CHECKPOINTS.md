@@ -2861,7 +2861,8 @@ selected share only.
 
 ## BT-13 — Measured cost of the selected-progress sampler
 
-**Starting SHA** `3b3c27d` (clean). **End SHA** `6720b44`. **Production code unchanged**: the benchmarks were
+**Starting SHA** `3b3c27d` (clean). **Benchmarks** `6720b44`, **guards** `434640b`, **this
+checkpoint** follows. **Production code unchanged**: the benchmarks were
 the slice, and the measurement says the sampler is acceptable for the queue's intended
 workload. No ETA, stall policy or bandwidth work.
 
@@ -2874,54 +2875,88 @@ timed loop:
 - **complete, storage-backed**: a real payload file, 16 KiB pieces, verified with
   `VerifyDataContext` — 512 and 2,048 pieces (8 MiB and 32 MiB).
 - **incomplete, no payload**: a hand-built metainfo with the requested piece count and a
-  `DeferStorageOpen` spec, so no payload file is created at all (the benchmark asserts
-  the data dir stays empty) — 65,536 and 262,144 pieces (1 GiB / 4 GiB at 16 KiB
-  pieces). This is exactly the "many pieces without a proportional payload" fixture the
+  `DeferStorageOpen` spec, so no payload file is created at all. The check accepts a
+  missing payload directory (storage never opened) or an empty one, and fails on any
+  other read error — 65,536 and 262,144 pieces (1 GiB / 4 GiB at 16 KiB pieces). This is exactly the "many pieces without a proportional payload" fixture the
   slice asked for; the cost is that these pieces are zero-value, storage-less states.
 
-### Results
+### Results, two regimes
 
-`go test ./internal/transfer/bittorrent/ -run '^$' -bench 'BenchmarkSelectedVerified' -benchtime=500x -count=3`
-(and `-benchtime=200x -count=3` for the 262,144 case; 32-core Linux 6.18.63, Go 1.27.3):
+Both regimes were run at the tip of this follow-up; the commands are in the next
+section. All numbers are ns/op, B/op and allocs/op from `-benchmem`.
 
-| benchmark | files | pieces | state | ns/op | B/op | allocs/op |
-|-----------|-------|--------|-------|-------|------|-----------|
-| `Complete512` | 1 | 512 | complete, storage-backed | 271–288 k (≈0.28 ms) | 86.9 kB | 96 |
-| `Complete2048` | 1 | 2,048 | complete, storage-backed | 1.12–1.22 M (≈1.17 ms) | 397 kB | 360 |
-| `Incomplete65536` | 1 | 65,536 | incomplete, no storage | 3.92 M | 14.0 MB | 27 |
-| `Incomplete262144` | 1 | 262,144 | incomplete, no storage | 15.9 M | 55.9 MB | 34 |
+**Default benchmark duration** (Go's 1 s budget), all four cases, `-count=3`:
 
-Per piece: **≈0.53–0.60 µs** on the storage-backed torrents, **≈60 ns** on the
-storage-less ones. The two families differ in two ways at once (complete vs incomplete,
-storage-backed vs not), so the 10× gap cannot be attributed to completeness alone; the
-plausible driver is a real per-piece completion lookup versus a zero-value piece, but
-that is an inference, not a measurement.
+| benchmark | files | pieces | state | ns/op (3 reps) | B/op | allocs/op |
+|-----------|-------|--------|-------|----------------|------|-----------|
+| `Complete512` | 1 | 512 | complete, storage-backed | 46.4–47.7 µs | 49.5–49.6 kB | 11 |
+| `Complete2048` | 1 | 2,048 | complete, storage-backed | 434–438 µs | 274–277 kB | 79–85 |
+| `Incomplete65536` | 1 | 65,536 | incomplete, no storage | 3.77–4.63 ms | 14.0 MB | 28 |
+| `Incomplete262144` | 1 | 262,144 | incomplete, no storage | 16.4–16.8 ms | 56.3–56.4 MB | 38–39 |
 
-### Extrapolation to the 100 ms cadence (labelled as extrapolation)
+**`-benchtime=500x`**, storage-backed cases only, `-count=3`:
 
-At 10 samples/s, one active download, using the measured storage-backed slope:
+| benchmark | pieces | ns/op (3 reps) | B/op | allocs/op |
+|-----------|--------|----------------|------|-----------|
+| `Complete512` | 512 | 265–302 µs | 86.9 kB | 96 |
+| `Complete2048` | 2,048 | 1.14–1.22 ms | 397 kB | 360–361 |
 
-- 512 pieces → ~2.8 ms/s of transfer-goroutine time (0.3 % duty), 0.87 MB/s allocated.
-- 2,048 pieces → ~11.7 ms/s (1.2 % duty), 4.0 MB/s allocated.
+Within a regime the repetitions are tight (≤7 % spread); **across** regimes the
+storage-backed cases differ by 2.6–2.8× at 2,048 pieces and 5.6–6.4× at 512 pieces, while
+`B/op` and `allocs/op` also rise (397 kB/360 allocs versus 275 kB/82). The two storage-less
+cases are stable across regimes (they do not appear in the 500x table because the second
+command filters to `Complete`). **The cause is unknown.** The difference was not
+established to be warm-up, GC, storage backing or completion state in isolation, and the
+default-duration numbers are *not* called steady state: they are the results of the
+documented command, nothing more.
 
-The intended workload (media torrents with 1–16 MiB pieces) lands in that range: a
-60 GiB file at 16 MiB pieces is ~3,800 pieces, ~2 ms per sample.
+An earlier run of this slice recorded only the `-benchtime=500x` numbers (271–288 µs and
+1.12–1.22 ms) and derived the per-piece slope from them. Those figures are retained here
+as the second regime, not as the primary measurement.
 
-**What is not measured**: the storage-backed path above ~2,048 pieces. If the ~0.55 µs
-per-piece slope held at 65,536 pieces, one sample would be ~36 ms — a third of the
-cadence — but that number is extrapolation across the fixture gap, not a result. Nothing
-here measures client lock contention (`File.State()` holds `cl.rLock` for the whole walk)
-or the transfer's own throughput while sampling; neither is inferred from allocation
-counts.
+### Per-piece figures and the extrapolation
+
+From the **default-duration** storage-backed measurements: 512 pieces → ~92 ns/piece,
+2,048 pieces → ~213 ns/piece. At the 100 ms cadence, 2,048 pieces is ~0.44 ms per sample
+(≈0.44 % of the transfer goroutine, ~4.4 % of one core-second per second across ten
+samples); 512 pieces is ~0.047 ms.
+
+The 60 GiB example — 60 GiB at 16 MiB pieces ≈ 3,800 pieces → ~0.8 ms per sample — is an
+**extrapolation beyond the largest measured storage-backed case (2,048 pieces)**, using
+the 2,048-piece slope. It is not a benchmark result.
 
 ### Decision
 
-Acceptable for the intended workload, so production code is untouched. The trigger for
-revisiting is concrete: re-measure with a *storage-backed* many-piece fixture before any
-ETA or stall detection adds more sampling; if the slope holds, add a bound (cache the
-last verified count per attempt or walk only changed pieces) rather than moving the same
-work to a goroutine. Allocations are the second-order concern (0.4–0.9 MB per sample at
-realistic sizes).
+The workflow decision uses the default-duration regime, because that is what the
+documented command produces: for the intended workload (media torrents, 1–16 MiB pieces,
+at most a few thousand pieces per file) a sample costs well under a millisecond, which
+does not justify changing the sampler. Production code is untouched. Revisit when the
+trigger below fires, and note that the slower `500x` regime would still only be a few
+percent of the goroutine at these sizes — it does not change the decision either.
+
+### Fixture guards (`434640b`, this follow-up)
+
+All four benchmarks now assert their fixture outside the timed loop: the piece count for
+every case, `selectedVerified == 8 MiB` / `== 32 MiB` for the storage-backed cases, and
+`== 0` for both storage-less cases. The no-payload check accepts a missing payload
+directory (storage never opened) or an empty one, and fails on unexpected read errors —
+which is what the fixture text above now says.
+
+### Future asynchronous sampling
+
+If sampling ever moves off the attempt's goroutine it must carry an explicit **attempt
+identity** (not just the queue entry id), and it must ship a regression that rejects a
+late sample from attempt A after attempt B has started for the same entry. The current
+ordering guarantees that by construction — the callback runs synchronously inside the
+attempt's own `Run`, and `liveRemove` (which also drops the rate baseline) happens before
+the next claim — and that is exactly the guarantee an asynchronous sampler would lose.
+
+### Revisit trigger
+
+Measure a **storage-backed many-piece** fixture (above 2,048 pieces) before expanding
+sampling for ETA or stalled-job detection. If the slope holds, bound the work — cache the
+last verified count per attempt, or walk only changed pieces — rather than moving the same
+work to a goroutine. Allocations are the second-order concern.
 
 ### Evidence accuracy
 
@@ -2930,13 +2965,16 @@ realistic sizes).
   the cause. Retained data is verified before the wait loop starts
   (`bittorrent.go:1027-1032`), so verification is not reported as transfer speed, apart
   from the one trailing piece the library may mark after `VerifyDataContext` returns.
-- Unknown stays distinct from measured zero; this slice did not touch the sampling path.
+- Unknown stays distinct from measured zero; this follow-up did not touch the sampling
+  path, and no lock contention or transfer-throughput impact is claimed or inferred.
 
 ### Commands
 
-- `go test ./internal/transfer/bittorrent/ -run '^$' -bench 'BenchmarkSelectedVerified' -benchtime=500x -count=3` (and 262,144 at `-benchtime=200x -count=3`)
-- `go test ./internal/transfer/bittorrent/ -run 'TestSelectedVerified' -race -count=2`
+- `go test ./internal/transfer/bittorrent/ -run '^$' -bench '^BenchmarkSelectedVerified' -benchmem -count=3` (four cases)
+- `go test ./internal/transfer/bittorrent/ -run '^$' -bench '^BenchmarkSelectedVerifiedComplete' -benchmem -benchtime=500x -count=3` (two cases)
+- `go test ./internal/transfer/bittorrent/ -run '^TestSelectedVerified' -race -count=2` (both correctness tests)
 - `make test`, `make lint`, `go vet ./...`, `git diff --check`, `gofmt -l .`
+- Platform: 32-core Linux 6.18.63-gentoo-dist-bin, Go 1.27.3.
 
 ### Limits
 

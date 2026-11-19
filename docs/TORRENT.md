@@ -980,32 +980,30 @@ knowing:
 
 - It moves in piece-sized steps. A torrent with 4 MiB pieces can sit at one value for
   seconds and then jump, and the rate follows the jump.
-- Resumed data counts immediately, which is why the first sample of an attempt never
-  reports a rate.
+- Resumed data counts immediately, so an attempt that starts from retained bytes already
+  has a large first value — and, like any first sample, no rate yet.
 
 `progress_rate` is a **progress** rate on the selected payload, not network throughput,
 and not the transfer engine's byte counter. It is sampled from the transfer's 100ms
 poll and computed over at least 250ms of baseline, so a sample inside that window keeps
-the previous baseline instead of producing a spike.
+the previous baseline instead of producing a spike. `progress_rate` is *absent* — not
+zero — on the first sample of an attempt, because there is no baseline yet; it is also
+absent after a counter rollback (the baseline restarts) and for a new attempt on the
+same entry. A measured zero (the same verified bytes over a full window) is reported as
+`0`, which is a different statement from an unavailable rate. The baseline is per
+attempt, so a retry never inherits the previous attempt's rate, and a sample arriving
+after an attempt has ended is dropped rather than reviving the row.
 
-Sampling walks every piece covering the selected files (`File.State()`), so its cost is
-linear in the selected piece count: measured ~0.55 µs per piece on a storage-backed
-torrent, i.e. ~1.2 ms per sample for 2,000 pieces (about 1% of the transfer goroutine at
-a 100 ms cadence) and ~0.28 ms for 500 pieces. Torrents with tens of thousands of small
-pieces are outside what has been measured; see the BT-13 checkpoint in
-`BT-CHECKPOINTS.md` for the numbers, the extrapolation and the gap. It is *absent* — not zero — on the
-first sample of an attempt, after a counter rollback (where the baseline restarts), and
-for a new attempt on the same entry. A measured zero (same verified bytes over a full
-window) is reported as `0`. The baseline is per attempt, so a retry never inherits the
-previous attempt's rate, and a sample arriving after an attempt ended is dropped rather
-than reviving the row.
-
-Unknown stays unknown: `queue live` prints `selected=`/`progress=` only when the
-snapshot carried them, the TUI overlay does the same, and neither infers completion from
-a displayed number (there is no percentage field). The schema change is additive with
-`omitempty`, so an older endpoint's snapshot decodes with the fields absent (unknown) and
-an older client reading a new endpoint ignores them; measured zeros survive the round
-trip as zeros.
+Sampling for these fields walks every piece covering the selected files
+(`File.State()`), so its cost is linear in the selected piece count. Measured on this
+box with the default Go benchmark duration, one storage-backed file: ~92 ns per piece
+at 512 pieces and ~213 ns per piece at 2,048 pieces, i.e. ~0.44 ms per sample at 2,048
+pieces — under half a percent of the transfer goroutine at the 100ms cadence. The same
+benchmarks with `-benchtime=500x` report 2.6–6.4× more time per sample; the cause of
+that difference is not established, and neither regime has been shown to match
+production. Nothing storage-backed above 2,048 pieces has been measured. The BT-13
+checkpoint in `BT-CHECKPOINTS.md` records both regimes, the per-piece figures, the
+extrapolation and the gap.
 
 ### Download priorities inside a selection
 
