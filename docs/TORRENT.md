@@ -765,34 +765,49 @@ previous behaviour.
   per-job share and no dynamic adjustment; the budgets apply to the runner's own
   clients only, in aggregate.
 
-### Managed seeding (internal, first proof)
+### Managed seeding (internal, startup-safe)
 
 `OpenSeedSession` (`internal/transfer/bittorrent/seed.go`) serves one isolated
-workspace: it reopens from the persisted metainfo, verifies the local data and then
-allows upload. There is **no queue integration, no CLI command and no seed slot** in
-this slice, and nothing calls it yet.
+workspace. There is still **no queue integration, no CLI command and no seed slot**;
+nothing in the product calls it yet.
 
-Eligibility, all enforced before a client is allowed to serve:
+Startup is deliberately two-phase, because the earlier single-client version served a
+peer before anyone asked it to:
+
+1. **Verify offline.** The workspace is opened for ownership, then verified in a
+   client that cannot reach a peer in either direction - `AcceptPeerConnections=false`,
+   no DHT, no trackers, no PEX, no uTP, no webseeds, no dialing, `ListenPort 0`. The
+   session asserts `len(Listeners()) == 0`, so "no peer path" is structural, not a
+   hopeful byte count.
+2. **Serve on demand.** `Serve` builds a second client around the *same* piece
+   completion state the verifier produced, and only then listens and accepts uploads.
+   Nothing is fetchable in the meantime: download is disallowed and no file carries a
+   download priority.
+
+The verifier uses a **fresh in-memory piece completion**, not the job's persisted
+completion database. That is the fix for the same-length corruption that used to be
+missed intermittently: with the database in play, a piece already marked complete was
+never re-hashed, so a flipped byte could survive verification. With a fresh map every
+piece is hashed from the files on disk, and a corrupted workspace is refused in
+single-digit milliseconds. The completion database is left untouched - not deleted, not
+rewritten - and the previous capture is never modified.
+
+Eligibility, all enforced before any client exists:
 
 | requirement | refusal |
 |-------------|---------|
 | a job record with a published capture whose manifest is present | `ErrSeedIneligible` |
 | a selection covering every file entry in the torrent | `ErrSeedSelective` - a boundary piece would expose bytes that were never attested |
-| local data that verifies completely | `ErrSeedDataIncomplete`, with the missing-piece count |
+| local data that hashes completely | `ErrSeedDataIncomplete`, with the missing-piece count |
 
-Two library facts this rests on, both verified against the pinned source:
+The workspace lock is held across verification, handoff and serving; there is no
+unlock/reopen window in which another writer could swap the payload. The client and its
+storage are closed before the lock is released. The lock coordinates Provenance
+writers only - an external process editing the payload is outside this model, and such
+an edit is caught by the next verification pass rather than by the lock.
 
-- `VerifyDataContext` is **synchronous** per piece (`piece.go`): it queues a check
-  and waits for `numVerifies` to advance, so piece states afterwards are the truth.
-  `Complete()` is a cached flag that lags that pass and, for damaged data, never
-  becomes true - waiting on it is how an earlier attempt hung.
-- A torrent admitted through the adapter's normal `admitSpec` carries
-  `DeferStorageOpen` and `DisallowDataDownload`, and in that state **the piece-hashing
-  loop never runs**, so verification waits forever. The seed path therefore applies
-  only `applySpecDiscovery`, and disallows download *after* verifying.
-
-Verification updates the backend's piece completion state; this is not the read-only
-BT-06 recheck.
+Verification updates the piece completion state used by this session; it is not the
+read-only BT-06 recheck.
 
 ### Peer limits
 

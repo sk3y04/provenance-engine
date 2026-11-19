@@ -1318,3 +1318,85 @@ until the cause is understood.
 BT-08d.3: persisted seed intent, a separate slot pool, and the last-download-slot
 test - plus the client-lifetime change that closes the serving-before-verification
 window.
+
+## BT-08d.2a — Verify offline, then allow serving
+
+**Starting SHA** `1c7fcc1` (clean). Both BT-08d.2 blockers were reproduced here before
+being fixed; neither is skipped any more.
+
+### Root cause 1: a peer was served before `Serve`
+
+Single-client startup built a listening client, then verified, then enabled upload. The
+pin does not honour `spec.DisallowDataUpload` once every piece is complete, so the
+client began serving as the last piece was marked - about 2 MiB reached an instrumented
+leecher before `Serve` was called.
+
+### Root cause 2: same-length corruption was intermittently missed
+
+`openWorkspaceAt` loads the job's persisted piece completion database. A piece already
+recorded complete is not re-hashed, so a flipped byte on a complete piece could pass
+verification. Whether it did depended on what the database already held - which is why
+the failure was intermittent rather than absent.
+
+### Fix
+
+Startup is now two phases behind one held workspace lock:
+
+1. `openWorkspaceBare` takes ownership and validates the job record - no storage, no
+   client.
+2. A **network-inert** verification client (`AcceptPeerConnections=false`, no DHT, no
+   trackers, no PEX, no uTP, no webseeds, `DisableTCP`, `ListenPort 0`) hashes the
+   workspace against a **fresh in-memory `MapPieceCompletion`**. The session refuses to
+   continue if that client reports any listener.
+3. `Serve` builds the serving client around the same completion state, applies the
+   configured discovery policy, enables upload and blocks. Download stays disallowed
+   for the session's life; no repair path exists.
+
+The persisted completion database is never read on this path - not deleted, not
+rewritten. This is the reviewed alternative to "clear the DB and hope".
+
+### Acceptance results
+
+| test | result |
+|------|--------|
+| `TestSeedVerificationDoesNotFetchOrServe` | every client created during startup is observed: 0 listeners, port 0, a dial to that port is refused; `Listening()` false, `Address()` empty, 0 bytes served, 0 payload fetched; after `Serve`, a fresh leecher receives the exact 12 MiB payload |
+| `TestSeedSessionRefusesDamagedWorkspace` | completion DB retained, one byte flipped at the same length: refused in **2-3 ms** with `1 of 8 pieces are not on disk`, manifest unchanged, lock free. Now deterministic: the fresh map forces a real hash of every piece |
+| `TestSeedSessionRefusesSelectiveWorkspace` | 1-of-2 selection refused, lock free |
+| `TestSeedSessionCancelDuringVerification` | `context.Canceled`, lock free |
+| `TestSeedCancelBetweenVerificationAndServe` | close before Serve: no listener, no client, lock free |
+| `TestSeedFailedHandoffLeavesNothingServing` | `Serve` on a cancelled context returns `context.Canceled`, leaves no listener, serves nothing, releases the lock |
+| `TestSeedStopOneKeepsSibling` | stopping one seed releases its lock, the sibling keeps serving, limiter unchanged |
+| `TestSeedAggregateUploadBudget` | preserved: shared 4,194,304 B in 6.05 s = **519,952 B/s** vs a 524,288 B/s budget; independent control 4,194,304 B in 2.016 s = **1,559,998 B/s**; `overlap=true` in both |
+
+### Gates
+
+- `go test ./internal/transfer/bittorrent/ -race -run TestSeed -count=3 -timeout 500s`
+  → `ok 52.974s`, no skips (one data race on `SeedSession.client` was found here and
+  fixed with a mutex before this number was recorded)
+- `go vet ./...` clean, `gofmt -l ./cmd ./internal` empty, `golangci-lint run ./...`
+  → `0 issues`, `git diff --check` clean
+- `make test` (repo-wide, `-race`) → exit 0, all packages ok,
+  `internal/transfer/bittorrent 77.011s`
+
+### Filesystem threat model
+
+The workspace lock (`.provenance/torrent/staging.lock`) coordinates Provenance writers:
+one fetch, recheck or seed session at a time. It does not defend against an external
+process editing the payload; that is caught by the next verification pass, which now
+always hashes every piece.
+
+### Not claimed
+
+- No queue integration, seed intent, slots, CLI, RPC, selective seeding or dependency
+  change.
+- Verification is not a defence against a file swapped *between* verification and a
+  later read; the lock covers Provenance writers only.
+- The pin's per-torrent upload flag is still not a hard gate; this slice avoids relying
+  on it rather than fixing it, because nothing listens before `Serve`.
+- No claim that a second `Serve` call on one session is handled: it starts a client
+  once, and a second call blocks on the same context.
+
+### Next
+
+BT-08d.3: persisted seed intent, a separate seed slot pool, and the scheduler test that
+a live seed leaves the last download slot available.
