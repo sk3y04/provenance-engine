@@ -3543,3 +3543,36 @@ The test fixture has printed labels `Cover`, `iv`, `1` on physical indices
 PR-4B (DOI/arXiv metadata identity and citation export), then PR-4C (versioned
 documentation evidence). The pre-existing torrentqueue sampler flake remains
 carried from BT-14.
+
+## PR-4B (partial) — BibTeX and CSL JSON export
+
+**Starting SHA** `e8552ae` (tree clean). **Ending SHA** `7d0fe06`.
+
+Scope shipped: `vault export REVISION_ID --format bibtex|csl-json` over a
+filesystem revision. `Entity.Identifiers` is available for explicit `doi`,
+`arxiv` or other provider identifiers; nothing infers them from a URL. Each
+BibTeX record carries a `note = {Pinned evidence: provenance://…}` and each CSL
+JSON item carries `provenance` plus `archive_sha256`. The citation key/id is the
+entity id, never a passage/chunk id.
+
+Not shipped: DOI/arXiv intake, a work/version model, Crossref
+correction/retraction observations, preprint/publication linking.
+
+### Verified
+
+| Command | Result |
+|---|---|
+| `go test ./internal/citation -run TestBibTeX -count=1` | pass |
+| `go test ./internal/citation ./cmd/provenance -count=1` | pass |
+| `go test -race ./internal/citation ./cmd/provenance` | pass |
+| `go vet ./...`, `golangci-lint run …`, `gofmt -l cmd internal` | clean |
+
+CLI smoke against the PR-4A vault: BibTeX printed the entity key, title, year,
+URL and pinned evidence note; CSL JSON printed an article item with `DOI`/
+`arXiv` absent (no identifiers), `archive_sha256` and the pinned `provenance`
+URI. No chunk id appeared in either.
+
+### Next
+
+PR-4B intake (DOI/arXiv metadata-only records, provider observation timestamps,
+Crossref update observations), then PR-4C versioned docs evidence.
