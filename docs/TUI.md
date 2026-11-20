@@ -18,7 +18,7 @@ The TUI has 12 views:
 | **Archive Search** | Full-text search across vaulted content | Main menu → "Archive search" |
 | **Vault** | Vault status and archive collection browser | Main menu → "Vault" |
 | **Runner** | Live download progress with per-file bars | Triggered from any download action |
-| **Torrent Queue** | Read-only view of the durable torrent queue; start/pause/retry/seed intents | Main menu → "Torrent queue" |
+| **Torrent Queue** | View of the durable torrent queue; start/pause/cancel/retry/seed/import intents | Main menu → "Torrent queue" |
 | **Torrent Add** | Pick a source and its files, then add a paused queue entry | Torrent Queue → `a` |
 
 ---
@@ -167,7 +167,9 @@ Shows vault initialization status and lists archive collections with revision co
 | `down` / `j` | Move selection down |
 | `s` | Save start intent (desired=run) |
 | `p` | Save pause intent (desired=paused) |
-| `t` | Retry a blocked or failed entry |
+| `x` | Save cancel intent (terminal until retry; payload kept) |
+| `t` | Retry a blocked, failed or cancelled entry |
+| `i` | Retry the entry's vault import (never downloads again) |
 | `e` / `d` | Enable / disable seed intent |
 | `a` | Add a torrent to the queue (opens the picker) |
 | `r` | Refresh from disk |
@@ -177,8 +179,9 @@ The view is read-only with respect to transfers: it reads the durable entry
 records and, when a foreground runner is reachable, its read-only snapshot. Keys
 write *intent* through the same store the CLI uses; nothing here launches a
 runner, and a successful action means the queue accepted the change, not that a
-runner has acted on it. A saved pause keeps the entry's slot until its client
-closes, and the status line says so. The source field is masked, so a magnet
+runner has acted on it. A saved pause or cancel keeps the entry's slot until its client
+closes, and the status line says so. Cancel is terminal until `t`; neither
+action deletes payload. The source field is masked, so a magnet
 carrying tracker credentials is never echoed.
 
 ---
