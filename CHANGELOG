@@ -1,6 +1,20 @@
-## [Unreleased]
+## [0.11.0] - 2026-11-20
+
+A research and vault release. It adds page-pinned PDF citations, BibTeX and CSL
+JSON export, offline vault verification, deterministic collection replay, and a
+durable torrent-to-vault handoff with an explicit cancel intent. The public
+facade gains one additive option — `Config.DisableHistory` — and no exported
+signature changes, so existing consumers compile unchanged.
 
 ### Added
+
+- **Facade callers can suppress the CLI history entry.**
+  `engine.Config.DisableHistory` stops `Engine.Download` from appending to
+  `~/.cache/provenance/history.json` (or `PROVENANCE_HISTORY_FILE`). The zero
+  value keeps the CLI behaviour, so an embedded caller — a desktop shell, a
+  hosted worker — can perform real downloads without polluting the CLI user's own
+  run history. It is deliberately separate from `DryRun`: a hosted run moves
+  bytes and must still leave that file alone.
 
 - **BibTeX and CSL JSON export.** `vault export REVISION_ID --format
   bibtex|csl-json` writes bibliography records from the filesystem revision. The

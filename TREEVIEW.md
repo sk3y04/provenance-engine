@@ -1,7 +1,7 @@
 # Treeview - File Reference
 
-File-level reference for every Go source file in the module (284 files),
-regenerated for the `v0.10.1` release. Test files are listed with their coverage.
+File-level reference for every Go source file in the module (297 files),
+regenerated for the `v0.11.0` release. Test files are listed with their coverage.
 Package-level design lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md);
 the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 
@@ -37,6 +37,7 @@ the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 | `soulseek_search_test.go` | Group selection, download/jobs/recover/cancel CLI wiring, missing-mount refusal |
 | `soulseek_shares_test.go` | Shares/uploads CLI wiring, configured-root requirement |
 | `main_test.go` | Command tree, auto-install skip table (including `torrent` and `soulseek`), exit-code mapping |
+| `compat_baseline_test.go` | CLI contract baseline against the real binary: exit codes, stderr/stdout separation, `torrent queue list`/`status` `--json` shapes |
 
 
 ## `engine/` — public facade
@@ -53,6 +54,7 @@ the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 | `example_test.go` | Compile-time external usage examples |
 | `capability_test.go` | Capability report shape |
 | `no_terminal_test.go` | No terminal output with a sink (and nil sink); slow/panicking sink regression |
+| `history_side_effect_test.go` | The facade's CLI-history side effect: written by default, untouched with `Config.DisableHistory` |
 | `externaltest/consumer.go` | Standalone external module importing only the facade (`make engine-example`) |
 | `engine_concurrent_test.go` | Concurrent `Resolve`/`Download` alongside `Capabilities` re-probing (race regression) |
 
@@ -236,6 +238,7 @@ the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 | `sync.go` | Incremental sync: scan → dedup against seen IDs → download → record; reload-before-record TOCTOU guard; capture recording |
 | `store_test.go` / `sync_test.go` | Persistence and sync/dedup behavior |
 | `capture_test.go` | Capture-to-record path and duplicate handling |
+| `replay_test.go` | Seen-identity stability, per-collection serialization, seen/result write-failure boundaries |
 
 
 ## `internal/manifest/` — scan & capture records
@@ -272,6 +275,10 @@ the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 | `ingest.go` | Capture-manifest ingest: path-traversal rejection, hash verification, dedupe, deterministic revision IDs, `WriteRevision` |
 | `diff.go` | Field-level entity diffing between revisions |
 | `ingest_test.go` / `diff_test.go` | Ingest invariants (traversal, hash mismatch, missing files, dedupe, round trip); diff behavior |
+| `locator.go` | Page-pinned passage locators: archived blob SHA-256, physical page, printed label, normalized rectangles; resolves a passage through the revision manifest |
+| `verify.go` | Read-only `VerifyVault`: hashes each referenced blob once, reports missing/mismatch/unreadable/invalid and shared-blob reference counts; never repairs |
+| `locator_test.go` | Locator resolution against archived bytes; page-pinned citation ids stay stable |
+| `verify_test.go` | Clean vault, shared blobs, missing/mismatch/unreadable manifests, empty vault |
 
 ## `internal/blobstore/` — content-addressed storage
 
@@ -300,6 +307,9 @@ the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 |---|---|
 | `citation.go` | `provenance://<collection>@<revision>#<entity>` references; Parse/Format (first-@/first-# split, empty-component rejection); Markdown/Plain/JSON formatters; `FromEntity`; `Short` |
 | `citation_test.go` | Round trips incl. @/#-bearing entity URLs, parse errors, formatters, entity mapping |
+| `export.go` | BibTeX and CSL JSON export from a revision: citation key = entity id, pinned `provenance://…` field, archived SHA-256 |
+| `export_test.go` | Both formats carry the pinned evidence without moving it into the citation key |
+| `offline_test.go` | A restored vault resolves citations with no network or database |
 
 ## `internal/importers/` — knowledge importers
 
@@ -389,7 +399,10 @@ the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 | `admit.go` | One admission path for the CLI and the TUI |
 | `actions.go` | Intent transitions shared by the CLI and the TUI |
 | `live.go` | Read-only Unix-socket snapshots (`queue live`), progress projection and rate baseline per attempt |
+| `import.go` | Optional vault handoff for a committed capture: independent, idempotent import step that retries without re-downloading |
 | `actions_test.go` | Intent transitions and their guards |
+| `cancel_test.go` | Cancel as a distinct terminal intent: keeps payload/workspace, not resumed, retry reopens |
+| `import_test.go` | Durable/idempotent handoff, import failure keeps the capture, symlink escape rejection, target conflicts |
 | `concurrency_test.go` | Worker and slot concurrency |
 | `filesource_probe_test.go` | Direct-vs-queue isolation probe |
 | `integration_test.go` | End-to-end queue runs against a local seeder |
