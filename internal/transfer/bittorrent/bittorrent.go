@@ -154,8 +154,10 @@ type Config struct {
 	// two minutes.
 	MetadataTimeout time.Duration
 
-	// Timeout bounds the whole fetch, metadata included. Zero means no
-	// deadline beyond the caller's context.
+	// Timeout bounds the transfer, metadata included. Zero means no
+	// deadline beyond the caller's context. It does not bound the KeepSeeding
+	// wait: once the capture is committed, seeding continues until the caller's
+	// context is cancelled.
 	Timeout time.Duration
 
 	// FilePriorities raises the download preference of individual files that are
@@ -167,7 +169,8 @@ type Config struct {
 	FilePriorities map[string]string
 
 	// KeepSeeding keeps the client alive after a successful capture until the
-	// context is cancelled. Off by default: the slice stops at capture.
+	// caller's context is cancelled; Config.Timeout does not cut it short. Off
+	// by default: the slice stops at capture.
 	KeepSeeding bool
 
 	// Discovery selects which network branches this session may use. The zero
@@ -862,6 +865,9 @@ func (s *Session) fetchSource(ctx context.Context, src source, selection []strin
 			return Capture{}, err
 		}
 	}
+	// The transfer deadline bounds the transfer, metadata included — not the
+	// KeepSeeding wait, which ends only when the caller's context is cancelled.
+	callerCtx := ctx
 	if s.cfg.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.cfg.Timeout)
@@ -944,12 +950,14 @@ func (s *Session) fetchSource(ctx context.Context, src source, selection []strin
 	}
 
 	// 3. Transfer.
-	return s.transferAndCapture(ctx, src, job, warnings, preOpened)
+	return s.transferAndCapture(ctx, callerCtx, src, job, warnings, preOpened)
 }
 
 // transferAndCapture runs the torrent backend for the job's selection, records
-// the verified payload, and commits the capture.
-func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRecord, warnings []string, pre *opened) (Capture, error) {
+// the verified payload, and commits the capture. ctx carries the transfer
+// deadline; callerCtx is the un-deadlined caller context that alone ends the
+// KeepSeeding wait.
+func (s *Session) transferAndCapture(ctx context.Context, callerCtx context.Context, src source, job *jobRecord, warnings []string, pre *opened) (Capture, error) {
 	o := pre
 	if o == nil {
 		metaCtx, cancelMeta := context.WithTimeout(ctx, s.cfg.MetadataTimeout)
@@ -1065,7 +1073,7 @@ func (s *Session) transferAndCapture(ctx context.Context, src source, job *jobRe
 		if err := s.markSeeding(job, SeedingActive); err != nil {
 			return cap, err
 		}
-		<-ctx.Done()
+		<-callerCtx.Done()
 		if err := s.markSeeding(job, SeedingStopped); err != nil {
 			return cap, err
 		}

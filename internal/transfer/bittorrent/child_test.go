@@ -10,9 +10,33 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// stderrBuf synchronises the os/exec copy goroutine's writes with the test's
+// reads. A bare bytes.Buffer assigned to cmd.Stderr races: exec copies the
+// child's stderr in its own goroutine, and nothing orders that goroutine
+// against a test-side read before Wait returns (observed as a DATA RACE in the
+// v0.10.0 release gate when expectLine reported a failure while the child's
+// library logs were still draining).
+type stderrBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *stderrBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *stderrBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
 
 // child is one real process running the torrent backend in helper mode.
 type child struct {
@@ -20,7 +44,7 @@ type child struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	lines  chan string
-	stderr *bytes.Buffer
+	stderr *stderrBuf
 	exited bool
 	code   int
 }
@@ -43,7 +67,7 @@ func startChild(t *testing.T, env map[string]string) *child {
 	if err != nil {
 		t.Fatalf("child stdout: %v", err)
 	}
-	stderr := &bytes.Buffer{}
+	stderr := &stderrBuf{}
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start child: %v", err)

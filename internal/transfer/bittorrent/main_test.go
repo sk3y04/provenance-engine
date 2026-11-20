@@ -61,7 +61,10 @@ func runHelper() int {
 		StagingDir:      os.Getenv(helperStaging),
 		Discovery:       DiscoveryDirect,
 		MetadataTimeout: 20 * time.Second,
-		Timeout:         60 * time.Second,
+		// Transfer budget only: the KeepSeeding wait ends on the caller's
+		// context, not on this deadline. 120s leaves headroom for a loaded CI
+		// runner (the v0.10.0 gate observed a ~60s capture-plus-build window).
+		Timeout: 120 * time.Second,
 	}
 	if p := os.Getenv(helperPeer); p != "" {
 		cfg.Peers = []string{p}
