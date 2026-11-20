@@ -3109,3 +3109,118 @@ ETA and stalled-job policy remain out of scope for this checkpoint.
 - `git diff --check`
 - Platform: 32-core Linux 6.18.63-gentoo-dist-bin, Go 1.27.3, NVMe-backed `/home` with
   376 GB free; fixture footprint 1.08 GB per run of the large case, removed afterwards.
+
+---
+
+## BT-15 — v0.10.0 release gate: seeding outlives the transfer deadline
+
+**Starting SHA** `17b667f` (`master`, the pushed `v0.10.0` tag; tree clean).
+**Ending SHA** `832c3ee` (`fix(torrent): the transfer deadline no longer ends
+KeepSeeding`). Changed paths: `internal/transfer/bittorrent/bittorrent.go`,
+`child_test.go`, `main_test.go`, new `seed_timeout_test.go`.
+
+**Trigger.** The tag-triggered Release workflow (run 44722782164) failed at
+"Run tests" on the CI runner: `TestCLIStatusDuringActiveSeeding` reported
+`recorded seeding = "stopped"`, a modified job record in the staging-tree
+diff, `child exited before "BUSY"` (the competitor printed `READY OK …
+reconciled=true … DONE`), and two `WARNING: DATA RACE` reports. CI on master
+passed; the v0.9.0 Release run had passed. The torrent code is byte-identical
+to v0.9.0 (`git diff v0.9.0..HEAD -- internal/transfer/ internal/torrentqueue/
+internal/filelock/ internal/atomicfile/` empty), so this is not a merge
+regression — a pre-existing, regime-sensitive defect the slskd merge happened
+to expose.
+
+**Root cause 1 (production).** `fetchSource` wrapped the whole call in
+`context.WithTimeout(ctx, cfg.Timeout)`, and `transferAndCapture`'s
+KeepSeeding wait (`<-ctx.Done()`) observed that derived context. The helper
+sets `Timeout: 60s`; on the loaded CI runner the deadline expired while the
+owner was seeding — the 81.66 s test window includes the cold-cache CLI build
+inside `runCLIStatus` — so the owner recorded `stopped`, returned, and
+released the flock before the competitor started. The competitor then
+legitimately acquired the root. The same deadline-driven `markSeeding(stopped)`
+write explains both the "stopped" record and the job-record mtime diff the
+test attributed to `status` (status wrote nothing; the owner's own stop did).
+The contract (`KeepSeeding` lasts "until the context is cancelled"; the CLI
+calls `--timeout` an "Overall transfer deadline") says the transfer deadline
+must not end seeding. The default CLI path (`--timeout 0`) was unaffected;
+`torrent fetch --seed --timeout <d>` was the latent product case.
+
+**Root cause 2 (harness).** `startChild` assigned a bare `bytes.Buffer` to
+`cmd.Stderr`; `expectLine`/`wait` read it on failure paths while os/exec's
+copy goroutine could still be writing. No happens-before edge exists before
+`Wait`, so the failure-path read raced — both CI reports are
+`child_test.go:74` (read) vs the exec copy goroutine created at
+`child_test.go:48`. The race only manifests when root cause 1 makes the test
+fail; the two defects are one chain.
+
+**Fix.** The seeding wait now observes the caller's context, captured before
+the deadline wrap (`callerCtx` threaded through `transferAndCapture`);
+`Config.Timeout`/`KeepSeeding` docs state the boundary explicitly. A
+mutex-guarded `stderrBuf` replaces the raw buffer. The helper's transfer
+budget rises 60 s → 120 s for loaded-runner headroom; the tests' own wait
+budgets still bound everything.
+
+**RED watched first.** `TestSeedingOutlivesTransferTimeout` (new, hermetic,
+20 s transfer deadline) against the pre-fix code: `fetch returned when the
+transfer deadline expired (cap={… State:{Payload:ready Capture:committed
+Seeding:stopped} …} err=<nil>)` at 21.06 s — the exact CI signature. Green
+after the fix (21.07 s): ownership held past the deadline (`ErrStagingBusy`
+probe), record still `seeding`, fetch returns only on cancellation, record
+then `stopped`, root acquirable after Close.
+
+**Stderr-lock discrimination proof** (scratch worktree at pre-fix `17b667f`,
+removed afterwards): the failure path was forced deterministically — the
+competitor pointed at an empty root (so it legitimately completes) and the
+helper emitted 200 stderr lines. Old harness: three `WARNING: DATA RACE`
+reports with the CI stack (`child_test.go:74` vs `:48`, via
+`status_process_test.go:182/175`). With `stderrBuf` alone (production fix NOT
+applied in that worktree): zero races; the only failure is the intended
+forced `child exited before "BUSY"` assertion. The lock, not the production
+fix, removes the race.
+
+**Hosted CI at the push (`17b667f`).** CI on master (run 44722782559):
+success. Security on master (run 44722782434): failure, sole failing job
+"Snyk Open Source" — `SNYK_TOKEN:` empty, `Status: 401 Unauthorized`, same
+cause as the baseline run 44627302628 at the v0.9.0 push: a pre-existing
+repo-config gap, not a merge regression. Release on the tag (run
+44722782164): failure at "Run tests", the defect this entry fixes.
+
+**Commands actually run.**
+
+| Command | Result |
+| --- | --- |
+| `go test -race ./internal/transfer/bittorrent/ -run TestSeedingOutlivesTransferTimeout` (pre-fix) | FAIL 21.06 s, deadline-ended seeding |
+| same (post-fix) | PASS 21.07 s |
+| `go test -race ./internal/transfer/bittorrent/ -run 'TestCLIStatus\|TestOwnership\|TestSeeding' -count=3` | ok 97.4 s, all green ×3 |
+| scratch-worktree race proof (old harness / stderrBuf only) | 3 races / 0 races |
+| `gofmt -l .` | empty (after formatting the new test) |
+| `go vet ./...` | clean |
+| `golangci-lint run ./...` | 0 issues |
+| `go mod tidy -diff` | empty |
+| `make test` (`go test -race ./...`) | EXIT=0; bittorrent 96.6 s, torrentqueue 106.2 s |
+
+**Verified vs inferred.**
+
+| Claim | Status |
+| --- | --- |
+| The transfer deadline ended seeding and released the root | verified (local RED with the CI failure signature; CI log) |
+| The stderr race is the exec-copy goroutine vs the failure-path read | verified (local reproduction, stack identical to CI) |
+| `stderrBuf` alone removes the race | verified (discrimination proof, production fix absent) |
+| Default CLI seeding (`--timeout 0`) was unaffected | verified (flag default read; deadline wrap only when > 0) |
+| `fetch --seed --timeout <d>` stopped seeding early | verified (the regression is exactly this case) |
+| The v0.9.0 Release pass was timing luck | inferred (identical code; that runner's interrupt-before-deadline timing not measured) |
+| Exact CI capture duration | not measured; the 81.66 s window includes the CLI build |
+
+**Limits and non-claims.** Hosted CI has not been re-run on the fix — the
+`v0.10.0` tag still points at the pre-fix `17b667f`, its Release run stays
+red, and no GitHub release was published for it. Queue-managed seeding is a
+separate path (`torrentqueue` adapter sets `KeepSeeding: false`; the seed
+session owns its lifetime) and is untouched by this change. No new real-peer
+evidence; the loopback fixture boundary stands.
+
+**Release state and next step.** `v0.10.0` is pushed (master and tag verified
+at `17b667f` on origin) but unreleased; the fix is local at `832c3ee`. The
+publication path — a `v0.10.1` patch tag carrying the fix versus re-tagging
+`v0.10.0` — is the maintainer's decision and is pending. After that: the BT
+backlog's next eligible ticket (BT-14's proposed sampler walk bounding) or
+slskd M5/M6.

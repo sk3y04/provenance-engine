@@ -8,7 +8,10 @@ stated rather than smoothed over.
 
 Branch: `feat/slskd-integration`. Base: `61f1cb3` (`master`, "docs(release):
 prepare v0.9.0"). Merged: fast-forward to `master` at `d34e326`; release prep
-`9598103` (v0.10.0). Nothing has been pushed; v0.10.0 is not tagged yet.
+`9598103` (v0.10.0). Pushed: master and the `v0.10.0` tag verified on origin
+at `17b667f`; the tag's Release run failed on a pre-existing torrent defect
+(BT-15 in `docs/BT-CHECKPOINTS.md`, fixed at `832c3ee`), so v0.10.0 has no
+published GitHub release and the publication path is pending.
 
 | Slice | Commit | Scope |
 | --- | --- | --- |
@@ -209,11 +212,14 @@ package entry.
 | `make engine-example` | ok |
 | `make release-dry-run` | six platforms + `dist/checksums.txt` |
 
-**Not done here:** tagging and pushing. `git tag -a v0.10.0` and `git push
-origin master --tags` remain the maintainer's manual gate per
-`docs/RELEASING.md`; hosted CI is unverified until the push. The merge does not
-upgrade the evidence: every "not verified" row above stays a non-claim in
-v0.10.0, including the absent real peer download.
+**Outcome after this record:** the maintainer approved the push; master and
+`v0.10.0` were pushed and verified on origin at `17b667f`. CI on master
+passed; the Security workflow's pre-existing failure and the tag's Release
+run are recorded in BT-15 (`docs/BT-CHECKPOINTS.md`) — the Release run failed
+on a pre-existing torrent test defect, fixed at `832c3ee`, and no GitHub
+release was published for v0.10.0. The merge does not upgrade the evidence:
+every "not verified" row above stays a non-claim, including the absent real
+peer download.
 
 ## Next commands for a maintainer
 
