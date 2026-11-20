@@ -7,7 +7,8 @@ code or upstream source without an observation behind it, and every limit is
 stated rather than smoothed over.
 
 Branch: `feat/slskd-integration`. Base: `61f1cb3` (`master`, "docs(release):
-prepare v0.9.0"). Nothing has been pushed.
+prepare v0.9.0"). Merged: fast-forward to `master` at `d34e326`; release prep
+`9598103` (v0.10.0). Nothing has been pushed; v0.10.0 is not tagged yet.
 
 | Slice | Commit | Scope |
 | --- | --- | --- |
@@ -19,6 +20,7 @@ prepare v0.9.0"). Nothing has been pushed.
 | docs | `eea0aba` | `docs/SOULSEEK.md`, CLI reference, README, CHANGELOG |
 | review | `06a9e48` | ten defects found reviewing M1–M4, each with a regression |
 | review fix | `9e0ff4b` | an unknown job/share id reports itself instead of leaking the record path |
+| release | `9598103` | merge verified; v0.10.0 release prep (version, CHANGELOG, RELEASING, TREEVIEW, ARCHITECTURE) |
 
 ---
 
@@ -171,10 +173,52 @@ poll → file on disk → verified capture, all through the public API.
 - **M5/M6 not started**: peer browse and recursive enqueue, the Compose/Gluetun
   template, wishlist, saved peers, download-side blocklist, telemetry and chat.
 
+## Merge and v0.10.0 release prep (`9598103`)
+
+The branch fast-forwarded `master` from `61f1cb3` to `d34e326`. Verified before
+editing: `git rev-parse HEAD feat/slskd-integration` both
+`d34e32671d2d09180c8f26edc523d3a31ec6f8e2`, `git merge-base --is-ancestor
+feat/slskd-integration HEAD` true, worktree clean. The merge itself was
+performed by the maintainer; this session verified it and prepared the release
+on top.
+
+`v0.9.0` is already tagged and published (the local and `origin` tags both peel
+to `61f1cb3`), so the integration ships as **v0.10.0** — an additive feature,
+minor bump, `package engine` untouched.
+
+Release prep (`9598103`): version default 0.9.0 → 0.10.0; CHANGELOG Unreleased
+→ 0.10.0 (2026-11-20), rewritten to the post-review behaviour (the block had
+been written at `eea0aba`, before the review pass); RELEASING.md default and
+tag command; TREEVIEW.md regenerated (251 → 283 Go files — verified by diffing
+`git ls-files '*.go'` against the files named in the treeview, and the 26-row
+`internal/slskd` section against the directory listing); ARCHITECTURE.md gained
+the Soulseek integration path, the on-disk Soulseek state and the `slskd`
+package entry.
+
+**Gates actually run on the prep tree:**
+
+| Command | Result |
+| --- | --- |
+| `gofmt -l .` | empty |
+| `go vet ./...` | clean |
+| `golangci-lint run ./...` | `0 issues` |
+| `go mod tidy -diff` | empty |
+| `make test` (`go test -race ./...`) | EXIT=0; `internal/slskd` 3.5s, `cmd/provenance` 3.3s, `torrentqueue` 105.9s, `bittorrent` 77.0s |
+| unstamped `go build` + `--version` | `provenance version 0.10.0` |
+| `make build` | produced; stamps `git describe` (`0.9.0-11-gd34e326-dirty` until the tag exists) |
+| `make engine-example` | ok |
+| `make release-dry-run` | six platforms + `dist/checksums.txt` |
+
+**Not done here:** tagging and pushing. `git tag -a v0.10.0` and `git push
+origin master --tags` remain the maintainer's manual gate per
+`docs/RELEASING.md`; hosted CI is unverified until the push. The merge does not
+upgrade the evidence: every "not verified" row above stays a non-claim in
+v0.10.0, including the absent real peer download.
+
 ## Next commands for a maintainer
 
 ```bash
-git switch feat/slskd-integration
+git switch master
 make all                      # vet + lint + test + build + engine-example
 go test -race -count=1 ./internal/slskd/ ./cmd/provenance/
 provenance soulseek settings set --base-url http://127.0.0.1:5030 --api-key <k> \
