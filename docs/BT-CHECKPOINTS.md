@@ -3230,3 +3230,100 @@ platform binaries plus `checksums.txt`. CI on master (run 44726972269):
 success. Security on master (run 44726972151): failure, same pre-existing
 empty-`SNYK_TOKEN` 401 as the baseline. Next eligible work: BT-14's proposed
 sampler walk bounding, or slskd M5/M6.
+
+---
+
+## PR-2 — Durable vault handoff and explicit cancel (shipped)
+
+**Starting SHA** `10362c2` (tree clean). **Ending SHA** `0e1e5d2`.
+
+Scope shipped: the optional archive handoff for a committed torrent capture,
+with a durable `pending/imported/failed` state that retries only the import, and
+`torrent queue cancel` plus its TUI action. Durable jobs, isolated workspaces,
+capture adoption, seeding states, retry/backoff, active-job and peer limits were
+already present on this baseline and are not reimplemented here.
+
+### Changed paths
+
+- `internal/torrentqueue/import.go` (new) — `ImportTarget`/`ImportRef`,
+  `ImportCapture`, workspace and manifest containment, symlink checks, vault
+  revision write, `PendingImports`.
+- `internal/torrentqueue/import_test.go` (new) — idempotency, failed import,
+  crash reconciliation, import-after-capture, symlink escape, target conflict.
+- `internal/torrentqueue/cancel_test.go` (new) — terminal cancel, per-attempt
+  cancellation, retry, interrupted-cancel reconciliation.
+- `internal/torrentqueue/store.go` — `DesiredCancelled`/`PhaseCancelled`, import
+  fields, `AddRequest.Import`, duplicate target acquisition/conflict.
+- `internal/torrentqueue/actions.go` — `Cancel`, `SetImportTarget`, start/retry
+  rules for cancelled entries.
+- `internal/torrentqueue/runner.go` — post-capture import, pending-import
+  reconciliation, cancel intent watcher, import summaries, race-close inside
+  result mutations.
+- `internal/torrentqueue/admit.go` — import target passes through admission.
+- `cmd/provenance/torrent.go` — `queue cancel`, `queue import`,
+  `queue add --vault/--collection`, import lines in `queue list`, run summary.
+- `internal/tui/torrentqueue.go` — `x` cancel, `i` import, import column/help.
+- `internal/tui/torrentadd.go`, tests — admission signature.
+- Docs: `docs/TORRENT.md`, `docs/CLI.md`, `CHANGELOG`.
+
+### What the handoff guarantees
+
+| boundary | behaviour |
+|---|---|
+| capture committed, import pending | next run imports before claiming downloads; no transfer |
+| crash during import | state is `pending` before the vault write, so the idempotent import is retried |
+| import fails | `Phase=completed` and `Capture` unchanged; `Import.State=failed`; `queue import` retries only the import |
+| import succeeds twice | same content-addressed revision; second call is a no-op |
+| target already imported | a normal add for a different target is refused; `queue import --vault` deliberately retargets |
+| symlink/traversal in capture | refused before the archive reads the file |
+
+Cancel is a third stop intent beside pause: it is terminal until `queue retry`,
+never resumed by a restart, and keeps payload, workspace, resume state and any
+published capture. A capture that completes while a cancel is racing is kept.
+
+### Verified (actually run)
+
+| Command | Result |
+|---|---|
+| `go test ./internal/torrentqueue -run 'TestQueueImport\|TestQueueCancel\|TestQueueRunnerImports\|TestQueueReconcileCancelled' -count=3` | pass, 9 tests ×3 |
+| same, `-race -count=1` | `ok 1.103s` |
+| `go test ./internal/tui -run TestQueueAction -count=1` | pass (cancel included) |
+| `go test -race ./internal/tui -run TestQueueAction` | `ok 1.257s` |
+| `go test -race ./cmd/provenance` | `ok 3.288s` |
+| `go test ./... -count=1` | every package ok except the pre-existing `TestQueuePerJobPeerLimitIsObserved`; both jobs completed but its 20 ms sampler observed no peers (the same failure occurred at the starting SHA) |
+| `go vet ./...` | clean |
+| `golangci-lint run ./internal/torrentqueue/... ./internal/tui/... ./cmd/provenance/...` | `0 issues` |
+| `gofmt -l cmd internal` | empty |
+| `git diff --check` | clean |
+
+CLI smoke against the real binary and the hybrid fixture: add with
+`--vault/--collection` printed `vault handoff: pending`; `list` showed it;
+`cancel` produced `cancelled`; `start` refused with "use retry"; `retry`
+returned `desired=run phase=queued`; `import` before capture printed "handoff
+saved; the capture is not committed yet"; `--collection` without `--vault` was
+refused.
+
+### Not verified (explicit)
+
+- **A real SIGKILL inside the import.** The crash boundary is simulated by a
+  committed capture with `Import.State=pending`; the reconciliation path is
+  exercised, but no process is killed between the vault write and the record
+  update.
+- **Concurrent imports.** `queue import` takes runner ownership, and a runner is
+  single-writer, but two direct `Store.ImportCapture` calls are not serialised
+  beyond the store lock and the idempotent revision.
+- **PostgreSQL catalog.** The handoff writes the filesystem vault and
+  `collections.json`; it does not insert into an optional PostgreSQL catalog.
+  `archive import` remains the path that does.
+- **Vault integrity after import.** Blobs are written through the existing
+  content-addressed store, but PR-3's `archive verify` does not exist yet, so
+  "the restored vault resolves the citation offline" is not claimed here.
+- Windows execution for the new cancel/import paths; only Linux was run.
+- The pre-existing peer-sampler flake above; not touched by this change.
+
+### Next
+
+**PR-3** (vault verify and collection reliability) or the watch-sampler fix
+carried from BT-14. PR-2's missing first-class HTTP/event API is deliberately
+deferred: the TUI uses the durable store and the read-only Unix live socket, so
+no second network client exists yet.
