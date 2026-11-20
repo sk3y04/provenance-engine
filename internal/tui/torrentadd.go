@@ -114,7 +114,7 @@ func (m *model) admitCmd(gen int, root, source string, mode bittorrent.Discovery
 		if err != nil {
 			return torrentAdmitMsg{gen: gen, err: err}
 		}
-		admitted, aerr := torrentqueue.Admit(store, source, mode, nil, selection)
+		admitted, aerr := torrentqueue.Admit(store, source, mode, nil, selection, nil)
 		return torrentAdmitMsg{gen: gen, entry: admitted.Entry, duplicate: admitted.Duplicate, err: aerr}
 	}
 }

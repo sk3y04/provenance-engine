@@ -162,6 +162,34 @@ func TestQueueActionRetryFromTUI(t *testing.T) {
 	}
 }
 
+// TestQueueActionCancelFromTUI: cancel is a distinct terminal intent, and the
+// status reports what was saved rather than claiming the runner stopped.
+func TestQueueActionCancelFromTUI(t *testing.T) {
+	root := t.TempDir()
+	store := storeAt(t, root)
+	e := seedEntry(t, store, torrentqueue.PhaseQueued, torrentqueue.DesiredRun)
+	m := actionModel(t, mustEntry(t, store, e.ID))
+	m.queue.root = root
+
+	pressAndApply(t, m, "x")
+	got := mustEntry(t, store, e.ID)
+	if got.Desired != torrentqueue.DesiredCancelled || got.Phase != torrentqueue.PhaseCancelled {
+		t.Fatalf("cancel = desired %q phase %q", got.Desired, got.Phase)
+	}
+	if !strings.Contains(m.queue.status, "saved cancel") {
+		t.Fatalf("status = %q", m.queue.status)
+	}
+	if torrentqueue.RunnerHeld(root) {
+		t.Fatal("a TUI cancel started a runner")
+	}
+
+	// Start is refused; retry is the explicit way back.
+	pressAndApply(t, m, "s")
+	if !m.queue.statusErr || !strings.Contains(m.queue.status, "retry") {
+		t.Fatalf("start after cancel = %q (err=%v), want an actionable refusal", m.queue.status, m.queue.statusErr)
+	}
+}
+
 // TestQueueActionInvalidStateRefused: start on a failed entry is refused, visibly.
 func TestQueueActionInvalidStateRefused(t *testing.T) {
 	root := t.TempDir()

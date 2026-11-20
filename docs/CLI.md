@@ -614,22 +614,27 @@ See [TORRENT.md](TORRENT.md) for the pinned library version, the security adviso
 
 ### Durable queue (`torrent queue`)
 
-A durable queue for selective fetches. Entries live under `<staging>/.provenance/torrent/queue/` and outlive the process that created them: `start`, `pause`, `seed` and `retry` record what an entry *should* do, and one foreground `queue run` applies those intents.
+A durable queue for selective fetches. Entries live under `<staging>/.provenance/torrent/queue/` and outlive the process that created them: `start`, `pause`, `cancel`, `seed` and `retry` record what an entry *should* do, and one foreground `queue run` applies those intents.
 
 ```bash
 provenance torrent queue add "magnet:?xt=urn:btih:..." --select "release/track.flac"
+provenance torrent queue add ./release.torrent --select "release/track.flac" \
+    --vault ./provenance-vault --collection music   # optional archive handoff
 provenance torrent queue list                        # recorded state, one line per entry
 provenance torrent queue start queued-000001-0e3dafa5
 provenance torrent queue run --max-active 2 --watch   # work the queue until SIGINT
+provenance torrent queue import queued-000001-0e3dafa5  # retry only the vault handoff
 provenance torrent queue live                        # one read-only snapshot of the session
 ```
 
 | Subcommand | Description |
 |------------|-------------|
-| `add SOURCE --select PATH` | Record an entry; it stays paused until started |
+| `add SOURCE --select PATH [--vault DIR --collection NAME]` | Record an entry; it stays paused until started |
 | `list [--json]` | Recorded entries, or `{runner_held, entries[]}` |
 | `start ID...` / `pause ID...` | Set the entry's desired state |
-| `retry ID...` | Re-queue an entry whose attempt ended blocked or failed |
+| `cancel ID...` | Stop the entry and keep its payload; terminal until `retry` |
+| `retry ID...` | Re-queue an entry whose attempt failed, was cancelled or is backing off |
+| `import ID... [--vault DIR --collection NAME]` | Import a committed capture, or retry a failed import; never downloads again |
 | `run` | One foreground pass over the queue |
 | `seed ID...` / `unseed ID...` | Set or clear seed intent for a completed entry |
 | `priority ID PATH normal\|high` | Relative piece priority for an already-selected path |
@@ -646,7 +651,9 @@ provenance torrent queue live                        # one read-only snapshot of
 | `--half-open-per-job` | int | `0` (derived) | Outbound handshakes in progress per torrent per attempt |
 | `--watch` | bool | `false` | Keep scanning after both pools go idle instead of returning |
 
-- **One runner, recorded intents.** A second `queue run` is refused while a runner holds the queue, and `queue remove` is refused for the same reason. Interrupting a runner is not a pause: the recorded intent is preserved and the next pass honours it.
+- **One runner, recorded intents.** A second `queue run` is refused while a runner holds the queue, and `queue remove`/`queue import` are refused for the same reason. Interrupting a runner is not a pause: the recorded intent is preserved and the next pass honours it.
+- **Pause, cancel and retry are distinct.** Pause is resumable by a later start; cancel is terminal until an explicit `retry`; neither deletes payload. A capture published while a cancel arrives is kept.
+- **The vault handoff is opt-in and retryable.** `add --vault` records the target; the runner imports after the capture commits. An import failure leaves the capture completed and is retried by `queue import` (or the TUI's `i`) without a transfer. A crash between capture and import is reconciled on the next run.
 - **A pass drains; `--watch` keeps claiming.** Without `--watch` a pass returns once both pools are idle and does not pick up work that appears afterwards. `--watch` keeps scanning (200 ms idle cadence) until SIGINT.
 - **Live status is read-only and observational.** `queue live` asks the runner's private Unix socket for one snapshot; there is no control channel, no RPC, and no way to start or stop a runner through it. When no runner answers, the command says so instead of inferring liveness from recorded state.
 - **Progress is verified selected bytes, not throughput.** `selected_bytes`/`selected_total` count verified bytes of the selected files (a boundary piece by its selected share, BEP 47 padding excluded); `progress_rate` is the change in that number per second and is omitted when it cannot be measured rather than reported as zero.

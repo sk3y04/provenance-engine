@@ -1,3 +1,21 @@
+## [Unreleased]
+
+### Added
+
+- **Durable torrent archive handoff.** `torrent queue add --vault DIR
+  [--collection NAME]` records an opt-in vault target on the entry. After the
+  capture commits, the runner imports it; a failed import records
+  `Import.State=failed` while leaving `Phase=completed` and the capture intact.
+  `torrent queue import ID` (or `i` in the TUI queue view) retries only the
+  import, never the transfer, and a crash between capture and import is
+  reconciled on the next drain. Revisions are content-addressed, so retries do
+  not duplicate artifacts.
+
+- **`torrent queue cancel ID`** and `x` in the TUI queue view. Cancel is a
+  distinct terminal intent: it stops the client, keeps the payload and
+  workspace, is not resumed by a restart, and needs an explicit `queue retry`
+  to run again. A capture already published when the cancel arrives is kept.
+
 ## [0.10.1] - 2026-11-20
 
 A release-gate fix for the torrent seeding path. `v0.10.0` was tagged but

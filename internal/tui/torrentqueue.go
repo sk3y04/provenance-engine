@@ -177,6 +177,18 @@ func (m *model) queueActionCmd(gen int, root, id, action string) tea.Cmd {
 			entry, aerr = store.Pause(id)
 		case "retry":
 			entry, aerr = store.Retry(id)
+		case "cancel":
+			entry, aerr = store.Cancel(id)
+		case "import":
+			// The handoff is a local writer. Refuse while a runner owns the queue so
+			// two importers cannot race the same capture.
+			owner, lerr := store.LockRunner()
+			if lerr != nil {
+				aerr = lerr
+			} else {
+				entry, aerr = store.ImportCapture(id)
+				_ = owner.Release()
+			}
 		case "seed-enable":
 			entry, aerr = store.EnableSeed(id)
 		case "seed-disable":
@@ -223,6 +235,18 @@ func (m *model) describeAction(msg queueActionMsg) string {
 		return fmt.Sprintf("saved pause intent for %s (desired=paused)%s", id, detail)
 	case "retry":
 		return fmt.Sprintf("saved retry for %s (desired=run, phase=%s, errors cleared)", id, msg.entry.Phase)
+	case "cancel":
+		live := ""
+		if a, ok := m.liveAttemptFor(id); ok {
+			live = fmt.Sprintf("; the runner has not acknowledged yet — it is still %s and keeps its slot until it closes", a.Phase)
+		}
+		return fmt.Sprintf("saved cancel for %s (desired=cancelled, phase=%s)%s", id, msg.entry.Phase, live)
+	case "import":
+		if msg.entry.Import == nil {
+			return fmt.Sprintf("imported %s", id)
+		}
+		return fmt.Sprintf("imported %s into %s/%s (revision %s)", id,
+			msg.entry.Import.Target.VaultRoot, msg.entry.Import.Target.Collection, msg.entry.Import.RevisionID)
 	case "seed-enable":
 		live := ""
 		if a, ok := m.liveAttemptFor(id); ok {
@@ -352,7 +376,7 @@ func (m *model) updateQueueKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "a":
 		return m.openTorrentAdd()
-	case "s", "p", "t":
+	case "s", "p", "t", "x", "i":
 		return m.queueAction(msg.String())
 	case "e", "d":
 		return m.queueAction(msg.String())
@@ -377,7 +401,7 @@ func (m *model) queueAction(key string) (tea.Model, tea.Cmd) {
 	}
 	id := rows[m.queue.cursor].ID
 	action := map[string]string{
-		"s": "start", "p": "pause", "t": "retry",
+		"s": "start", "p": "pause", "t": "retry", "x": "cancel", "i": "import",
 		"e": "seed-enable", "d": "seed-disable",
 	}[key]
 	m.queue.actionBusy = true
@@ -466,7 +490,11 @@ func (m *model) viewTorrentQueue() string {
 		if e.SeedDesired != "" || e.SeedPhase != "" {
 			seed = fmt.Sprintf("  seed=%s/%s", seedText(e.SeedDesired), e.SeedPhase)
 		}
-		fmt.Fprintf(&b, "%s%-26s desired=%-6s recorded=%-9s%s", marker, trim(e.ID, 26), string(e.Desired), recorded, seed)
+		handoff := ""
+		if e.Import != nil {
+			handoff = fmt.Sprintf("  import=%s", e.Import.State)
+		}
+		fmt.Fprintf(&b, "%s%-26s desired=%-6s recorded=%-9s%s%s", marker, trim(e.ID, 26), string(e.Desired), recorded, seed, handoff)
 		if a, ok := byID[e.ID]; ok {
 			fmt.Fprintf(&b, "  live=%s %s", a.Kind, livePhaseText(a))
 		}
@@ -478,7 +506,7 @@ func (m *model) viewTorrentQueue() string {
 			fmt.Fprintf(&b, "  %-26s %s %s\n", trim(a.EntryID, 26), a.Kind, livePhaseText(a))
 		}
 	}
-	b.WriteString("\n↑/↓ move • s start • p pause • t retry • e seed • d unseed • a add • r refresh • esc back\n")
+	b.WriteString("\n↑/↓ move • s start • p pause • x cancel • t retry • i import • e seed • d unseed • a add • r refresh • esc back\n")
 	return clipLines(b.String(), width)
 }
 

@@ -149,16 +149,18 @@ owns the root.`,
 
 	queue := &cobra.Command{
 		Use:   "queue",
-		Short: "Durable local job queue: add paused, start, pause, retry, run",
+		Short: "Durable local job queue: add paused, start, pause, cancel, retry, run",
 		Long: "A durable queue over isolated workspaces. Entries are added paused; only an explicit\n" +
 			"start makes one runnable. `queue run` drains the queue in the foreground with one worker\n" +
 			"and then exits, so nothing keeps running in the background. No daemon, no RPC, no TUI.\n\n" +
 			"Interrupting the runner is not a pause: the recorded intent is preserved, so a restart\n" +
-			"picks the work back up. Nothing in this command group deletes payload or data.",
+			"picks the work back up. Cancel and pause stop the client but keep payload and workspace;\n" +
+			"a completed capture can be handed to an opt-in vault and the handoff retried without\n" +
+			"downloading again. Nothing in this command group deletes payload or data.",
 	}
-	queue.AddCommand(queueAddCmd(), queueListCmd(), queueStartCmd(), queuePauseCmd(), queueRetryCmd(),
-		queueSeedCmd(), queueUnseedCmd(), queuePriorityCmd(), queueRemoveCmd(),
-		queueLiveCmd(), queueRunCmd())
+	queue.AddCommand(queueAddCmd(), queueListCmd(), queueStartCmd(), queuePauseCmd(), queueCancelCmd(),
+		queueRetryCmd(), queueImportCmd(), queueSeedCmd(), queueUnseedCmd(), queuePriorityCmd(),
+		queueRemoveCmd(), queueLiveCmd(), queueRunCmd())
 	cmd.AddCommand(queue)
 
 	return cmd
@@ -170,13 +172,17 @@ func queueStore() (*torrentqueue.Store, error) {
 }
 
 func queueAddCmd() *cobra.Command {
+	var vaultRoot, collection string
 	cmd := &cobra.Command{
 		Use:   "add SOURCE",
 		Short: "Add a magnet or .torrent to the queue, paused",
 		Long: "Validates the source without contacting the network and records the entry as paused.\n" +
 			"A magnet whose identity needs a metadata exchange is accepted as unresolved and keeps\n" +
 			"its discovery policy for that exchange; a source this build cannot resume is refused\n" +
-			"here rather than accepted as a job that would never start.",
+			"here rather than accepted as a job that would never start.\n\n" +
+			"--vault records an optional archive handoff. It is intent on the entry, so a restart\n" +
+			"retries the import without downloading again; the vault itself is written only after\n" +
+			"the capture is committed.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(normalizeCLISelection(flagTorrentSelect)) == 0 {
@@ -186,11 +192,21 @@ func queueAddCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("--discovery: %w", err)
 			}
+			var target *torrentqueue.ImportTarget
+			if strings.TrimSpace(vaultRoot) != "" || strings.TrimSpace(collection) != "" {
+				if strings.TrimSpace(vaultRoot) == "" {
+					return errors.New("--collection requires --vault")
+				}
+				if strings.TrimSpace(collection) == "" {
+					collection = "torrent"
+				}
+				target = &torrentqueue.ImportTarget{VaultRoot: vaultRoot, Collection: collection}
+			}
 			store, err := queueStore()
 			if err != nil {
 				return err
 			}
-			admitted, err := torrentqueue.Admit(store, args[0], mode, flagTorrentPeer, normalizeCLISelection(flagTorrentSelect))
+			admitted, err := torrentqueue.Admit(store, args[0], mode, flagTorrentPeer, normalizeCLISelection(flagTorrentSelect), target)
 			if err != nil {
 				return err
 			}
@@ -206,12 +222,18 @@ func queueAddCmd() *cobra.Command {
 			default:
 				fmt.Fprintf(&b, "%s added paused\n", entry.ID)
 			}
+			if entry.Import != nil {
+				fmt.Fprintf(&b, "vault handoff: %s -> %s/%s (after the capture is committed)\n",
+					entry.Import.State, entry.Import.Target.VaultRoot, entry.Import.Target.Collection)
+			}
 			fmt.Fprintf(&b, "start it with: provenance torrent queue start %s\n", entry.ID)
 			_, _ = io.WriteString(os.Stdout, b.String())
 			return nil
 		},
 	}
 	cmd.Flags().StringArrayVar(&flagTorrentSelect, "select", nil, "Exact file path within the torrent to fetch (repeatable; comma lists accepted)")
+	cmd.Flags().StringVar(&vaultRoot, "vault", "", "Also import the committed capture into this vault root")
+	cmd.Flags().StringVar(&collection, "collection", "", "Vault collection for --vault (default \"torrent\")")
 	return cmd
 }
 
@@ -264,6 +286,15 @@ func queueListCmd() *cobra.Command {
 				fmt.Fprintf(&b, "    source: %s\n", source)
 				if e.Capture != nil {
 					fmt.Fprintf(&b, "    capture: %s (%s)\n", e.Capture.Key, e.Capture.Manifest)
+				}
+				if e.Import != nil {
+					fmt.Fprintf(&b, "    import: %s -> %s/%s\n", e.Import.State, e.Import.Target.VaultRoot, e.Import.Target.Collection)
+					if e.Import.RevisionID != "" {
+						fmt.Fprintf(&b, "    revision: %s\n", e.Import.RevisionID)
+					}
+					if e.Import.LastError != "" {
+						fmt.Fprintf(&b, "    import error: %s\n", e.Import.LastError)
+					}
 				}
 				if e.LastError != "" {
 					fmt.Fprintf(&b, "    error: %s\n", e.LastError)
@@ -350,13 +381,48 @@ func queuePauseCmd() *cobra.Command {
 	return cmd
 }
 
+func queueCancelCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "cancel ID...",
+		Short: "Stop entries and keep their payload",
+		Long: "Records desired=cancelled. A running job is not killed by this command: the runner\n" +
+			"observes the intent, reports stopping until the client has closed and the workspace is\n" +
+			"released, then records cancelled. Cancelling is terminal until `queue retry`; unlike a\n" +
+			"pause it is never resumed by a restart. Payload, workspace and any committed capture\n" +
+			"are kept. A completed entry has nothing to cancel; use remove to forget it.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			var b strings.Builder
+			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
+			for _, id := range args {
+				entry, cerr := store.Cancel(id)
+				if cerr != nil {
+					return cerr
+				}
+				switch entry.Phase {
+				case torrentqueue.PhaseRunning, torrentqueue.PhaseStopping, torrentqueue.PhaseResolving:
+					fmt.Fprintf(&b, "%s  cancel recorded; the runner will stop it and report stopping until the client closes\n", entry.ID)
+				default:
+					fmt.Fprintf(&b, "%s  cancelled (payload and workspace kept)\n", entry.ID)
+				}
+			}
+			return nil
+		},
+	}
+	return cmd
+}
+
 func queueRetryCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "retry ID...",
-		Short: "Clear a failure or a backoff and make the entry runnable",
-		Long: "An explicit retry, separate from start and from recheck: a failed capture retries from\n" +
-			"verified local bytes through the normal resume path, and a failed recheck never repairs\n" +
-			"anything on its own.",
+		Short: "Clear a failure, cancellation or backoff and make the entry runnable",
+		Long: "An explicit retry, separate from start and from recheck: a failed or cancelled capture\n" +
+			"retries from verified local bytes through the normal resume path, and a failed recheck\n" +
+			"never repairs anything on its own.",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := queueStore()
@@ -375,6 +441,70 @@ func queueRetryCmd() *cobra.Command {
 			return nil
 		},
 	}
+	return cmd
+}
+
+func queueImportCmd() *cobra.Command {
+	var vaultRoot, collection string
+	cmd := &cobra.Command{
+		Use:   "import ID...",
+		Short: "Hand committed captures to the vault, retrying only the import",
+		Long: "Imports each entry's committed capture into a content-addressed vault. It reads the\n" +
+			"published run manifest and verifies the selected files again; it never starts a\n" +
+			"transfer, opens a torrent client or contacts a peer. A failed handoff leaves the\n" +
+			"capture completed and records the import failure, so this command is the retry path.\n\n" +
+			"With --vault/--collection the target is recorded on the entry first (the default\n" +
+			"collection is \"torrent\"). Without them the entry's recorded target is used. An entry\n" +
+			"whose capture is not committed yet keeps the target as pending and is imported by the\n" +
+			"next run after the capture commits.",
+		Args:         cobra.MinimumNArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(collection) != "" && strings.TrimSpace(vaultRoot) == "" {
+				return errors.New("--collection requires --vault")
+			}
+			store, err := queueStore()
+			if err != nil {
+				return err
+			}
+			// Imports are a local writer. Taking runner ownership makes it impossible
+			// to race a foreground runner's post-capture handoff on the same entry.
+			owner, lerr := store.LockRunner()
+			if lerr != nil {
+				return lerr
+			}
+			defer func() { _ = owner.Release() }()
+
+			var b strings.Builder
+			defer func() { _, _ = io.WriteString(os.Stdout, b.String()) }()
+			for _, id := range args {
+				if strings.TrimSpace(vaultRoot) != "" {
+					name := collection
+					if strings.TrimSpace(name) == "" {
+						name = "torrent"
+					}
+					if _, serr := store.SetImportTarget(id, torrentqueue.ImportTarget{
+						VaultRoot: vaultRoot, Collection: name,
+					}); serr != nil {
+						return serr
+					}
+				}
+				entry, ierr := store.ImportCapture(id)
+				if ierr != nil {
+					if errors.Is(ierr, torrentqueue.ErrImportNotReady) {
+						fmt.Fprintf(&b, "%s  handoff saved; the capture is not committed yet\n", id)
+						continue
+					}
+					return ierr
+				}
+				fmt.Fprintf(&b, "%s  imported revision %s into %s/%s\n", id,
+					entry.Import.RevisionID, entry.Import.Target.VaultRoot, entry.Import.Target.Collection)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&vaultRoot, "vault", "", "Vault root to import into (recorded on the entry)")
+	cmd.Flags().StringVar(&collection, "collection", "", "Vault collection for --vault (default \"torrent\")")
 	return cmd
 }
 
@@ -644,10 +774,21 @@ func queueRunCmd() *cobra.Command {
 				// counters are still what it reports.
 				label = "watch ended"
 			}
-			_, _ = fmt.Fprintf(os.Stdout, "%s: %d completed, %d failed, %d blocked, %d paused, %d claimed\n",
-				label, sum.Completed, sum.Failed, sum.Blocked, sum.Paused, len(sum.Ran))
+			_, _ = fmt.Fprintf(os.Stdout, "%s: %d completed, %d failed, %d blocked, %d paused, %d cancelled, %d claimed\n",
+				label, sum.Completed, sum.Failed, sum.Blocked, sum.Paused, sum.Cancelled, len(sum.Ran))
+			if sum.Imported > 0 || sum.ImportFailed > 0 {
+				_, _ = fmt.Fprintf(os.Stdout, "vault handoff: %d imported, %d failed (the capture stays completed)\n",
+					sum.Imported, sum.ImportFailed)
+			}
 			if sum.Failed > 0 {
 				return fmt.Errorf("queue run: %d entr%s failed; inspect with `torrent queue list`", sum.Failed, plural(sum.Failed))
+			}
+			if sum.ImportFailed > 0 {
+				suffix := "s"
+				if sum.ImportFailed == 1 {
+					suffix = ""
+				}
+				return fmt.Errorf("queue run: %d capture import%s failed; retry with `torrent queue import ID`", sum.ImportFailed, suffix)
 			}
 			return nil
 		},

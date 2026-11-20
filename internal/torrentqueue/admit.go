@@ -29,7 +29,7 @@ type Admission struct {
 // A local .torrent is read offline; a magnet keeps its discovery profile and is
 // recorded unresolved until metadata is fetched. A source this build cannot resume is
 // refused here rather than accepted as a job that would never start.
-func Admit(store *Store, raw string, mode bittorrent.Discovery, peers, selection []string) (Admission, error) {
+func Admit(store *Store, raw string, mode bittorrent.Discovery, peers, selection []string, target *ImportTarget) (Admission, error) {
 	var out Admission
 	if len(selection) == 0 {
 		return out, fmt.Errorf("%w: an entry needs at least one selected path", ErrUsage)
@@ -59,6 +59,7 @@ func Admit(store *Store, raw string, mode bittorrent.Discovery, peers, selection
 		InfoHashV2: prepared.InfoHashV2,
 		Workspace:  prepared.Workspace,
 		Unresolved: prepared.Unresolved,
+		Import:     target,
 	})
 	if aerr != nil {
 		return out, aerr

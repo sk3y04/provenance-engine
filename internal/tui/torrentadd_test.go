@@ -203,7 +203,7 @@ func TestTorrentAddDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	admitted, aerr := torrentqueue.Admit(store, torrent, bittorrent.DiscoveryPublic, nil, []string{"fixture/a.bin"})
+	admitted, aerr := torrentqueue.Admit(store, torrent, bittorrent.DiscoveryPublic, nil, []string{"fixture/a.bin"}, nil)
 	if aerr != nil || admitted.Duplicate {
 		t.Fatalf("first admit: %+v %v", admitted, aerr)
 	}
@@ -294,7 +294,7 @@ func TestTorrentAddSecretNeverEchoed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	if _, aerr := torrentqueue.Admit(store, src, bittorrent.DiscoveryDirect, nil, []string{"a.bin"}); aerr != nil {
+	if _, aerr := torrentqueue.Admit(store, src, bittorrent.DiscoveryDirect, nil, []string{"a.bin"}, nil); aerr != nil {
 		t.Fatalf("admit: %v", aerr)
 	}
 	entries, _ := store.List()

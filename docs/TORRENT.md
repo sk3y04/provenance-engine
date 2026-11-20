@@ -1,8 +1,8 @@
 # Selective BitTorrent
 
-Status: first slice. Magnet / `.torrent` input, explicit file selection, verified
-capture into the existing manifest path. No UI, no RPC, no aria2 compatibility,
-no queueing, no Soulseek.
+Status: selective magnet / `.torrent` fetch, isolated job workspaces, a durable
+local queue with managed seeding, and an optional vault handoff. No RPC, no
+aria2 compatibility, no Soulseek (that is a separate integration).
 
 ## Why a native adapter
 
@@ -699,8 +699,8 @@ Intent and observation are separate fields:
 
 | field | values | meaning |
 |-------|--------|---------|
-| `desired` | `paused`, `run` | what the user asked for; survives every restart |
-| `phase` | `queued`, `resolving`, `running`, `stopping`, `paused`, `completed`, `failed`, `blocked` | the last thing the runner observed and persisted |
+| `desired` | `paused`, `run`, `cancelled` | what the user asked for; survives every restart |
+| `phase` | `queued`, `resolving`, `running`, `stopping`, `paused`, `completed`, `failed`, `blocked`, `cancelled` | the last thing the runner observed and persisted |
 
 Rules that follow from keeping them apart:
 
@@ -723,6 +723,80 @@ Rules that follow from keeping them apart:
   already holds a published capture covering the selection, the entry becomes
   `completed` and is never refetched, even if the crash happened between "capture
   committed" and "queue updated".
+
+### Pause, cancel and retry
+
+Pause and cancel are both recorded intents, not process commands. A running
+attempt is cancelled by the watcher, reported as `stopping` until its client has
+closed and the workspace lock is released, and only then written as its final
+phase.
+
+| intent | final phase | restart behaviour | payload |
+|--------|-------------|-------------------|---------|
+| `pause` | `paused` | stays paused | kept |
+| `cancel` | `cancelled` | stays cancelled until `queue retry` | kept |
+| `retry` | `queued` / `desired=run` | resumes from verified local bytes | kept |
+
+Cancel is therefore not remove: it never deletes a workspace, payload, resume
+database, capture or vault revision. `queue remove` is the separate,
+non-destructive operation that forgets the queue record. `start` is refused for
+both `failed` and `cancelled` entries, so only an explicit `retry` reopens either
+one. A capture that was already published while a cancel arrived is kept
+(`phase=completed`); the note says so rather than pretending the cancel undid it.
+
+### Vault handoff (opt-in)
+
+`queue add --vault ROOT [--collection NAME]` records an import target on the
+entry. The default collection is `torrent`. The handoff is a second, independent
+step after the capture commit:
+
+```
+transfer ──▶ payload=ready ──▶ run manifest written (capture committed)
+                                      │
+                                      ├── optional import ──▶ vault revision
+                                      │        pending → imported | failed
+                                      └── seed intent (separate again)
+```
+
+The queue entry keeps those states apart. `Phase=completed` plus a non-nil
+`Capture` means the capture is committed; `Import.State` is `pending`,
+`imported` or `failed`; `SeedPhase` is the independent seeding observation. The
+backend's own job record still holds `payload`, `capture` and `seeding`
+separately, so "payload ready but capture pending" is never confused with either.
+
+Rules the handoff keeps:
+
+- **Import failure never un-commits a capture and never re-downloads.** A failed
+  import sets `Import.State=failed` and leaves `Phase=completed` and `Capture`
+  untouched. `queue import ID` (or the TUI's `i`) retries only the import.
+- **A crash between capture and import is reconciled.** At the start of a drain,
+  committed captures whose import is still `pending` are imported before any new
+  download is claimed. That path calls no transfer and needs no peer.
+- **The result is idempotent.** A revision ID is a content address, and the blob
+  store deduplicates by SHA-256, so a retry after a crash between the vault write
+  and the record update rewrites the same revision. `Import.Attempts` counts
+  attempts, not revisions.
+- **The vault is written locally.** The handoff writes `blobs/`, `revisions/` and
+  `collections.json` under the target root. It does not connect to PostgreSQL;
+  run the existing catalog path if a deployment wants the search index.
+- **Only the committed workspace is read.** The recorded manifest must match the
+  capture key; every item path must resolve under that workspace as a regular
+  file, with symlinks rejected. The manifest's own `output_dir` is replaced with
+  the resolved workspace before ingestion.
+- **Secrets stay out.** The vault source is the sanitized identity-only magnet
+  (or empty for a local `.torrent`); tracker URLs, passkeys and peer hints are not
+  copied from the restricted record.
+
+Example:
+
+```
+provenance torrent queue add ./release.torrent --select "release/track.flac" \
+    --vault ./provenance-vault --collection music
+provenance torrent queue start queued-000001-0e3dafa5
+provenance torrent queue run
+# ... capture committed, then: imported revision <sha256>
+provenance torrent queue import queued-000001-0e3dafa5   # retry after a vault error
+```
 
 ### Locks
 

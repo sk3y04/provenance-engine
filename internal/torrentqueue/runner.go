@@ -341,6 +341,12 @@ type Summary struct {
 	Failed    int
 	Blocked   int
 	Paused    int
+	Cancelled int
+	// Imported counts captures this pass handed to the vault. ImportFailed counts
+	// a committed capture whose optional vault handoff failed: the capture stays
+	// completed and only the import is retried.
+	Imported     int
+	ImportFailed int
 	// Seeded lists entries this runner started serving, and SeedFinished counts
 	// the seed slots that closed. SeedBlocked counts workspaces that could not be
 	// served (damaged, selective, ineligible).
@@ -397,6 +403,10 @@ func (r *Runner) Run(ctx context.Context) (Summary, error) {
 		return sum, err
 	}
 	sum.Completed += adopted
+	// A committed capture with an unfinished handoff is imported before any new
+	// download is claimed. This is the crash path between "capture committed" and
+	// "import recorded"; it never asks the transfer layer for bytes again.
+	r.importPending(&sum)
 
 	limit := r.opts.maxActive()
 	var mu sync.Mutex
@@ -611,10 +621,10 @@ func (r *Runner) nextExcept(inflight map[string]context.CancelFunc, skipped map[
 		if _, busy := inflight[e.ID]; busy || skipped[e.ID] {
 			continue
 		}
-		// Completed work is done; a failed entry needs an explicit retry, so it is
-		// never re-claimed automatically. Both rules keep a drain from looping on
-		// one job while later entries wait behind it.
-		if e.Desired != DesiredRun || e.Phase == PhaseCompleted || e.Phase == PhaseFailed {
+		// Completed work is done; a failed or cancelled entry needs an explicit
+		// retry, so it is never re-claimed automatically. Both rules keep a drain
+		// from looping on one job while later entries wait behind it.
+		if e.Desired != DesiredRun || e.Phase == PhaseCompleted || e.Phase == PhaseFailed || e.Phase == PhaseCancelled {
 			continue
 		}
 		if e.Phase == PhaseBlocked && !e.NotBefore.IsZero() && now.Before(e.NotBefore) {
@@ -689,8 +699,11 @@ func (r *Runner) reconcile() (int, error) {
 		switch e.Phase {
 		case PhaseRunning, PhaseStopping, PhaseResolving:
 			phase := PhaseQueued
-			if e.Desired == DesiredPaused {
+			switch e.Desired {
+			case DesiredPaused:
 				phase = PhasePaused
+			case DesiredCancelled:
+				phase = PhaseCancelled
 			}
 			if _, uerr := r.store.Update(e.ID, func(x *Entry) error {
 				x.Phase = phase
@@ -766,12 +779,12 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sy
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
-	var paused syncFlag
+	var stop stopIntent
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		r.watchPause(runCtx, entry.ID, token, cancel, &paused)
+		r.watchStop(runCtx, entry.ID, token, cancel, &stop)
 	}()
 
 	out, runErr := r.transfer.Run(runCtx, req)
@@ -814,20 +827,55 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sy
 			}
 			r.count(mu, sum, func(s *Summary) { s.Completed++ })
 			r.logf("%s: adopted capture after failure: %s", entry.ID, ref.Key)
+			r.importEntry(entry.ID, mu, sum)
 			return
 		}
 	}
 
 	reason := SanitizeError(runErr)
+	cancelled := stop.reason() == string(DesiredCancelled)
+	if !cancelled {
+		// A cancel can land after the attempt already returned. The intent is
+		// durable; honour it instead of recording the failure the user stopped.
+		if current, gerr := r.store.Get(entry.ID); gerr == nil && current.Desired == DesiredCancelled {
+			cancelled = true
+		}
+	}
 	switch {
-	case paused.load():
-		// The user asked for this. Record it as a pause, not a failure.
+	case cancelled:
+		// Cancel is terminal until an explicit retry, but it never deletes the
+		// payload or the workspace.
 		if _, uerr := r.updateAttempt(entry.ID, token, func(e *Entry) error {
-			e.Phase = PhasePaused
-			e.Note = "paused at request; the client closed and the workspace was released"
+			e.Phase = PhaseCancelled
+			e.LastError = ""
+			e.Note = "cancelled at request; the client closed, payload and workspace kept, no capture published"
+			e.Attempt = ""
 			return nil
 		}); uerr != nil {
 			r.recordStale(entry.ID, uerr, mu, sum)
+			return
+		}
+		r.count(mu, sum, func(s *Summary) { s.Cancelled++ })
+		r.logf("%s: cancelled", entry.ID)
+	case stop.reason() == string(DesiredPaused):
+		// The user asked for this. Record it as a pause, not a failure.
+		var cancelledByUpdate bool
+		if _, uerr := r.updateAttempt(entry.ID, token, func(e *Entry) error {
+			if markCancelledByIntent(e) {
+				cancelledByUpdate = true
+				return nil
+			}
+			e.Phase = PhasePaused
+			e.Note = "paused at request; the client closed and the workspace was released"
+			e.Attempt = ""
+			return nil
+		}); uerr != nil {
+			r.recordStale(entry.ID, uerr, mu, sum)
+			return
+		}
+		if cancelledByUpdate {
+			r.count(mu, sum, func(s *Summary) { s.Cancelled++ })
+			r.logf("%s: cancelled", entry.ID)
 			return
 		}
 		r.count(mu, sum, func(s *Summary) { s.Paused++ })
@@ -837,10 +885,14 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sy
 		// the next runner resumes instead of reading this as a pause.
 		if _, uerr := r.updateAttempt(entry.ID, token, func(e *Entry) error {
 			e.Phase = PhaseQueued
-			if e.Desired == DesiredPaused {
+			switch e.Desired {
+			case DesiredPaused:
 				e.Phase = PhasePaused
+			case DesiredCancelled:
+				e.Phase = PhaseCancelled
 			}
 			e.Note = "interrupted by runner shutdown; intent preserved"
+			e.Attempt = ""
 			return nil
 		}); uerr != nil {
 			r.recordStale(entry.ID, uerr, mu, sum)
@@ -848,7 +900,12 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sy
 		}
 	case errors.Is(runErr, ErrWorkspaceBusy):
 		backoff := r.opts.backoff()
+		var cancelledByUpdate bool
 		if _, uerr := r.updateAttempt(entry.ID, token, func(e *Entry) error {
+			if markCancelledByIntent(e) {
+				cancelledByUpdate = true
+				return nil
+			}
 			e.Phase = PhaseBlocked
 			e.LastError = reason
 			e.NotBefore = time.Now().UTC().Add(backoff)
@@ -858,16 +915,31 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sy
 			r.recordStale(entry.ID, uerr, mu, sum)
 			return
 		}
+		if cancelledByUpdate {
+			r.count(mu, sum, func(s *Summary) { s.Cancelled++ })
+			r.logf("%s: cancelled", entry.ID)
+			return
+		}
 		r.count(mu, sum, func(s *Summary) { s.Blocked++ })
 		r.logf("%s: blocked (%s)", entry.ID, reason)
 	default:
+		var cancelledByUpdate bool
 		if _, uerr := r.updateAttempt(entry.ID, token, func(e *Entry) error {
+			if markCancelledByIntent(e) {
+				cancelledByUpdate = true
+				return nil
+			}
 			e.Phase = PhaseFailed
 			e.LastError = reason
 			e.Note = "failed; fix the cause and run `torrent queue retry` to try again"
 			return nil
 		}); uerr != nil {
 			r.recordStale(entry.ID, uerr, mu, sum)
+			return
+		}
+		if cancelledByUpdate {
+			r.count(mu, sum, func(s *Summary) { s.Cancelled++ })
+			r.logf("%s: cancelled", entry.ID)
 			return
 		}
 		r.count(mu, sum, func(s *Summary) { s.Failed++ })
@@ -878,7 +950,7 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry, token string, mu *sy
 // finishCompleted records a successful run, attaching the canonical identity only
 // now that the backend has validated it.
 func (r *Runner) finishCompleted(id, token string, out Outcome, mu *sync.Mutex, sum *Summary) {
-	if _, err := r.updateAttempt(id, token, func(e *Entry) error {
+	entry, err := r.updateAttempt(id, token, func(e *Entry) error {
 		e.JobID = out.JobID
 		e.InfoHash = out.InfoHash
 		e.InfoHashV2 = out.InfoHashV2
@@ -886,19 +958,64 @@ func (r *Runner) finishCompleted(id, token string, out Outcome, mu *sync.Mutex, 
 		e.Unresolved = false
 		e.Phase = PhaseCompleted
 		e.LastError = ""
-		e.Capture = &CaptureRef{Key: out.CaptureKey, Manifest: out.ManifestPath, Reconciled: out.Reconciled}
-		if e.Desired == DesiredPaused {
+		e.Attempt = ""
+		e.Capture = &CaptureRef{
+			Key:         out.CaptureKey,
+			Manifest:    out.ManifestPath,
+			CommittedAt: time.Now().UTC(),
+			Reconciled:  out.Reconciled,
+		}
+		switch e.Desired {
+		case DesiredPaused:
 			e.Note = "completed; a pause arrived while the capture was being committed, so the capture was kept and the entry stays paused"
-		} else {
+		case DesiredCancelled:
+			e.Note = "completed; a cancel arrived while the capture was being committed, so the capture was kept and no download will restart"
+		default:
 			e.Note = ""
 		}
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		r.recordStale(id, err, mu, sum)
 		return
 	}
 	r.count(mu, sum, func(s *Summary) { s.Completed++ })
 	r.logf("%s: completed (%s)", id, out.CaptureKey)
+	if entry.Import != nil && entry.Import.State == ImportPending {
+		r.importEntry(id, mu, sum)
+	}
+}
+
+// importEntry performs one optional vault handoff. It never affects the capture:
+// a failed import leaves PhaseCompleted and Capture intact.
+func (r *Runner) importEntry(id string, mu *sync.Mutex, sum *Summary) {
+	if _, err := r.store.ImportCapture(id); err != nil {
+		r.count(mu, sum, func(s *Summary) { s.ImportFailed++ })
+		r.logf("%s: import failed (%s)", id, SanitizeError(err))
+		return
+	}
+	r.count(mu, sum, func(s *Summary) { s.Imported++ })
+	r.logf("%s: imported into vault", id)
+}
+
+// importPending hands off every committed capture whose import was interrupted
+// before its result was recorded. ImportFailed is excluded: that state needs an
+// explicit retry, so one broken vault cannot slow every drain.
+func (r *Runner) importPending(sum *Summary) {
+	entries, err := r.store.PendingImports()
+	if err != nil {
+		r.logf("import reconciliation failed: %v", SanitizeError(err))
+		return
+	}
+	for _, e := range entries {
+		if _, ierr := r.store.ImportCapture(e.ID); ierr != nil {
+			sum.ImportFailed++
+			r.logf("%s: import failed (%s)", e.ID, SanitizeError(ierr))
+			continue
+		}
+		sum.Imported++
+		r.logf("%s: imported into vault", e.ID)
+	}
 }
 
 // recordStale counts a result that arrived too late to apply. It is not a failure:
@@ -918,12 +1035,12 @@ func (r *Runner) count(mu *sync.Mutex, sum *Summary, fn func(*Summary)) {
 	mu.Unlock()
 }
 
-// watchPause polls recorded intent while a job runs. A pause request switches the
-// entry to "stopping" (the client may still be closing) and cancels the worker;
-// the phase only becomes "paused" once Run has returned and the workspace lock is
-// released. It only ever acts on its own attempt: a superseded attempt stops
-// watching without touching the record.
-func (r *Runner) watchPause(ctx context.Context, id, token string, cancel context.CancelFunc, paused *syncFlag) {
+// watchStop polls recorded intent while a job runs. A pause or cancel request
+// switches the entry to "stopping" (the client may still be closing) and cancels
+// the worker; the final phase is written only once Run has returned and the
+// workspace lock is released. It only ever acts on its own attempt: a superseded
+// attempt stops watching without touching the record.
+func (r *Runner) watchStop(ctx context.Context, id, token string, cancel context.CancelFunc, stop *stopIntent) {
 	ticker := time.NewTicker(r.opts.pollInterval())
 	defer ticker.Stop()
 	for {
@@ -932,19 +1049,23 @@ func (r *Runner) watchPause(ctx context.Context, id, token string, cancel contex
 			return
 		case <-ticker.C:
 			entry, err := r.store.Get(id)
-			if err != nil || entry.Desired != DesiredPaused {
+			if err != nil || (entry.Desired != DesiredPaused && entry.Desired != DesiredCancelled) {
 				continue
 			}
-			paused.set(true)
+			stop.set(string(entry.Desired))
 			r.liveStopping(id)
 			if _, uerr := r.updateAttempt(id, token, func(e *Entry) error {
 				if e.Phase == PhaseRunning {
 					e.Phase = PhaseStopping
-					e.Note = "pause requested; waiting for the client to close"
+					if e.Desired == DesiredCancelled {
+						e.Note = "cancel requested; waiting for the client to close"
+					} else {
+						e.Note = "pause requested; waiting for the client to close"
+					}
 				}
 				return nil
 			}); uerr == nil {
-				r.logf("%s: stopping (pause requested)", id)
+				r.logf("%s: stopping (%s requested)", id, entry.Desired)
 			}
 			cancel()
 			return
@@ -959,23 +1080,37 @@ func (r *Runner) logf(format string, args ...any) {
 	_, _ = fmt.Fprintf(r.opts.Log, format+"\n", args...)
 }
 
-// syncFlag is a tiny atomic bool: the runner only needs "was this cancelled by a
-// pause request".
-type syncFlag struct {
-	mu sync.Mutex
-	v  bool
+// markCancelledByIntent closes the window where a cancel lands after the attempt
+// result was read but before it is persisted. The store lock serialises the two
+// writes, so re-reading intent inside the mutation is the authoritative check.
+func markCancelledByIntent(e *Entry) bool {
+	if e.Desired != DesiredCancelled {
+		return false
+	}
+	e.Phase = PhaseCancelled
+	e.LastError = ""
+	e.Note = "cancelled at request; the client closed, payload and workspace kept, no capture published"
+	e.Attempt = ""
+	return true
 }
 
-func (f *syncFlag) set(v bool) {
+// stopIntent is the reason a running attempt was cancelled: pause or cancel.
+// The runner only needs the last recorded reason, never a stack of commands.
+type stopIntent struct {
+	mu   sync.Mutex
+	kind string
+}
+
+func (f *stopIntent) set(kind string) {
 	f.mu.Lock()
-	f.v = v
+	f.kind = kind
 	f.mu.Unlock()
 }
 
-func (f *syncFlag) load() bool {
+func (f *stopIntent) reason() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.v
+	return f.kind
 }
 
 // SanitizeError makes a backend error safe to persist: no absolute paths, no
@@ -1019,6 +1154,8 @@ func EntryLabel(e Entry) string {
 		return "blocked"
 	case PhasePaused:
 		return "paused"
+	case PhaseCancelled:
+		return "cancelled"
 	case PhaseRunning:
 		return "running (recorded)"
 	case PhaseStopping:

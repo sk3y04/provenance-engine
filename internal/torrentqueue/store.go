@@ -53,6 +53,9 @@ const (
 	DesiredPaused Desired = "paused"
 	// DesiredRun means the runner may pick the entry up.
 	DesiredRun Desired = "run"
+	// DesiredCancelled means the user stopped the entry. Unlike a pause, it is
+	// terminal until an explicit retry; payload already on disk is kept.
+	DesiredCancelled Desired = "cancelled"
 )
 
 // Phase is the last observed lifecycle position, recorded - never inferred live.
@@ -77,6 +80,9 @@ const (
 	// PhaseBlocked: a retryable condition (busy workspace, no peers yet) with a
 	// bounded backoff, so the runner neither hot-loops nor gives up.
 	PhaseBlocked Phase = "blocked"
+	// PhaseCancelled: stopped by explicit request. Payload and workspace are kept;
+	// only an explicit retry makes it runnable again.
+	PhaseCancelled Phase = "cancelled"
 )
 
 // Source is the public description of what was enqueued.
@@ -96,6 +102,39 @@ type CaptureRef struct {
 	Manifest    string    `json:"manifest"`
 	CommittedAt time.Time `json:"committed_at,omitempty"`
 	Reconciled  bool      `json:"reconciled,omitempty"`
+}
+
+// ImportState is the durable position of the optional vault handoff. It is
+// deliberately separate from Phase: a failed import must never turn a committed
+// capture back into a failed transfer.
+type ImportState string
+
+const (
+	// ImportPending means the capture is committed and the vault handoff has not
+	// completed. A runner retries this state without touching the swarm.
+	ImportPending ImportState = "pending"
+	// ImportImported means a content-addressed vault revision was written.
+	ImportImported ImportState = "imported"
+	// ImportFailed means the capture is still committed, but the vault handoff
+	// failed. It needs an explicit retry (`queue import`), never a re-download.
+	ImportFailed ImportState = "failed"
+)
+
+// ImportTarget names the vault a completed capture is handed to. It is recorded
+// on the entry so a restart can retry the handoff without repeating a flag.
+type ImportTarget struct {
+	VaultRoot  string `json:"vault_root"`
+	Collection string `json:"collection"`
+}
+
+// ImportRef is the recorded handoff result.
+type ImportRef struct {
+	Target     ImportTarget `json:"target"`
+	State      ImportState  `json:"state"`
+	RevisionID string       `json:"revision_id,omitempty"`
+	ImportedAt time.Time    `json:"imported_at,omitempty"`
+	Attempts   int          `json:"attempts,omitempty"`
+	LastError  string       `json:"last_error,omitempty"`
 }
 
 // SeedDesired is what the user asked for. Only an explicit `queue seed` sets it.
@@ -176,8 +215,12 @@ type Entry struct {
 	// a workspace. A resolved entry can always be resumed offline.
 	Unresolved bool `json:"unresolved,omitempty"`
 
-	Capture  *CaptureRef `json:"capture,omitempty"`
-	Attempts int         `json:"attempts,omitempty"`
+	Capture *CaptureRef `json:"capture,omitempty"`
+	// Import is the optional vault handoff for a committed capture. Its state is
+	// independent of Phase and seeding: an import failure never un-commits a
+	// capture and never asks the transfer layer to fetch again.
+	Import   *ImportRef `json:"import,omitempty"`
+	Attempts int        `json:"attempts,omitempty"`
 	// Attempt is the token of the attempt that currently owns the record, or empty
 	// when no attempt is running. A result is applied only if its token still
 	// matches, so a superseded attempt cannot overwrite a newer command.
@@ -230,6 +273,9 @@ type AddRequest struct {
 	InfoHashV2 string
 	Workspace  string
 	Unresolved bool
+	// Import optionally records a vault handoff for the capture this entry will
+	// produce. It is intent, not a credential.
+	Import *ImportTarget
 }
 
 // OpenStore prepares the queue directories under root. It creates no entry and
@@ -301,6 +347,11 @@ func (s *Store) Add(req AddRequest) (Entry, bool, error) {
 	if strings.TrimSpace(req.Source.Magnet) == "" && strings.TrimSpace(req.Source.Path) == "" {
 		return zero, false, errors.New("a queue entry needs a magnet or a .torrent path")
 	}
+	target, err := normalizeImportTarget(req.Import)
+	if err != nil {
+		return zero, false, err
+	}
+	req.Import = target
 
 	l, err := s.lock()
 	if err != nil {
@@ -315,6 +366,23 @@ func (s *Store) Add(req AddRequest) (Entry, bool, error) {
 	key := duplicateKey(req)
 	for _, e := range entries {
 		if duplicateKeyOf(e) == key {
+			if req.Import == nil {
+				return e, true, nil
+			}
+			if e.Import != nil && e.Import.Target != *req.Import {
+				return zero, false, fmt.Errorf("%w: %s is already queued for vault %s/%s",
+					ErrImportTargetConflict, e.ID, e.Import.Target.VaultRoot, e.Import.Target.Collection)
+			}
+			if e.Import != nil {
+				return e, true, nil
+			}
+			// A duplicate may acquire an import target that was not given when it
+			// was first queued. The capture intent is unchanged.
+			e.Import = &ImportRef{Target: *req.Import, State: ImportPending}
+			e.UpdatedAt = time.Now().UTC()
+			if werr := s.writeEntry(e); werr != nil {
+				return zero, false, werr
+			}
 			return e, true, nil
 		}
 	}
@@ -343,6 +411,9 @@ func (s *Store) Add(req AddRequest) (Entry, bool, error) {
 		Workspace:  req.Workspace,
 		Unresolved: req.Unresolved,
 	}
+	if req.Import != nil {
+		entry.Import = &ImportRef{Target: *req.Import, State: ImportPending}
+	}
 	if err := s.writeEntry(entry); err != nil {
 		return zero, false, err
 	}
@@ -350,6 +421,27 @@ func (s *Store) Add(req AddRequest) (Entry, bool, error) {
 		return zero, false, err
 	}
 	return entry, false, nil
+}
+
+// normalizeImportTarget validates a vault target and makes the vault path
+// absolute, so a later restart cannot resolve it against a different directory.
+func normalizeImportTarget(target *ImportTarget) (*ImportTarget, error) {
+	if target == nil {
+		return nil, nil
+	}
+	vault := strings.TrimSpace(target.VaultRoot)
+	if vault == "" {
+		return nil, fmt.Errorf("%w: an import target needs a vault root", ErrUsage)
+	}
+	collection := strings.TrimSpace(target.Collection)
+	if collection == "" {
+		return nil, fmt.Errorf("%w: an import target needs a collection name", ErrUsage)
+	}
+	abs, err := filepath.Abs(vault)
+	if err != nil {
+		return nil, fmt.Errorf("resolve vault root: %w", err)
+	}
+	return &ImportTarget{VaultRoot: abs, Collection: collection}, nil
 }
 
 func duplicateKey(req AddRequest) string {
