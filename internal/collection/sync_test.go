@@ -98,7 +98,12 @@ func syncTestEnv(t *testing.T) {
 	t.Setenv("PROVENANCE_COLLECTION_FILE", filepath.Join(dir, "collections.json"))
 	t.Setenv("PROVENANCE_SESSION_DIR", filepath.Join(dir, "sessions"))
 	origScan, origDownload := scanFn, downloadFn
-	t.Cleanup(func() { scanFn, downloadFn = origScan, origDownload })
+	origRecord, origAddSeen, origRecordSync := recordCaptureFn, addSeenFn, recordSyncFn
+	t.Cleanup(func() {
+		scanFn, downloadFn = origScan, origDownload
+		recordCaptureFn, addSeenFn, recordSyncFn = origRecord, origAddSeen, origRecordSync
+	})
+	recordCaptureFn, addSeenFn, recordSyncFn = origRecord, origAddSeen, origRecordSync
 }
 
 func fakeScan(items []manifest.Item) func(context.Context, string, dispatcher.Options) (manifest.Manifest, error) {
@@ -212,7 +217,7 @@ func TestRecordCaptureStampsCurrentVersion(t *testing.T) {
 		Site:    "generic",
 		Options: config.Config{OutputDir: dir},
 	}
-	if err := recordCapture(c, "sess-test", map[string]manifest.Item{}); err != nil {
+	if _, err := recordCapture(c, "sess-test", map[string]manifest.Item{}); err != nil {
 		t.Fatalf("recordCapture: %v", err)
 	}
 	runs, err := manifest.ListRunManifests(dir)

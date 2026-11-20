@@ -2,6 +2,25 @@
 
 ### Added
 
+- **`archive verify [--json]`.** A read-only vault check walks every revision
+  manifest, hashes each referenced blob once and reports missing blobs,
+  digest/size mismatches, unreadable manifests and invalid entries. Shared blobs
+  are checked once with a reference count. It never repairs or deletes, and exits
+  nonzero on damage so it can gate a backup/restore drill. A copied vault is
+  covered by an offline citation-resolution test.
+
+- **Deterministic collection replay.** Seen identities are now extractor plus the
+  platform's stable item id, with the legacy key still honoured and signed query
+  strings stripped from URL fallbacks. A per-collection sync lock prevents two
+  replays from racing. With `--record`, an item is marked seen only after its
+  artifact exists and the capture item plus run manifest are committed; capture,
+  seen and result write failures are each tested at their boundary. Capture item
+  IDs and paths are now unique per artifact and relative to the output directory.
+
+- **Bounded, redacted tool versions in `provenance doctor`.** Tool details show
+  the resolved path and a short `--version` banner with a timeout; banner output
+  is redacted, and an invalid database DSN never echoes its password.
+
 - **Durable torrent archive handoff.** `torrent queue add --vault DIR
   [--collection NAME]` records an opt-in vault target on the entry. After the
   capture commits, the runner imports it; a failed import records

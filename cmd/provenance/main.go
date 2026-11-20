@@ -1178,6 +1178,7 @@ func manifestCmd() *cobra.Command {
 }
 
 func archiveCmd() *cobra.Command {
+	var verifyJSON bool
 	cmd := &cobra.Command{
 		Use:   "archive",
 		Short: "Preserve content in the durable vault",
@@ -1221,6 +1222,48 @@ func archiveCmd() *cobra.Command {
 			return archiveImport(cmd.Context(), args[0])
 		},
 	})
+	verify := &cobra.Command{
+		Use:   "verify",
+		Short: "Verify revision manifests and every referenced blob (read-only)",
+		Long: "Walks every revision manifest under <vault>/revisions, hashes each referenced\n" +
+			"blob once and reports missing blobs, digest/size mismatches and unreadable\n" +
+			"manifests. It never repairs, rewrites or deletes anything. A shared blob is\n" +
+			"checked once and its reference count is reported. Exit status is 0 only when\n" +
+			"the vault is healthy, so this can gate a backup/restore drill.",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			report, err := archive.VerifyVault(flagVaultRoot)
+			if err != nil {
+				return err
+			}
+			if verifyJSON {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(report); err != nil {
+					return err
+				}
+			} else {
+				fmt.Printf("vault verify: %d revision(s), %d unique blob(s) (%d ok, %d missing, %d mismatch, %d unreadable, %d invalid)\n",
+					report.Revisions, report.UniqueBlobs, report.OK, report.Missing, report.Mismatch, report.Unreadable, report.Invalid)
+				for _, b := range report.Blobs {
+					if b.Status == archive.VerifyOK {
+						continue
+					}
+					fmt.Printf("  %-10s %s (referenced %d time(s)): %s\n", strings.ToUpper(string(b.Status)), b.Sha256, b.References, b.Error)
+				}
+				for _, m := range report.Manifests {
+					fmt.Printf("  %-10s revision %s: %s\n", strings.ToUpper(string(m.Status)), m.RevisionID, m.Error)
+				}
+			}
+			if !report.Healthy {
+				return errors.New("archive verify: vault is not healthy")
+			}
+			return nil
+		},
+	}
+	verify.Flags().BoolVar(&verifyJSON, "json", false, "Emit the verification report as JSON on stdout")
+	cmd.AddCommand(verify)
 	cmd.AddCommand(&cobra.Command{
 		Use:   "import-pdf PATH",
 		Short: "Import a PDF file into the vault",

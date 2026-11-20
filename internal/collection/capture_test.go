@@ -1,6 +1,8 @@
 package collection
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"unicode/utf8"
 
@@ -25,8 +27,17 @@ func TestRecordCaptureItemsAreSortedByURL(t *testing.T) {
 		"https://cdn/m.jpg": {URL: "https://cdn/m.jpg", Filename: "m.jpg"},
 		"https://cdn/b.jpg": {URL: "https://cdn/b.jpg", Filename: "b.jpg"},
 	}
-	if err := recordCapture(c, "sess-test", urlToItem); err != nil {
+	for _, item := range urlToItem {
+		if err := os.WriteFile(filepath.Join(dir, item.Filename), []byte(item.Filename), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	committed, err := recordCapture(c, "sess-test", urlToItem)
+	if err != nil {
 		t.Fatalf("recordCapture: %v", err)
+	}
+	if len(committed) != len(urlToItem) {
+		t.Fatalf("committed = %v, want %d keys", committed, len(urlToItem))
 	}
 	runs, err := manifest.ListRunManifests(dir)
 	if err != nil || len(runs) != 1 {
@@ -38,6 +49,19 @@ func TestRecordCaptureItemsAreSortedByURL(t *testing.T) {
 	}
 	if len(cm.Items) != len(urlToItem) {
 		t.Fatalf("items = %d, want %d", len(cm.Items), len(urlToItem))
+	}
+	seenIDs := map[string]bool{}
+	for _, item := range cm.Items {
+		if item.Sha256 == "" || item.ByteSize == 0 {
+			t.Fatalf("capture item lacks an artifact attestation: %+v", item)
+		}
+		if filepath.IsAbs(item.DownloadedPath) {
+			t.Fatalf("capture path is absolute: %q", item.DownloadedPath)
+		}
+		if seenIDs[item.ExternalID] {
+			t.Fatalf("duplicate capture external id %q", item.ExternalID)
+		}
+		seenIDs[item.ExternalID] = true
 	}
 	for i := 1; i < len(cm.Items); i++ {
 		if cm.Items[i-1].URL >= cm.Items[i].URL {

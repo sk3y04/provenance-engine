@@ -162,3 +162,64 @@ func TestRenderListsChecksAndResult(t *testing.T) {
 		t.Fatalf("rendered output missing result line:\n%s", out)
 	}
 }
+
+func TestRunReportsToolVersionsWithoutLeakingSecrets(t *testing.T) {
+	hermeticHome(t)
+	p := toolPath(t)
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then\n" +
+		"  echo \"yt-dlp 2026.01.01 token=SECRET https://cdn.example/x?token=SECRET\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(p, "yt-dlp"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := Run(context.Background(), Options{PingTimeout: time.Second, ToolVersionTimeout: 500 * time.Millisecond})
+	c, ok := findCheck(rep, "yt-dlp")
+	if !ok || c.Status != OK {
+		t.Fatalf("yt-dlp check = %#v", c)
+	}
+	if !strings.Contains(c.Detail, "2026.01.01") {
+		t.Fatalf("version missing from detail: %q", c.Detail)
+	}
+	if strings.Contains(c.Detail, "SECRET") {
+		t.Fatalf("secret leaked from a version banner: %q", c.Detail)
+	}
+	if strings.Contains(c.Detail, "?token=") {
+		t.Fatalf("signed URL query leaked from a version banner: %q", c.Detail)
+	}
+}
+
+func TestRunInvalidDSNDoesNotLeakPassword(t *testing.T) {
+	hermeticHome(t)
+	toolPath(t)
+	t.Setenv("PROVENANCE_DATABASE_URL", "postgres://user:s3cret@[bad")
+
+	rep := Run(context.Background(), Options{PingTimeout: 200 * time.Millisecond, ToolVersionTimeout: 200 * time.Millisecond})
+	c, ok := findCheck(rep, "database")
+	if !ok || c.Status != Missing {
+		t.Fatalf("database check = %#v", c)
+	}
+	if strings.Contains(c.Detail, "s3cret") {
+		t.Fatalf("DSN password leaked: %q", c.Detail)
+	}
+}
+
+func TestToolVersionTimeoutIsBounded(t *testing.T) {
+	hermeticHome(t)
+	p := toolPath(t)
+	script := "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 2; fi\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(p, "yt-dlp"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	rep := Run(context.Background(), Options{PingTimeout: time.Second, ToolVersionTimeout: 50 * time.Millisecond})
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("tool version probe was not bounded: %s", elapsed)
+	}
+	if !rep.OK {
+		t.Fatalf("a slow version banner failed the required check: %#v", rep.Checks)
+	}
+}

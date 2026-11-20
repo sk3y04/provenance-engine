@@ -41,6 +41,7 @@ provenance
 │   ├── collection <NAME>              Archive a collection's content
 │   ├── session <NAME>                Archive a session's downloads
 │   ├── import <DIR>                  Import a directory with capture manifests
+│   ├── verify [--json]               Check revision manifests and blobs
 │   ├── import-pdf <PATH>             Import a PDF into the vault
 │   ├── import-git <URL>              Import a Git repository
 │   ├── import-docs <URL>             Import a static documentation site
@@ -203,17 +204,19 @@ ping), so it is safe to run at any time.
 
 | Check | Required | Meaning |
 |-------|----------|---------|
-| `yt-dlp` | yes | resolved from PATH or the go-ytdlp cache |
-| `ffmpeg` | yes | resolved from PATH |
-| `ffprobe` | yes | resolved from PATH |
-| `chrome` | no | browser fallback and `import-web` |
+| `yt-dlp` | yes | resolved from PATH or the go-ytdlp cache; path and bounded version |
+| `ffmpeg` | yes | resolved from PATH; path and bounded version |
+| `ffprobe` | yes | resolved from PATH; path and bounded version |
+| `chrome` | no | browser fallback and `import-web`; path and bounded version |
 | `cookies` | no | the `--cookies` file, if given, exists and is a regular file |
 | `cache` | yes | the provenance cache directory exists and is writable |
 | `database` | no | pings `PROVENANCE_DATABASE_URL` when set (host shown, never the password) |
 
 The exit code is non-zero when a required check fails, so it can gate a
 deployment or CI step. It does not trigger tool auto-install (the point is to
-report state, not fix it).
+report state, not fix it). Version probes are bounded and their output is
+redacted, so a hostile banner cannot leak a signed URL or hang the check; DSN
+parse errors never echo a password.
 
 ```bash
 $ provenance doctor
@@ -281,12 +284,18 @@ Named collection sync sources. A collection is a saved source URL with its own c
 
 ### Incremental sync
 
-Collections track seen item IDs (post IDs, video IDs) in `~/.cache/provenance/collections.json`. Each `collect sync` run:
+Collections track seen item identities in `~/.cache/provenance/collections.json`. Each `collect sync` run:
 
-1. Scans the source URL (discover all items without downloading)
-2. Compares discovered item IDs against the seen set
-3. Downloads only new items via a resumable session (`collect-<name>-<date>`)
-4. Records the sync result (total, new, skipped, failed)
+1. Takes a per-collection sync lock, so two replays cannot both decide the same item is new
+2. Scans the source URL (discover all items without downloading)
+3. Compares extractor + stable platform item IDs against the seen set (not CDN URLs; signed query strings are stripped from the fallback)
+4. Downloads only new items via a resumable session (`collect-<name>-<date>`)
+5. With `--record`, writes capture items and the run manifest, then marks an item seen
+6. Records the sync result (total, new, skipped, failed)
+
+An item is marked seen only after its artifact exists and its capture record is
+committed. A crash before the seen write leaves the item retryable; a crash
+after it leaves the committed capture and the next sync skips it.
 
 Repeated runs only pick up new content  -  a Reddit subreddit with 1000 wallpapers scans immediately and downloads nothing if no new posts have appeared since the last sync.
 
@@ -376,11 +385,30 @@ There are two paths into the vault:
 | `collection <NAME>` | Archive all captured content from a named collection |
 | `session <NAME>` | Archive all downloads from a session |
 | `import <DIR>` | Import an existing directory that already has `.provenance/` capture manifests |
+| `verify [--json]` | Read-only check of every revision manifest and referenced blob; nonzero on damage |
 | `import-pdf <PATH>` | Import a PDF file  -  extracts text per page, stores as searchable documents |
 | `import-git <URL>` | Import a Git repository  -  shallow clone, extract doc files, resolve tag→commit |
 | `import-docs <URL>` | Import a static documentation site  -  crawl bounded by scope and max-pages |
 | `import-openapi <PATH>` | Import an OpenAPI spec  -  generate endpoint documents, store original spec |
 | `import-web <URL>` | Archive a web page or site via headless Chrome  -  extracts HTML, text, discovers same-scope links, bounded by `--max-pages` |
+
+### Verify a vault
+
+`provenance archive verify` walks `revisions/*/manifest.json`, hashes each
+referenced blob once, and reports missing blobs, digest/size mismatches and
+unreadable manifests. It never repairs, rewrites or deletes anything. A blob
+shared by several revisions is checked once and reports its reference count.
+Exit status is 0 only when the vault is healthy.
+
+```bash
+provenance archive verify --vault ~/Vault
+provenance archive verify --vault ~/Vault --json
+```
+
+The JSON document contains `revisions`, `unique_blobs`, `checked_blobs`, the
+`ok`/`missing`/`mismatch`/`unreadable`/`invalid` counts, `healthy`, and per-blob
+or per-manifest findings. It is the same document on stdout whether the vault is
+healthy or damaged, so a restore drill can archive it.
 
 ### Importer flags
 

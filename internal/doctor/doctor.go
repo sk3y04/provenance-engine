@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
@@ -18,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sk3y04/provenance-engine/internal/capability"
+	"github.com/sk3y04/provenance-engine/internal/redact"
 )
 
 // Status is the outcome of one check.
@@ -48,10 +50,16 @@ type Options struct {
 	ChromePath  string // optional Chrome/Chromium override
 	// PingTimeout bounds the database ping. Zero uses DefaultPingTimeout.
 	PingTimeout time.Duration
+	// ToolVersionTimeout bounds one `<tool> --version` probe. Zero uses
+	// DefaultToolVersionTimeout. A slow or hostile tool cannot hold doctor open.
+	ToolVersionTimeout time.Duration
 }
 
 // DefaultPingTimeout bounds the database ping.
 const DefaultPingTimeout = 5 * time.Second
+
+// DefaultToolVersionTimeout bounds one tool version probe.
+const DefaultToolVersionTimeout = 2 * time.Second
 
 // Report is the full check result. OK is true when every required check
 // passed; optional checks never affect it.
@@ -66,13 +74,17 @@ func Run(ctx context.Context, opts Options) Report {
 	if timeout <= 0 {
 		timeout = DefaultPingTimeout
 	}
+	versionTimeout := opts.ToolVersionTimeout
+	if versionTimeout <= 0 {
+		versionTimeout = DefaultToolVersionTimeout
+	}
 
 	set := capability.Probe(ctx, opts.ChromePath)
 	checks := []Check{
-		toolCheck(capability.ToolYtdlp, set, true),
-		toolCheck(capability.ToolFfmpeg, set, true),
-		toolCheck(capability.ToolFFprobe, set, true),
-		toolCheck(capability.ToolChrome, set, false),
+		toolCheck(ctx, capability.ToolYtdlp, set, true, versionTimeout),
+		toolCheck(ctx, capability.ToolFfmpeg, set, true, versionTimeout),
+		toolCheck(ctx, capability.ToolFFprobe, set, true, versionTimeout),
+		toolCheck(ctx, capability.ToolChrome, set, false, versionTimeout),
 		cookiesCheck(opts.CookiesFile),
 		cacheCheck(),
 		databaseCheck(ctx, timeout),
@@ -86,10 +98,14 @@ func Run(ctx context.Context, opts Options) Report {
 	return rep
 }
 
-func toolCheck(name string, set capability.Set, required bool) Check {
+func toolCheck(ctx context.Context, name string, set capability.Set, required bool, timeout time.Duration) Check {
 	t, _ := set.Get(name)
 	if t.Available {
-		return Check{Name: name, Status: OK, Detail: t.Path, Required: required}
+		detail := t.Path
+		if version := toolVersion(ctx, t.Path, timeout); version != "" {
+			detail += " (" + version + ")"
+		}
+		return Check{Name: name, Status: OK, Detail: detail, Required: required}
 	}
 	detail := "not found on PATH"
 	if name == capability.ToolYtdlp {
@@ -146,13 +162,32 @@ func databaseCheck(ctx context.Context, timeout time.Duration) Check {
 	defer cancel()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		return Check{Name: "database", Status: Missing, Detail: "invalid DSN: " + err.Error()}
+		// Never echo a DSN parse error: drivers can include the password.
+		return Check{Name: "database", Status: Missing, Detail: "invalid DSN (password redacted)"}
 	}
 	defer pool.Close()
 	if pingErr := pool.Ping(ctx); pingErr != nil {
-		return Check{Name: "database", Status: Missing, Detail: databaseTarget(dsn) + ": " + pingErr.Error()}
+		return Check{Name: "database", Status: Missing, Detail: databaseTarget(dsn) + ": " + redact.Detail(pingErr.Error())}
 	}
 	return Check{Name: "database", Status: OK, Detail: databaseTarget(dsn)}
+}
+
+// toolVersion asks a tool for its version with a bounded lifetime. It reports an
+// empty string rather than failing the check: a present tool is still usable even
+// if it does not answer `--version` the way we expect. Output is redacted and
+// bounded, so a version banner cannot leak a signed URL or an oversized body.
+func toolVersion(parent context.Context, path string, timeout time.Duration) string {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "--version").Output()
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+	if line == "" {
+		return ""
+	}
+	return redact.Detail(line)
 }
 
 // databaseTarget renders the host part of a DSN for display (no password).
