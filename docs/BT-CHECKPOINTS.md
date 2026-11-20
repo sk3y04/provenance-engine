@@ -3447,3 +3447,99 @@ report and a nonzero exit; an empty vault verified healthy.
 PR-4A (page-pinned PDF citations) or the carried torrentqueue flake/sampler
 work. PR-3's "separate live smoke" requirement is a CI-policy follow-up; no live
 network test was moved into the default suite.
+
+---
+
+## PR-4A — Page-pinned PDF citations and optional Docling
+
+**Starting SHA** `ec5451f` (tree clean). **Ending SHA** `eb13be2`.
+
+Scope shipped: 4A only. Every extracted PDF passage carries a Provenance-owned
+locator (artifact SHA-256, zero-based physical page index, optional printed
+label, optional normalized top-left rectangles). The PDF is immutable; optional
+Docling JSON is stored as a separate content-addressed derivation. Page-pinned
+citations and offline resolution are exposed through the filesystem vault.
+PR-4B (DOI/arXiv identity and enrichment) and PR-4C (versioned docs evidence)
+are deliberately not in this commit; `docs/RESEARCH.md` records that boundary.
+
+### Changed paths
+
+- `internal/archive/types.go` — `Rect`, `Locator`, `Derivation`,
+  `Document.Locator`, `Revision.Derivations`, `ArtifactAnalysis`.
+- `internal/archive/locator.go` (new) — offline `ResolveLocator`.
+- `internal/archive/locator_test.go` (new) — archived bytes, negative page,
+  artifact outside the revision, invalid revision id.
+- `internal/citation/citation.go` — `FromDocument`, locator/excerpt fields,
+  page-aware plain rendering; the URI remains entity-level.
+- `internal/citation/offline_test.go` — chunk id stays out of the URI.
+- `internal/importers/pdf.go` — locators for fallback extraction, optional
+  bounded Docling process, tolerant JSON parser, raw JSON derivation, normalized
+  rectangles, printed labels.
+- `internal/importers/importers_test.go` — printed labels differing from
+  physical pages, re-index acceptance, offline PDF resolution, derivation blob.
+- `cmd/provenance/main.go` — `archive import-pdf --docling/--docling-timeout/
+  --docling-version`, `vault cite --page`, filesystem-first citations,
+  `vault --vault`.
+- `docs/RESEARCH.md` (new), `docs/CLI.md`, `CHANGELOG`.
+
+### Locator contract
+
+```
+artifact_sha256      PDF blob SHA-256
+page_index           zero-based physical page
+page_label           printed label when the parser exposes it (optional)
+rectangles[]         normalized fractions of page width/height, [0,1]
+coordinate_origin    "top-left"
+```
+
+The citation URI is still `provenance://<collection>@<revision>#<entity>`.
+Passage/chunk ids are not part of it. `vault cite --page N` finds the document
+whose locator has that physical index and emits the locator alongside the URI.
+
+### Verified (actually run)
+
+| Command | Result |
+|---|---|
+| `go test ./internal/importers -run TestImportPDF -count=1` | fallback and Docling page-pinning tests pass |
+| `go test ./internal/archive ./internal/citation ./internal/importers ./cmd/provenance -count=1` | all ok |
+| `go test -race ./internal/archive ./internal/citation ./internal/importers ./cmd/provenance` | all ok |
+| `go test ./... -count=1` | every package ok except the pre-existing `TestQueuePerJobPeerLimitIsObserved` sampler flake; no new failures |
+| `go vet ./...` | clean |
+| `golangci-lint run ./internal/archive/... ./internal/citation/... ./internal/importers/... ./cmd/provenance/...` | `0 issues` |
+| `gofmt -l cmd internal` | empty |
+
+CLI smoke with a fake local Docling executable: `archive import-pdf` recorded
+the PDF plus Docling JSON; `archive verify --json` reported two healthy blobs;
+`vault cite <rev> --page 1 --format json --vault <vault>` returned the physical
+index `1`, printed label `iv`, a normalized rectangle, the excerpt, and the same
+entity-level URI. The plain rendering showed `page index 1 (printed "iv")`.
+
+The test fixture has printed labels `Cover`, `iv`, `1` on physical indices
+`0`, `1`, `2`; after a second import with changed passage IDs, physical index
+`1` still resolves to the archived PDF bytes through `ResolveLocator`.
+
+### Not verified (explicit)
+
+- **Real Docling execution.** The process runner is exercised by a fake CLI and
+  the parser by fixtures; no real Docling binary or OCR model was run here.
+- **The full Docling schema.** The parser reads `page_no`, `prov`, `bbox`,
+  `pages/size`, and `page_label` where present. Unknown fields are ignored and
+  the exact JSON is retained for a later adapter; no claim is made that every
+  Docling version emits the same shape.
+- **BBox origin.** Rectangles declare `top-left`; a parser whose bbox uses a
+  different origin needs an adapter rather than a silent reinterpretation.
+- **Scan-only PDFs without Docling.** The built-in extractor records no text and
+  the import succeeds with zero passages; OCR is not performed.
+- **PR-4B/4C.** No DOI/arXiv intake, Crossref update observations,
+  BibTeX/CSL export, work/version model, release/commit docs evidence, or
+  normalized docs diff was added.
+- **PostgreSQL locator round-trip.** The filesystem revision carries locators;
+  the existing PostgreSQL reader does not reconstruct them, which is why
+  `vault cite` reads the filesystem first.
+- **Windows.** Linux only.
+
+### Next
+
+PR-4B (DOI/arXiv metadata identity and citation export), then PR-4C (versioned
+documentation evidence). The pre-existing torrentqueue sampler flake remains
+carried from BT-14.
