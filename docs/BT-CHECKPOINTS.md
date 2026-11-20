@@ -3327,3 +3327,123 @@ refused.
 carried from BT-14. PR-2's missing first-class HTTP/event API is deliberately
 deferred: the TUI uses the durable store and the read-only Unix live socket, so
 no second network client exists yet.
+
+---
+
+## PR-3 — Vault verification, deterministic collection replay, safer diagnostics
+
+**Starting SHA** `2311305` (tree clean). **Ending SHA** `4632111`.
+
+Scope shipped: read-only `archive verify --json`, deterministic collection commit
+ordering and item identity, a per-collection sync lock, bounded/redacted tool
+versions in doctor, and an offline restored-vault citation test. No migration,
+automatic repair, deletion, new database dependency or live-network test was
+added.
+
+### Changed paths
+
+- `internal/archive/verify.go` (new) — `VerifyVault`, unique-blob walk,
+  missing/mismatch/unreadable/invalid findings, shared-blob reference counts.
+- `internal/archive/verify_test.go` (new) — clean/shared, corrupt, missing,
+  unreadable manifest, empty vault, no-repair assertions.
+- `internal/citation/offline_test.go` (new) — copy a vault, delete the source,
+  resolve the citation through `ReadRevision` + blob store.
+- `internal/collection/sync.go` — per-collection lock, extractor+stable-ID
+  identity with legacy-key compatibility, capture-before-seen ordering,
+  fully-succeeded-post capture subset, relative capture paths, unique artifact
+  external IDs, test seams for the capture/seen/result boundaries.
+- `internal/collection/replay_test.go` (new) — identity, contention, capture
+  failure, seen failure, result failure, partial-post and unique-ID tests.
+- `internal/collection/capture_test.go`, `sync_test.go` — fixture files and the
+  new signatures; seams restored between tests.
+- `internal/doctor/doctor.go` — bounded `--version` probes, redacted banners,
+  safe invalid-DSN detail, optional `ToolVersionTimeout`.
+- `internal/doctor/doctor_test.go` — version redaction, bounded timeout, DSN
+  password absence.
+- `cmd/provenance/main.go` — `archive verify [--json]`.
+- `docs/CLI.md`, `CHANGELOG`.
+
+### Vault verification contract
+
+| Case | Reported as |
+|---|---|
+| blob exists and hashes to its address | `ok` |
+| blob address has no file | `missing` |
+| bytes hash elsewhere, or size is not the recorded size | `mismatch` |
+| blob exists but cannot be read | `unreadable` |
+| `manifest.json` missing or invalid JSON | manifest `unreadable` |
+| revision directory/name or artifact hash is invalid | `invalid` |
+| same blob in several revisions | one hash, `references` count |
+
+`VerifyVault` never writes. It validates a blob digest before joining it into a
+path, so a hostile manifest cannot make the verifier read outside the vault.
+`archive verify` exits nonzero when `healthy` is false; `--json` still emits the
+complete report first.
+
+### Collection replay contract
+
+The durable order is:
+
+```
+download -> artifact on disk -> capture item -> run manifest
+         -> seen id -> sync result
+```
+
+- Identity is `extractor:PostID` (or `extractor:ID`), not a CDN URL. The old
+  unprefixed key is still checked so an existing seen store does not rescan.
+  Generic URL fallbacks strip query/fragment before they become a key.
+- Capture item external IDs are `extractor:mediaID`; when a platform id is
+  absent, a short hash of the redacted URL keeps sibling files distinct.
+- `DownloadedPath` is relative to the output directory and must stay inside it.
+  A missing/non-regular artifact fails the capture instead of recording an empty
+  hash.
+- `--record` commits only fully succeeded posts, then marks exactly those seen.
+  A capture failure leaves everything retryable; a seen failure keeps the
+  committed run manifest; a result failure keeps the seen ids.
+- One sync per collection at a time (`ErrCollectionSyncing`); a second caller
+  fails fast rather than racing the first.
+
+### Verified (actually run)
+
+| Command | Result |
+|---|---|
+| `go test ./internal/archive -run TestVerify -count=3` | pass |
+| `go test ./internal/citation -run TestRestored -count=3` | pass |
+| `go test ./internal/collection -count=3` | pass |
+| `go test ./internal/doctor -count=3` | pass |
+| `go test -race ./internal/archive ./internal/citation ./internal/collection ./internal/doctor` | all ok |
+| `go test ./internal/archive ./internal/citation ./internal/collection ./internal/doctor ./cmd/provenance -count=3` | all ok |
+| `go test ./... -count=1` | every package ok except the two pre-existing torrentqueue flakes (`TestQueueRealSameWorkspaceRace`, `TestQueuePerJobPeerLimitIsObserved`); neither touches this change and both failed at earlier baselines |
+| `go vet ./...` | clean |
+| `golangci-lint run ./internal/archive/... ./internal/citation/... ./internal/collection/... ./internal/doctor/... ./cmd/provenance/...` | `0 issues` |
+| `gofmt -l cmd internal` | empty |
+| `git diff --check` | clean |
+
+CLI smoke (real binary, synthetic one-revision vault): clean verify printed
+`1 revision(s), 1 unique blob(s) (1 ok...)` and JSON parsed with
+`healthy=true`; corrupting the blob produced `MISMATCH`, the same one-blob
+report and a nonzero exit; an empty vault verified healthy.
+
+### Not verified (explicit)
+
+- **Automatic repair or deletion.** Not implemented by design.
+- **Bit-rot detection without a manifest.** No manifest means no reference; the
+  verifier does not scan unreferenced blobs (that is GC's separate view).
+- **Live extractor/network smoke.** PR-3's deterministic tests use fakes and
+  fixtures; the opt-in live/cross-client suites stay separate and were not run
+  here.
+- **Cross-process collection contention.** The sync lock is exercised by a
+  same-process second caller; the existing cross-process `AddSeen` test covers
+  the store lock, not the whole sync lock.
+- **Windows execution.** Linux only.
+- **PostgreSQL catalog verification.** `archive verify` checks the filesystem
+  vault; it does not compare PostgreSQL index rows.
+- **Citation CLI without PostgreSQL.** The offline test resolves a citation
+  through archive/blob APIs; `vault cite` still requires its existing catalog
+  path.
+
+### Next
+
+PR-4A (page-pinned PDF citations) or the carried torrentqueue flake/sampler
+work. PR-3's "separate live smoke" requirement is a CI-policy follow-up; no live
+network test was moved into the default suite.
