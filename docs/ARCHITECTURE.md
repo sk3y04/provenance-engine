@@ -113,6 +113,29 @@ private Unix socket serving one read-only snapshot
 Neither the store nor the socket can start, stop or reprioritise a runner: only
 the runner moves an entry's phase.
 
+## Soulseek integration path
+
+`provenance soulseek` integrates Soulseek through an external, unmodified
+`slskd >= 0.26.0` over its HTTP API (`internal/slskd`); there is no second
+Soulseek client in this binary. The connection profile is a `0600` JSON store
+(`$XDG_CONFIG_HOME/provenance/slskd-settings.json`) with `PROVENANCE_SLSKD_*`
+environment overrides, and `health` reports one of four states with a hard
+version floor at `0.26.0`.
+
+`search` runs through one single-flight coordinator (millisecond `searchTimeout`,
+a 35-second wall-clock cap, ranked `(peer, folder)` groups). `download` writes a
+durable job record before posting the batch, pins `externalId` and a
+`provenance/<jobID>/` destination, and refuses hostile remote paths before the
+call. `watch`/`recover` reconcile the records against both slskd and the
+filesystem; a completed job is imported through the existing capture pipeline
+(`manifest.CaptureItem` plus a job-unique run manifest), re-hashing the staged
+bytes and keeping them on `IMPORT_FAILED`. Sharing is an explicit opt-in:
+`shares preview` shows what a folder would expose, `shares add` materialises
+hardlinks into an isolated curated root (never copies, never symlinks), audits
+the tree with `Lstat`, prunes stale links on re-add and asks slskd to rescan.
+The optional `webhook-listen` receiver only wakes the reconciler early — polling
+remains authoritative. Full operator guide: [`docs/SOULSEEK.md`](SOULSEEK.md).
+
 ## Extractor Design
 
 Each extractor follows a common pattern with three entry points:
@@ -243,6 +266,27 @@ Lines without a prefix are treated as `ok:` for backward compatibility. The `--n
 A queue entry points at a job; it does not duplicate the job's payload, capture
 or seeding state. Entry and job records are validated on read with the writer's
 rules, and `status` never infers liveness from a timestamp or a leftover lock.
+
+### Soulseek state
+
+```
+$XDG_CONFIG_HOME/provenance/slskd-settings.json  ← connection profile (0600), env-overridable
+<job root>/.provenance/slskd/
+  jobs/<jobID>.json                ← durable job record (0600): items, states, capture pointers
+  store.lock                       ← read-modify-write lock across processes
+<share root>/.provenance/slskd/
+  shares/<ruleID>.json             ← share rule (0600): source, alias, counts, sync time
+  shares.lock                      ← share-store lock
+<curated share root>/              ← hardlink-only materialisation, mounted read-only into slskd
+```
+
+The job root is normally the mapped download mount. Job records are the
+authoritative history of a Soulseek download: they outlive slskd's transfer
+retention and a `flags.volatile` restart, so recovery reconciles against both
+slskd and the filesystem instead of trusting either alone. Captures themselves
+use the standard `.provenance/items` + `.provenance/runs` layout under the
+import root, with a job-unique run-manifest name so two jobs finishing in the
+same second cannot overwrite one capture.
 
 ## Concurrency Model
 
@@ -461,6 +505,9 @@ Durable local queue for torrent jobs, worked by one foreground runner. `store.go
 
 ### `bittorrent` (under `internal/transfer/`)
 Selective BitTorrent adapter over `github.com/anacrolix/torrent v1.62.0`: one magnet or `.torrent` into a private client, a selection into verified pieces, a capture manifest out. Adds typed v1/v2 identity, discovery profiles with BEP 27 enforcement, hostile-path rejection, metadata-first admission (no payload storage before validation), isolated per-job workspaces with exclusive staging ownership, offline recheck, a workspace-scoped seed session, a durable job record and record-only status documents. See [`docs/TORRENT.md`](TORRENT.md).
+
+### `slskd`
+Soulseek integration over an external, unmodified `slskd >= 0.26.0` HTTP API — no second client, no slskd configuration writes. Owns the connection profile and four-state health, a single-flight search coordinator, durable download jobs with pinned `externalId`, boot-time recovery, import through the existing capture pipeline, hardlink-only curated shares with a `Lstat` audit, upload visibility and an optional webhook receiver that only wakes the reconciler. See [`docs/SOULSEEK.md`](SOULSEEK.md) and [`docs/SLSKD-CHECKPOINTS.md`](SLSKD-CHECKPOINTS.md).
 
 ### `filelock`
 Advisory cross-process exclusive locks keyed by a stable `path + ".lock"` sidecar, because data files are replaced by atomic rename and locking the inode cannot serialise writers. `Acquire` blocks (cancellably); `TryAcquire` reports `ErrLocked`. Unix uses `flock`, Windows `LockFileEx`.

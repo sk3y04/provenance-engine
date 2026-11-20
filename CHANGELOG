@@ -1,10 +1,12 @@
-## [Unreleased]
+## [0.10.0] - 2026-11-20
 
 Soulseek arrives as an integration over an external, unmodified `slskd >= 0.26.0`
 rather than a second client: searches are serialised, downloads become durable
 jobs with a pinned `externalId`, completed files are imported through the existing
 capture pipeline, and sharing is an explicit, previewed opt-in that materialises
-hardlinks into an isolated root.
+hardlinks into an isolated root. The integration shipped after a ten-finding
+review pass; the behaviour below is the post-review behaviour, and the findings
+with their evidence are recorded in `docs/SLSKD-CHECKPOINTS.md`.
 
 ### Added
 
@@ -16,41 +18,52 @@ hardlinks into an isolated root.
 - **Four-state health** (`HEALTHY`, `SLSKD_UNREACHABLE`, `AUTH_OR_CONFIG_ERROR`,
   `SOULSEEK_DISCONNECTED`) with a hard block below `0.26.0`, amber warnings for
   `0.26.1`/`0.26.2` (`#1891`) and for the `0.26.2` `/options` `403` (`#1905`),
-  and diagnostics for an unreadable download mount.
+  and diagnostics for an invalid profile or an unreadable download mount.
 
 - **Serialised search**: one in-process single-flight coordinator, a
   millisecond `searchTimeout` (the upstream documentation says seconds; the
   binary says milliseconds), a 35-second wall-clock cap that stops a search
-  `slskd` keeps extending, adaptive polling, ranked `(peer, folder)` groups, and
-  a deferred `DELETE` after a settle grace (`#1819`).
+  `slskd` keeps extending (the final poll window is re-fetched, not discarded),
+  adaptive polling, ranked `(peer, folder)` groups, and a deferred `DELETE`
+  after a settle grace (`#1819`).
 
 - **Durable download jobs** under `<root>/.provenance/slskd/jobs/`: the record is
   written before the batch is posted, the batch pins `externalId` and
   `provenance/<jobID>/`, >255-byte and traversing remote paths are refused before
-  the call (`#1818`), and a duplicate grab attaches to the existing job.
+  the call (`#1818`), and a duplicate grab attaches to the existing job. A
+  partial (`207`) batch marks each refused file with `slskd`'s reason, so the
+  job settles instead of waiting for a transfer that will never exist.
 
 - **Immediate terminal classification**: every `Completed, <failure>` state and a
   bare `Cancelled` ends the job at once with the exact upstream reason, so
   nothing polls out a 180-second stall.
 
 - **Import through the existing capture pipeline**: `manifest.CaptureItem` plus a
-  run manifest per job, Soulseek provenance in `raw_metadata`, containment checks,
-  symlinks ignored, `_{ticks}` collision renames found, size and hash verified,
-  and optional vault ingestion. `IMPORT_FAILED` keeps the staged bytes.
+  job-unique run manifest per job, Soulseek provenance in `raw_metadata`,
+  containment checks, symlinks ignored, path-aware matching of `_{ticks}`
+  collision renames so same-named files keep distinct capture identities, size
+  and hash verified, and optional vault ingestion. A job imports only when every
+  non-refused file is present and complete on disk; cleanup removes only the
+  imported files, never a shared destination. `IMPORT_FAILED` keeps the staged
+  bytes.
 
 - **Queue control and recovery**: cancel, retry, `--another-source` over cached
-  alternate peers, rate-limited queue position, clear-completed, boot-time
-  reconciliation against both `slskd` and the filesystem, and `INTERRUPTED` for a
-  job a volatile restart forgot.
+  alternate peers, a rate-limited queue-position probe that reports unknown as
+  unknown, clear-completed, boot-time reconciliation against both `slskd` and
+  the filesystem, and `INTERRUPTED` for a job a volatile restart forgot. An
+  unknown job or share id reports itself instead of leaking the record path.
 
-- **Optional webhooks** (`webhook-listen`) with a constant-time shared secret,
-  bounded delivery-id deduplication, stale-timestamp rejection and per-event
-  wakeups. Polling remains authoritative.
+- **Optional webhooks** (`webhook-listen`) with a shared secret compared as
+  constant-time digests, bounded delivery-id deduplication, stale-timestamp
+  rejection, oversized bodies refused (`413`) and per-event wakeups. Polling
+  remains authoritative.
 
 - **Curated shares**: a pre-share preview (files, bytes, extension histogram,
   exclusions), hardlink-only materialisation into an isolated root, fail-fast
   `EXDEV`, `Lstat` audit that refuses a planted symlink, paginated browse of the
-  shared index, and a zero-share warning (`#1663`).
+  shared index, and a zero-share warning (`#1663`). Re-adding a share prunes
+  links for files deleted since the last add, so `slskd` stops advertising
+  removed content.
 
 - **Upload visibility**: listing with duplicate `Queued, Locally` records
   collapsed (`#1609`), cancel/remove and clear-completed.

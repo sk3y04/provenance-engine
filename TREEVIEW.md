@@ -1,7 +1,7 @@
 # Treeview - File Reference
 
-File-level reference for every Go source file in the module (251 files),
-regenerated for the `v0.9.0` release. Test files are listed with their coverage.
+File-level reference for every Go source file in the module (283 files),
+regenerated for the `v0.10.0` release. Test files are listed with their coverage.
 Package-level design lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md);
 the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 
@@ -23,14 +23,20 @@ the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 
 | File | Purpose |
 |---|---|
-| `main.go` | Cobra command tree (grab, scan, collect, archive, vault, watch, history, encode, doctor, install, tui, completion); flag surface; signal context; auto-install pre-run; exit-code mapping |
+| `main.go` | Cobra command tree (grab, scan, collect, archive, vault, watch, history, encode, soulseek, doctor, install, tui, completion); flag surface; signal context; auto-install pre-run; exit-code mapping |
 | `engine_adapter.go` | CLI adapter over the public facade: `facadeGrabCompatible`, flag→`engine.Config` mapping, `runGrabViaFacade`, `cliEventSink`, `exitCode` |
 | `engine_adapter_test.go` | Flag mapping, facade-compatibility decisions, event-sink rendering, exit-code regression |
 | `torrent.go` | `torrent inspect`/`fetch`/`status` and the durable `torrent queue` commands (add, list, start, pause, retry, run, seed, unseed, remove, priority, live); discovery profiles, drain/`--watch` summaries, live rendering |
 | `torrent_test.go` | Flag validation, inspect/fetch wiring, queue entry points |
 | `torrent_inspect_test.go` | Read-only inspection output and exit codes |
 | `torrent_status_test.go` | Human/JSON status, unreadable records, exit code |
-| `main_test.go` | Command tree, auto-install skip table (including `torrent`), exit-code mapping |
+| `soulseek.go` | `soulseek` group root and `settings show`/`set`, `health`, `test`; profile loading, secret masking, four-state health rendering |
+| `soulseek_search.go` | `search`, `download`, `jobs`, `ingest`, `watch`, `cancel`, `retry`, `position`, `clear-completed`, `recover`, `webhook-listen`; group selection, job rendering, reconciler loop |
+| `soulseek_shares.go` | `shares list`/`preview`/`add`/`remove`/`status`/`rescan`/`files` and `uploads list`/`cancel`/`clear-completed`; preview rendering, paginated browse |
+| `soulseek_test.go` | Settings masking/round-trip, enable-without-key refusal, health states, env-key enable |
+| `soulseek_search_test.go` | Group selection, download/jobs/recover/cancel CLI wiring, missing-mount refusal |
+| `soulseek_shares_test.go` | Shares/uploads CLI wiring, configured-root requirement |
+| `main_test.go` | Command tree, auto-install skip table (including `torrent` and `soulseek`), exit-code mapping |
 
 
 ## `engine/` — public facade
@@ -401,6 +407,37 @@ the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 | `seedpool_test.go` | Seed pool fatal paths |
 | `seed_queue_test.go` | Seed intent through the queue |
 | `watch_test.go` | `--watch` session, drain semantics and fatal shutdown |
+
+## `internal/slskd/` — Soulseek through an external slskd
+
+| File | Purpose |
+|---|---|
+| `types.go` | Package contract and typed API surface: composite state flags (`", "`-separated), terminal-failure reasons, version parsing/comparison, path-segment validation, millisecond `searchTimeout` |
+| `client.go` | HTTP client over `/api/v0`: `X-API-Key` only, URL-base joining without doubled prefixes, escaped path segments, bounded bodies, per-operation timeouts, secret redaction, API-error classification |
+| `settings.go` | Connection profile: `0600` JSON store with atomic rename, `PROVENANCE_SLSKD_*` env overrides, sentinel-preserving updates, secret masking, validation, future-format refusal |
+| `health.go` | Four-state health probe: version floor `0.26.0`, amber warnings for `0.26.1`/`0.26.2` (`#1891`) and the `0.26.2` `/options` `403` (`#1905`), risky-option and download-mount diagnostics |
+| `search.go` | Single-flight search coordinator: serialised creates, throttle retry, 35-second wall-clock cap with a final re-fetch, adaptive polling, ranked `(peer, folder)` groups, deferred `DELETE` after settle |
+| `jobstore.go` | Durable job records under `.provenance/slskd/jobs/`: unsafe-id refusal, duplicate detection, pending/active item projection, concurrent-write safety, `ErrJobNotFound` |
+| `transfers.go` | Batch enqueue persisted before posting with pinned `externalId`/destination, hostile-path and locked-file refusal, dedupe, terminal-state classification, queue-position probe, local snapshot cache |
+| `recovery.go` | Boot-time reconciliation against slskd and the filesystem: adopt files on disk, `INTERRUPTED` for a job a volatile restart forgot, no guessing while slskd is down |
+| `ingest.go` | Completed download → capture through `internal/manifest`: path-aware locate (exact/suffix/tail/`_{ticks}`), distinct identities for same-basename files, size/hash verification, job-unique run manifests, scoped cleanup, optional vault ingestion |
+| `shares.go` | Curated shares: preview with exclusions, hardlink-only materialisation, fail-fast `EXDEV`, `Lstat` audit, stale-link pruning on re-add, share rules store, rescan, paginated contents browse |
+| `uploads.go` | Upload visibility: duplicate `Queued, Locally` collapse (`#1609`), summaries, list/cancel/clear-completed |
+| `webhook.go` | Optional receiver: digest-compare shared secret, bounded delivery-id dedupe, stale-timestamp rejection, `413` on oversized bodies, per-event wakeups |
+| `client_test.go` | API-key-only header, URL joining, error classification/redaction, TLS, timeouts, batch outcomes, bounded bodies |
+| `types_test.go` | Millisecond timeout contract, state-flag parsing, terminal reasons, version floor, path validation |
+| `settings_test.go` | Round-trip/permissions, masking, sentinel updates, env overrides, validation, future-format refusal |
+| `health_test.go` | All four states, version floor, amber warnings, `/options` `403` handling, path diagnostics, redaction |
+| `search_test.go` | Serialisation, request contract, throttle retry/failure, wall-clock stop, cancel, ranking, settle delete |
+| `jobstore_test.go` | Record lifecycle, unsafe/duplicate ids, concurrent writes, pending statuses, job-id shape |
+| `transfers_test.go` | Persist-before-post, pinned ids, path/locked refusal, dedupe, terminal classification, snapshot-cache locality |
+| `recovery_test.go` | Reconciliation outcomes, adoption, `INTERRUPTED`, young-job grace, refusal while slskd is down |
+| `ingest_test.go` | Capture happy path, `_{ticks}` rename, symlink/traversal refusal, size/empty/missing failures, cleanup gating, vault ingestion |
+| `shares_test.go` | Preview exclusions/symlink counting, hardlinks + rescan, `EXDEV`, overlapping roots, planted-symlink audit, pruning, pagination |
+| `uploads_test.go` | `Queued, Locally` dedupe, summaries, list/cancel |
+| `webhook_test.go` | Secret refusal, unconfigured refusal, dedupe bounds, stale timestamps, event dispatch, malformed JSON |
+| `e2e_test.go` | End-to-end search → enqueue → poll → ingest against a fake slskd |
+| `review_fixes_test.go` | Regressions for the ten review findings: invalid-profile health, partial-batch settle, final-window responses, same-basename identities, partial-import refusal, share pruning, permission warning, oversized webhook body, position throttle/shape, same-second captures, scoped cleanup |
 
 ## `internal/diagnose/` — failure hints
 
