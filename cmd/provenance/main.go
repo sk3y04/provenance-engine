@@ -1548,6 +1548,7 @@ func vaultCmd() *cobra.Command {
 	})
 	cmd.AddCommand(revisionShowCmd())
 	cmd.AddCommand(citeCmd())
+	cmd.AddCommand(exportCmd())
 	cmd.AddCommand(diffCmd())
 	cmd.AddCommand(gcCmd())
 	cmd.AddCommand(retentionCmd())
@@ -1660,6 +1661,51 @@ func citeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&flagCiteFormat, "format", "plain", "Citation format: provenance, markdown, plain, json")
 	cmd.Flags().StringVar(&flagCiteEntity, "entity", "", "Entity external ID")
 	cmd.Flags().IntVar(&flagCitePage, "page", -1, "Pin the citation to this zero-based physical PDF page index")
+	return cmd
+}
+
+func exportCmd() *cobra.Command {
+	var format, entityID string
+	cmd := &cobra.Command{
+		Use:   "export REVISION_ID",
+		Short: "Export revision entities as BibTeX or CSL JSON",
+		Long: "Reads the filesystem revision and exports bibliography records for writing.\n" +
+			"Each record carries a separate pinned provenance URI for audits; the URI is not\n" +
+			"the citation key and never contains a passage/chunk id.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			rev, err := archive.ReadRevision(flagVaultRoot, args[0])
+			if err != nil {
+				return err
+			}
+			collectionName := flagSearchCollection
+			if collectionName == "" {
+				collectionName = "default"
+			}
+			items := make([]map[string]any, 0, len(rev.Entities))
+			for _, ent := range rev.Entities {
+				if entityID != "" && ent.ExternalID != entityID {
+					continue
+				}
+				switch format {
+				case "bibtex":
+					fmt.Print(citation.BibTeX(collectionName, rev.ID, &ent))
+				case "csl-json":
+					items = append(items, citation.CSLJSON(collectionName, rev.ID, &ent))
+				default:
+					return fmt.Errorf("unsupported export format %q (want bibtex or csl-json)", format)
+				}
+			}
+			if format == "csl-json" {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(items)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&format, "format", "bibtex", "Export format: bibtex or csl-json")
+	cmd.Flags().StringVar(&entityID, "entity", "", "Only export this entity external ID")
 	return cmd
 }
 

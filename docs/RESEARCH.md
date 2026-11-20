@@ -83,11 +83,16 @@ IDs, and resolves physical page `1` to the same archived PDF as `iv` offline.
 
 ### 4B — scholarly identity and enrichment
 
-A work/version/capture/derivation model, DOI and arXiv intake, Crossref
-correction/retraction observations, preprint/publication linking, and
-BibTeX/CSL JSON export are not implemented. The PDF importer currently produces
-an ordinary `archive.Entity` with `kind: pdf`; no work identity is inferred from
-the file name or content. No network lookup is performed.
+BibTeX and CSL JSON export is shipped: `vault export REVISION_ID --format
+bibtex|csl-json` reads the filesystem revision and puts the pinned provenance
+URI in a separate field, never in the citation key.
+
+Still not implemented: a work/version/capture/derivation model, DOI and arXiv
+intake, Crossref correction/retraction observations, and preprint/publication
+linking. The PDF importer produces an ordinary `archive.Entity` with
+`kind: pdf`; no work identity is inferred from the file name or content. No
+network lookup is performed. `Entity.Identifiers` exists for a future provider
+to record `doi`/`arxiv` explicitly, but nothing fills it automatically.
 
 When this lands, it must keep the captured PDF immutable, store provider
 metadata with retrieval time, and never rewrite a PDF because a retraction or

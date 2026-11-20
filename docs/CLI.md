@@ -51,6 +51,7 @@ provenance
 │   ├── init                            Initialize vault + PostgreSQL schema
 │   ├── show <ID>                       Show revision details
 │   ├── cite <ID>                       Generate citation for a revision
+│   ├── export <ID>                     Export BibTeX or CSL JSON
 │   ├── diff <IDA> <IDB>                Diff two revisions
 │   ├── gc                              Garbage-collect orphaned blobs
 │   ├── retention prune                 Prune old revisions (--collection, --keep)
@@ -717,6 +718,7 @@ Manage the durable archive vault. Search and schema operations use PostgreSQL wh
 | `init` | Initialize the vault and create PostgreSQL schema (tables, GIN indexes, tsvector triggers) |
 | `show <ID>` | Show revision details: entities, artifacts, timestamps |
 | `cite <ID>` | Generate a citation for a revision entity |
+| `export <ID>` | Export entities as BibTeX or CSL JSON with a pinned provenance note |
 | `diff <ID_A> <ID_B>` | Diff two revisions  -  reports added, removed, and changed entities with field-level diffs |
 | `gc` | Garbage-collect orphaned blobs. `--dry-run` previews without deleting |
 | `retention prune` | Prune old revisions keeping the last N (`--collection`, `--keep` required) |
@@ -740,7 +742,14 @@ provenance vault init
 provenance vault show abc123def456
 provenance vault cite abc123def456 --entity my-post --format markdown
 provenance vault cite abc123def456 --page 3 --format json --vault ~/Vault
+provenance vault export abc123def456 --format bibtex --vault ~/Vault
+provenance vault export abc123def456 --format csl-json --entity paper.pdf --vault ~/Vault
 ```
+
+`vault export` reads the filesystem revision. Each BibTeX record carries a
+`note = {Pinned evidence: provenance://…}` field; each CSL JSON item carries a
+`provenance` field and `archive_sha256`. The citation key/ID is the entity id,
+not a chunk id, so a re-index does not invalidate a bibliography.
 
 ---
 

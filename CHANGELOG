@@ -2,6 +2,12 @@
 
 ### Added
 
+- **BibTeX and CSL JSON export.** `vault export REVISION_ID --format
+  bibtex|csl-json` writes bibliography records from the filesystem revision. The
+  citation key is the entity id; a separate pinned `provenance://…` field in each
+  record keeps the audit link out of the key and out of chunk ids. CSL output also
+  carries the archived SHA-256.
+
 - **Page-pinned PDF citations (PR-4A).** `archive import-pdf` now stores a
   zero-based physical page locator on every extracted passage: the archived PDF
   blob SHA-256, optional printed page label and optional normalized rectangles

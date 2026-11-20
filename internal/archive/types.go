@@ -120,20 +120,23 @@ type Relation struct {
 }
 
 type Entity struct {
-	ExternalID   string          `json:"external_id"`
-	URL          string          `json:"url"`
-	CanonicalURL string          `json:"canonical_url,omitempty"`
-	Title        string          `json:"title,omitempty"`
-	Author       string          `json:"author,omitempty"`
-	PublishedAt  *time.Time      `json:"published_at,omitempty"`
-	CapturedAt   time.Time       `json:"captured_at"`
-	Kind         string          `json:"kind,omitempty"`
-	Extractor    string          `json:"extractor,omitempty"`
-	Text         *Document       `json:"text,omitempty"`
-	Artifacts    []string        `json:"artifacts"`
-	Documents    []Document      `json:"documents,omitempty"`
-	Relations    []Relation      `json:"relations,omitempty"`
-	RawMetadata  json.RawMessage `json:"raw_metadata,omitempty"`
+	ExternalID   string     `json:"external_id"`
+	URL          string     `json:"url"`
+	CanonicalURL string     `json:"canonical_url,omitempty"`
+	Title        string     `json:"title,omitempty"`
+	Author       string     `json:"author,omitempty"`
+	PublishedAt  *time.Time `json:"published_at,omitempty"`
+	CapturedAt   time.Time  `json:"captured_at"`
+	Kind         string     `json:"kind,omitempty"`
+	Extractor    string     `json:"extractor,omitempty"`
+	Text         *Document  `json:"text,omitempty"`
+	// Identifiers holds stable external identifiers when a provider supplies
+	// them, for example "doi" or "arxiv". It is not inferred from a URL.
+	Identifiers map[string]string `json:"identifiers,omitempty"`
+	Artifacts   []string          `json:"artifacts"`
+	Documents   []Document        `json:"documents,omitempty"`
+	Relations   []Relation        `json:"relations,omitempty"`
+	RawMetadata json.RawMessage   `json:"raw_metadata,omitempty"`
 }
 
 type Revision struct {
