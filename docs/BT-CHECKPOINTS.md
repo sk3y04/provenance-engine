@@ -3211,16 +3211,22 @@ repo-config gap, not a merge regression. Release on the tag (run
 | The v0.9.0 Release pass was timing luck | inferred (identical code; that runner's interrupt-before-deadline timing not measured) |
 | Exact CI capture duration | not measured; the 81.66 s window includes the CLI build |
 
-**Limits and non-claims.** Hosted CI has not been re-run on the fix — the
-`v0.10.0` tag still points at the pre-fix `17b667f`, its Release run stays
-red, and no GitHub release was published for it. Queue-managed seeding is a
+**Limits and non-claims.** The `v0.10.0` tag still points at the pre-fix
+`17b667f`, its Release run stays red, and no GitHub release was published for
+it — the fix shipped as `v0.10.1` instead (below). Queue-managed seeding is a
 separate path (`torrentqueue` adapter sets `KeepSeeding: false`; the seed
 session owns its lifetime) and is untouched by this change. No new real-peer
 evidence; the loopback fixture boundary stands.
 
-**Release state and next step.** `v0.10.0` is pushed (master and tag verified
-at `17b667f` on origin) but unreleased; the fix is local at `832c3ee`. The
-publication path — a `v0.10.1` patch tag carrying the fix versus re-tagging
-`v0.10.0` — is the maintainer's decision and is pending. After that: the BT
-backlog's next eligible ticket (BT-14's proposed sampler walk bounding) or
-slskd M5/M6.
+**Publication (verified).** The maintainer chose the patch-release path.
+Prep commit `7c869eb` (`docs(release): prepare v0.10.1`; version default
+0.10.1, CHANGELOG Fixed entry, RELEASING tag command, TREEVIEW 284 files)
+was tagged `v0.10.1` and pushed; origin master and the peeled tag both read
+`7c869eb33d46e2a70b5639fd4cae32f9e020e604`. The tag's Release run
+44726972725 completed every step green — including "Run tests" on the same
+runner configuration that failed at `17b667f` — and published the GitHub
+release `v0.10.1` (not draft, not prerelease) with all seven assets: six
+platform binaries plus `checksums.txt`. CI on master (run 44726972269):
+success. Security on master (run 44726972151): failure, same pre-existing
+empty-`SNYK_TOKEN` 401 as the baseline. Next eligible work: BT-14's proposed
+sampler walk bounding, or slskd M5/M6.

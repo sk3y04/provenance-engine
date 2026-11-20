@@ -11,7 +11,9 @@ prepare v0.9.0"). Merged: fast-forward to `master` at `d34e326`; release prep
 `9598103` (v0.10.0). Pushed: master and the `v0.10.0` tag verified on origin
 at `17b667f`; the tag's Release run failed on a pre-existing torrent defect
 (BT-15 in `docs/BT-CHECKPOINTS.md`, fixed at `832c3ee`), so v0.10.0 has no
-published GitHub release and the publication path is pending.
+published GitHub release. The integration shipped as **v0.10.1**: prep
+`7c869eb`, tag verified on origin, Release run green, all seven assets
+published.
 
 | Slice | Commit | Scope |
 | --- | --- | --- |
