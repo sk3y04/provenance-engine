@@ -70,6 +70,14 @@ type Config struct {
 	// files created by another job. It is left false for single-job CLI use,
 	// where outputs land directly in WorkDir.
 	IsolatedWorkspace bool
+
+	// DisableHistory suppresses the CLI history entry a Download otherwise
+	// appends to ~/.cache/provenance/history.json (or PROVENANCE_HISTORY_FILE).
+	// The history file records the CLI user's own runs, so an embedded caller
+	// acting on that user's behalf (the desktop shell, a hosted worker) must set
+	// this rather than pollute it. The zero value keeps the documented CLI
+	// behavior for every existing caller.
+	DisableHistory bool
 }
 
 // ToolStatus is the read-only result of probing one external tool.

@@ -32,7 +32,12 @@ import (
 type Options struct {
 	config.Config
 
-	DryRun      bool
+	DryRun bool
+	// NoHistory suppresses the durable CLI history entry for this operation. It
+	// is deliberately separate from DryRun: a real run performed on behalf of
+	// another product (the desktop shell, a hosted worker) moves bytes and must
+	// still leave the CLI user's own history file alone.
+	NoHistory   bool
 	Reporter    Reporter
 	RateLimiter *ratelimit.Manager
 	// FileProgress, when set, receives per-file lifecycle events from the

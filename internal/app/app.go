@@ -90,7 +90,7 @@ func Download(ctx context.Context, urls []string, batchPath string, opts dispatc
 	} else {
 		dispatcher.PrintSummary(os.Stderr, &cr.Counts, opts.OutputDir, "")
 	}
-	if !opts.DryRun {
+	if !opts.DryRun && !opts.NoHistory {
 		// History is best-effort metadata: a store failure must not fail the
 		// run itself.
 		var errText string

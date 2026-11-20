@@ -246,6 +246,7 @@ func (e *Engine) options(f FilterOptions, limit int, includePosts, includeCommen
 		},
 		RateLimiter: e.limiter,
 		Deps:        e.deps,
+		NoHistory:   e.cfg.DisableHistory,
 	}
 }
 
