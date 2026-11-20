@@ -20,6 +20,11 @@ type Reference struct {
 	Author     string    `json:"author,omitempty"`
 	CapturedAt time.Time `json:"captured_at,omitempty"`
 	Sha256     string    `json:"sha256,omitempty"`
+	// Locator pins a PDF passage to archived bytes. PageIndex is zero-based and
+	// PageLabel is the printed label when available. The citation URI itself
+	// stays entity-level, so re-indexing never changes it.
+	Locator *archive.Locator `json:"locator,omitempty"`
+	Excerpt string           `json:"excerpt,omitempty"`
 }
 
 func Parse(s string) (*Reference, error) {
@@ -80,6 +85,16 @@ func (r *Reference) Plain() string {
 	if r.Author != "" {
 		out += fmt.Sprintf("\n  by %s", r.Author)
 	}
+	if r.Locator != nil {
+		page := fmt.Sprintf("page index %d", r.Locator.PageIndex)
+		if r.Locator.PageLabel != "" {
+			page += fmt.Sprintf(" (printed %q)", r.Locator.PageLabel)
+		}
+		out += fmt.Sprintf("\n  %s", page)
+	}
+	if r.Excerpt != "" {
+		out += fmt.Sprintf("\n  %s", r.Excerpt)
+	}
 	if r.Sha256 != "" {
 		out += fmt.Sprintf("\n  SHA-256: %s", r.Sha256)
 	}
@@ -88,6 +103,26 @@ func (r *Reference) Plain() string {
 
 func (r *Reference) ToJSON() ([]byte, error) {
 	return json.MarshalIndent(r, "", "  ")
+}
+
+// FromDocument builds a page-pinned citation for one extracted passage. The
+// permanent citation URI is still entity-level; the locator travels beside it so
+// a re-index (different chunk ids) resolves to the same physical page.
+func FromDocument(collection, revisionID string, ent *archive.Entity, doc *archive.Document) *Reference {
+	ref := FromEntity(collection, revisionID, ent)
+	if doc == nil {
+		return ref
+	}
+	if doc.Locator != nil {
+		loc := *doc.Locator
+		loc.Rectangles = append([]archive.Rect(nil), doc.Locator.Rectangles...)
+		ref.Locator = &loc
+		if loc.ArtifactSha256 != "" {
+			ref.Sha256 = loc.ArtifactSha256
+		}
+	}
+	ref.Excerpt = doc.Content
+	return ref
 }
 
 func FromEntity(collection, revisionID string, ent *archive.Entity) *Reference {

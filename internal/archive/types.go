@@ -41,6 +41,9 @@ const (
 	ArtifactText   ArtifactKind = "text"
 	ArtifactBinary ArtifactKind = "binary"
 	ArtifactHTML   ArtifactKind = "html"
+	// ArtifactAnalysis is a structured derivation (for example Docling JSON)
+	// stored alongside the immutable source artifact.
+	ArtifactAnalysis ArtifactKind = "analysis"
 )
 
 type Artifact struct {
@@ -59,10 +62,45 @@ const (
 	DocHTML     DocumentFormat = "html"
 )
 
+// Rect is a normalized rectangle with a top-left origin. Values are fractions
+// of the page width/height in [0,1]; x/y is the top-left corner.
+type Rect struct {
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+}
+
+// Locator pins a document/passage to immutable archived bytes. PageIndex is a
+// zero-based physical page index; PageLabel is the printed label when the source
+// exposes one (for example "iv" or "12"). Chunk/passage identifiers are not part
+// of a permanent citation URI.
+type Locator struct {
+	ArtifactSha256   string `json:"artifact_sha256"`
+	PageIndex        int    `json:"page_index"`
+	PageLabel        string `json:"page_label,omitempty"`
+	Rectangles       []Rect `json:"rectangles,omitempty"`
+	CoordinateOrigin string `json:"coordinate_origin,omitempty"`
+}
+
 type Document struct {
 	ExternalID string         `json:"external_id"`
 	Content    string         `json:"content"`
 	Format     DocumentFormat `json:"format"`
+	// Locator is set for page-pinned PDF passages and other spatial derivations.
+	Locator *Locator `json:"locator,omitempty"`
+}
+
+// Derivation records a structured analysis of an immutable artifact. The exact
+// parser output is stored as its own blob; ArtifactSha256 names the parent bytes.
+type Derivation struct {
+	Kind           string    `json:"kind"`
+	ArtifactSha256 string    `json:"artifact_sha256"`
+	BlobSha256     string    `json:"blob_sha256"`
+	Parser         string    `json:"parser"`
+	ParserVersion  string    `json:"parser_version"`
+	ConfigHash     string    `json:"config_hash,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 type RelationKind string
@@ -99,13 +137,14 @@ type Entity struct {
 }
 
 type Revision struct {
-	ID          string     `json:"id"`
-	CapturedAt  time.Time  `json:"captured_at"`
-	Source      Source     `json:"source"`
-	Tool        string     `json:"tool"`
-	ToolVersion string     `json:"tool_version"`
-	Entities    []Entity   `json:"entities"`
-	Artifacts   []Artifact `json:"artifacts"`
-	Documents   []Document `json:"documents"`
-	Relations   []Relation `json:"relations"`
+	ID          string       `json:"id"`
+	CapturedAt  time.Time    `json:"captured_at"`
+	Source      Source       `json:"source"`
+	Tool        string       `json:"tool"`
+	ToolVersion string       `json:"tool_version"`
+	Entities    []Entity     `json:"entities"`
+	Artifacts   []Artifact   `json:"artifacts"`
+	Documents   []Document   `json:"documents"`
+	Relations   []Relation   `json:"relations"`
+	Derivations []Derivation `json:"derivations,omitempty"`
 }

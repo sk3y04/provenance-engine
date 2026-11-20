@@ -386,7 +386,7 @@ There are two paths into the vault:
 | `session <NAME>` | Archive all downloads from a session |
 | `import <DIR>` | Import an existing directory that already has `.provenance/` capture manifests |
 | `verify [--json]` | Read-only check of every revision manifest and referenced blob; nonzero on damage |
-| `import-pdf <PATH>` | Import a PDF file  -  extracts text per page, stores as searchable documents |
+| `import-pdf <PATH>` | Import a PDF file  -  extracts page text, stores page-pinned locators and optionally a Docling JSON derivation |
 | `import-git <URL>` | Import a Git repository  -  shallow clone, extract doc files, resolve tag→commit |
 | `import-docs <URL>` | Import a static documentation site  -  crawl bounded by scope and max-pages |
 | `import-openapi <PATH>` | Import an OpenAPI spec  -  generate endpoint documents, store original spec |
@@ -409,6 +409,21 @@ The JSON document contains `revisions`, `unique_blobs`, `checked_blobs`, the
 `ok`/`missing`/`mismatch`/`unreadable`/`invalid` counts, `healthy`, and per-blob
 or per-manifest findings. It is the same document on stdout whether the vault is
 healthy or damaged, so a restore drill can archive it.
+
+### PDF importer flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--docling` | string | - | Path to a local Docling executable; its exact JSON is stored as a derivation |
+| `--docling-timeout` | duration | `5m` | Bounded lifetime for the Docling process |
+| `--docling-version` | string | - | Parser version recorded with the derivation |
+
+The PDF is stored immutably and never rewritten. Every indexed passage carries a
+Provenance-owned locator: the PDF blob SHA-256, a zero-based physical page index,
+the printed page label when available, and normalized rectangles with a declared
+top-left origin. `vault cite --page N` resolves a passage without the source file
+or network. The permanent citation URI stays entity-level, so a re-index that
+changes passage/chunk IDs does not change it.
 
 ### Importer flags
 
@@ -695,7 +710,7 @@ See [TORRENT.md](TORRENT.md) for the full queue semantics — claim and backoff 
 
 ## `provenance vault`
 
-Manage the durable archive vault. Requires PostgreSQL (`PROVENANCE_DATABASE_URL` env var).
+Manage the durable archive vault. Search and schema operations use PostgreSQL when configured; `cite` reads the filesystem revision first, so a restored vault can be cited offline.
 
 | Subcommand | Description |
 |------------|-------------|
@@ -714,6 +729,8 @@ Manage the durable archive vault. Requires PostgreSQL (`PROVENANCE_DATABASE_URL`
 | `--collection` | string | - | Archive collection name |
 | `--entity` | string | (first entity) | Entity external ID to cite |
 | `--format` | string | `plain` | Citation format: `plain`, `markdown`, `json` |
+| `--page` | int | `-1` | Pin the citation to a zero-based physical PDF page index |
+| `--vault` | string | `./provenance-vault` | Vault root directory |
 
 ### Example
 
@@ -722,6 +739,7 @@ export PROVENANCE_DATABASE_URL=postgres://user:pass@localhost/provenance
 provenance vault init
 provenance vault show abc123def456
 provenance vault cite abc123def456 --entity my-post --format markdown
+provenance vault cite abc123def456 --page 3 --format json --vault ~/Vault
 ```
 
 ---

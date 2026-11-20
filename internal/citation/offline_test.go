@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,5 +116,39 @@ func TestRestoredVaultResolvesCitationOffline(t *testing.T) {
 	data, err := io.ReadAll(f)
 	if err != nil || string(data) != string(content) {
 		t.Fatalf("archived bytes = %q err=%v", data, err)
+	}
+}
+
+func TestPagePinnedCitationKeepsChunkIDOutOfURI(t *testing.T) {
+	ent := &archive.Entity{
+		ExternalID: "paper.pdf",
+		Title:      "Paper",
+		Artifacts:  []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	}
+	doc := &archive.Document{
+		ExternalID: "paper.pdf:p1:b7", // chunk id, deliberately unstable
+		Content:    "the quoted passage",
+		Locator: &archive.Locator{
+			ArtifactSha256:   ent.Artifacts[0],
+			PageIndex:        1,
+			PageLabel:        "iv",
+			CoordinateOrigin: "top-left",
+			Rectangles: []archive.Rect{{
+				X: 0.1, Y: 0.2, Width: 0.3, Height: 0.1,
+			}},
+		},
+	}
+	ref := FromDocument("papers", "rev", ent, doc)
+	if ref.String() != "provenance://papers@rev#paper.pdf" {
+		t.Fatalf("uri = %q, want an entity-level URI", ref.String())
+	}
+	if strings.Contains(ref.String(), "b7") || strings.Contains(ref.String(), "p1") {
+		t.Fatalf("chunk/page internals leaked into the permanent URI: %q", ref.String())
+	}
+	if ref.Locator == nil || ref.Locator.PageIndex != 1 || ref.Locator.PageLabel != "iv" {
+		t.Fatalf("locator = %+v", ref.Locator)
+	}
+	if !strings.Contains(ref.Plain(), "page index 1") || !strings.Contains(ref.Plain(), `printed "iv"`) {
+		t.Fatalf("plain citation lacks page pin: %q", ref.Plain())
 	}
 }

@@ -15,7 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sk3y04/provenance-engine/internal/archive"
 	"github.com/sk3y04/provenance-engine/internal/blobstore"
+	"github.com/sk3y04/provenance-engine/internal/citation"
 	"github.com/sk3y04/provenance-engine/internal/event"
 )
 
@@ -438,4 +440,113 @@ func TestNarrateIsTransportNeutral(t *testing.T) {
 	if stderr != want {
 		t.Fatalf("legacy output changed: got %q want %q", stderr, want)
 	}
+}
+
+// TestImportPDFWithDoclingPagePinning proves printed labels travel beside the
+// zero-based physical page index and that a re-index still resolves the same
+// archived PDF page offline.
+func TestImportPDFWithDoclingPagePinning(t *testing.T) {
+	vault := t.TempDir()
+	pdfPath := buildTestPDF(t)
+	original, err := os.ReadFile(pdfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fixture := `{
+	  "pages": {
+	    "1": {"page_no": 1, "size": {"width": 612, "height": 792}, "page_label": "Cover"},
+	    "2": {"page_no": 2, "size": {"width": 612, "height": 792}, "page_label": "iv"},
+	    "3": {"page_no": 3, "size": {"width": 612, "height": 792}, "page_label": "1"}
+	  },
+	  "texts": [
+	    {"text": "Front matter", "prov": [{"page_no": 1, "bbox": {"l": 72, "t": 72, "r": 300, "b": 100}}]},
+	    {"text": "Printed page four", "prov": [{"page_no": 2, "bbox": {"l": 72, "t": 200, "r": 500, "b": 260}}]},
+	    {"text": "Body page one", "prov": [{"page_no": 3, "bbox": {"l": 72, "t": 100, "r": 500, "b": 160}}]}
+	  ]
+	}`
+	rev, err := ImportPDFWithOptions(context.Background(), vault, pdfPath, "papers", PDFOptions{
+		DoclingVersion: "9.9.9",
+		DoclingRunner: func(ctx context.Context, path string) ([]byte, error) {
+			return []byte(fixture), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ImportPDFWithOptions: %v", err)
+	}
+	if len(rev.Derivations) != 1 || rev.Derivations[0].Kind != "docling-json" {
+		t.Fatalf("derivations = %+v", rev.Derivations)
+	}
+	if rev.Derivations[0].ArtifactSha256 != rev.Artifacts[0].Sha256 {
+		t.Fatalf("derivation parent = %s, pdf = %s", rev.Derivations[0].ArtifactSha256, rev.Artifacts[0].Sha256)
+	}
+	if !blobstore.New(vault).Exists(rev.Derivations[0].BlobSha256) {
+		t.Fatal("exact docling JSON was not stored as a blob")
+	}
+	if len(rev.Artifacts) != 2 || rev.Artifacts[1].Kind != archive.ArtifactAnalysis {
+		t.Fatalf("artifacts = %+v", rev.Artifacts)
+	}
+
+	doc := findPageDoc(t, rev, 1)
+	if doc.Locator == nil || doc.Locator.PageLabel != "iv" {
+		t.Fatalf("page locator = %+v, want printed label iv on physical index 1", doc.Locator)
+	}
+	if doc.Locator.CoordinateOrigin != "top-left" || len(doc.Locator.Rectangles) == 0 {
+		t.Fatalf("rectangle metadata = %+v", doc.Locator)
+	}
+	if r := doc.Locator.Rectangles[0]; r.X <= 0 || r.Y <= 0 || r.Width <= 0 || r.Height <= 0 || r.X > 1 || r.Y > 1 {
+		t.Fatalf("rectangle is not normalized: %+v", r)
+	}
+
+	// The permanent citation URI stays entity-level; no chunk id enters it.
+	ent := &rev.Entities[0]
+	ref := citation.FromDocument("papers", rev.ID, ent, doc)
+	wantURI := citation.Format("papers", rev.ID, ent.ExternalID)
+	if ref.String() != wantURI {
+		t.Fatalf("citation URI = %q, want the entity-level %q", ref.String(), wantURI)
+	}
+	parsed, err := citation.Parse(ref.String())
+	if err != nil || parsed.EntityID != ent.ExternalID {
+		t.Fatalf("citation parse = %+v err=%v", parsed, err)
+	}
+
+	// Re-index with a different block order and an extra passage. The locator,
+	// not the chunk id, still resolves the physical page from the vault.
+	reordered := strings.Replace(fixture, `{"text": "Front matter"`, `{"text": "Front matter b"`, 1)
+	rev2, err := ImportPDFWithOptions(context.Background(), vault, pdfPath, "papers", PDFOptions{
+		DoclingVersion: "9.9.9",
+		DoclingRunner: func(ctx context.Context, path string) ([]byte, error) {
+			return []byte(reordered), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("re-index: %v", err)
+	}
+	doc2 := findPageDoc(t, rev2, 1)
+	if doc2.Locator == nil || doc2.Locator.PageLabel != "iv" || doc2.Locator.PageIndex != 1 {
+		t.Fatalf("re-index locator = %+v", doc2.Locator)
+	}
+	f, err := archive.ResolveLocator(vault, rev2.ID, *doc2.Locator)
+	if err != nil {
+		t.Fatalf("resolve locator offline: %v", err)
+	}
+	defer f.Close()
+	got, err := io.ReadAll(f)
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("resolved bytes differ from the original PDF (err=%v)", err)
+	}
+}
+
+func findPageDoc(t *testing.T, rev *archive.Revision, pageIndex int) *archive.Document {
+	t.Helper()
+	for i := range rev.Entities {
+		for j := range rev.Entities[i].Documents {
+			doc := &rev.Entities[i].Documents[j]
+			if doc.Locator != nil && doc.Locator.PageIndex == pageIndex {
+				return doc
+			}
+		}
+	}
+	t.Fatalf("no document for physical page index %d in %+v", pageIndex, rev.Entities)
+	return nil
 }

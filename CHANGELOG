@@ -2,6 +2,16 @@
 
 ### Added
 
+- **Page-pinned PDF citations (PR-4A).** `archive import-pdf` now stores a
+  zero-based physical page locator on every extracted passage: the archived PDF
+  blob SHA-256, optional printed page label and optional normalized rectangles
+  with a declared top-left origin. `vault cite --page N` resolves the passage
+  offline through the revision manifest and blob store; the permanent citation
+  URI stays entity-level, so re-indexing does not change it. `--docling` runs an
+  optional, bounded local Docling process and stores its exact JSON as a separate
+  content-addressed derivation with parser/config evidence. See
+  `docs/RESEARCH.md`.
+
 - **`archive verify [--json]`.** A read-only vault check walks every revision
   manifest, hashes each referenced blob once and reports missing blobs,
   digest/size mismatches, unreadable manifests and invalid entries. Shared blobs

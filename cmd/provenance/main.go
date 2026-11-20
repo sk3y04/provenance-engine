@@ -71,10 +71,14 @@ var (
 	flagVaultRoot          string
 	flagCiteFormat         string
 	flagCiteEntity         string
+	flagCitePage           int
 	flagSearchCollection   string
 	flagSearchKind         string
 	flagImportRef          string
 	flagImportScope        string
+	flagDoclingPath        string
+	flagDoclingTimeout     time.Duration
+	flagDoclingVersion     string
 	flagMaxPages           int
 	flagScreenshot         bool
 	flagEvery              string
@@ -1264,22 +1268,35 @@ func archiveCmd() *cobra.Command {
 	}
 	verify.Flags().BoolVar(&verifyJSON, "json", false, "Emit the verification report as JSON on stdout")
 	cmd.AddCommand(verify)
-	cmd.AddCommand(&cobra.Command{
+	importPDF := &cobra.Command{
 		Use:   "import-pdf PATH",
 		Short: "Import a PDF file into the vault",
-		Args:  cobra.ExactArgs(1),
+		Long: "Stores the PDF immutably and indexes page-pinned text. The built-in\n" +
+			"extractor needs no external tools; --docling runs a local Docling command and\n" +
+			"stores its exact JSON as a separate derivation. Printed page labels and\n" +
+			"normalized passage rectangles are kept beside the physical zero-based page\n" +
+			"index, so a re-index still resolves the same page.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if flagArchiveCollection == "" {
 				return fmt.Errorf("--collection is required")
 			}
-			rev, err := importers.ImportPDF(cmd.Context(), flagVaultRoot, args[0], flagArchiveCollection)
+			rev, err := importers.ImportPDFWithOptions(cmd.Context(), flagVaultRoot, args[0], flagArchiveCollection, importers.PDFOptions{
+				DoclingPath:    flagDoclingPath,
+				DoclingTimeout: flagDoclingTimeout,
+				DoclingVersion: flagDoclingVersion,
+			})
 			if err != nil {
 				return err
 			}
 			fmt.Fprintf(os.Stderr, "[provenance] imported PDF: revision %s (%d entities)\n", rev.ID, len(rev.Entities))
 			return nil
 		},
-	})
+	}
+	importPDF.Flags().StringVar(&flagDoclingPath, "docling", "", "Path to a local docling executable (optional; stores its JSON as a derivation)")
+	importPDF.Flags().DurationVar(&flagDoclingTimeout, "docling-timeout", importers.DefaultDoclingTimeout, "Maximum lifetime of the Docling process")
+	importPDF.Flags().StringVar(&flagDoclingVersion, "docling-version", "", "Docling version recorded as derivation evidence")
+	cmd.AddCommand(importPDF)
 	cmd.AddCommand(&cobra.Command{
 		Use:   "import-git URL",
 		Short: "Import a Git repository into the vault",
@@ -1510,6 +1527,7 @@ func vaultCmd() *cobra.Command {
 		Use:   "vault",
 		Short: "Manage the durable vault",
 	}
+	cmd.PersistentFlags().StringVar(&flagVaultRoot, "vault", "./provenance-vault", "Vault root directory")
 	cmd.AddCommand(&cobra.Command{
 		Use:   "init",
 		Short: "Initialize the vault and PostgreSQL schema",
@@ -1573,14 +1591,24 @@ func citeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "cite REVISION_ID",
 		Short: "Generate a citation for a revision entity",
-		Args:  cobra.ExactArgs(1),
+		Long: "Generates an entity-level citation URI. With --page, the citation is pinned to a\n" +
+			"physical zero-based PDF page using the archived locator; the permanent URI stays\n" +
+			"entity-level, so a re-index that changes passage ids does not change it. The\n" +
+			"filesystem vault is read first, which makes a restored vault citable offline.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := ensureVaultStore(cmd.Context()); err != nil {
-				return err
-			}
-			rev, err := catalog.Store().GetRevision(cmd.Context(), args[0])
-			if err != nil {
-				return err
+			// Prefer the local revision: page locators live in the filesystem
+			// manifest and a restored vault must be citable without PostgreSQL.
+			rev, localErr := archive.ReadRevision(flagVaultRoot, args[0])
+			if localErr != nil {
+				if err := ensureVaultStore(cmd.Context()); err != nil {
+					return localErr
+				}
+				var err error
+				rev, err = catalog.Store().GetRevision(cmd.Context(), args[0])
+				if err != nil {
+					return err
+				}
 			}
 			collectionName := flagSearchCollection
 			if collectionName == "" {
@@ -1597,6 +1625,21 @@ func citeCmd() *cobra.Command {
 					continue
 				}
 				ref := citation.FromEntity(collectionName, args[0], &ent)
+				if flagCitePage >= 0 {
+					found := false
+					for i := range ent.Documents {
+						doc := &ent.Documents[i]
+						if doc.Locator == nil || doc.Locator.PageIndex != flagCitePage {
+							continue
+						}
+						ref = citation.FromDocument(collectionName, args[0], &ent, doc)
+						found = true
+						break
+					}
+					if !found {
+						return fmt.Errorf("no indexed passage for physical page index %d in entity %s", flagCitePage, ent.ExternalID)
+					}
+				}
 				switch flagCiteFormat {
 				case "markdown":
 					fmt.Println(ref.Markdown())
@@ -1616,6 +1659,7 @@ func citeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&flagSearchCollection, "collection", "", "Archive collection name")
 	cmd.Flags().StringVar(&flagCiteFormat, "format", "plain", "Citation format: provenance, markdown, plain, json")
 	cmd.Flags().StringVar(&flagCiteEntity, "entity", "", "Entity external ID")
+	cmd.Flags().IntVar(&flagCitePage, "page", -1, "Pin the citation to this zero-based physical PDF page index")
 	return cmd
 }
 
