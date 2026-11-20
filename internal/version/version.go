@@ -5,4 +5,4 @@ package version
 // Version is the release version. Release builds may override it:
 //
 //	go build -ldflags "-X github.com/sk3y04/provenance-engine/internal/version.Version=1.2.3"
-var Version = "0.10.0"
+var Version = "0.10.1"

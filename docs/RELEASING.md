@@ -87,7 +87,7 @@ tag (then `go mod tidy` is safe again).
   `0.7.0`, so the first engine release is **`v0.7.0`**, continuing the existing
   sequence rather than restarting at `v0.1.0`.
 - The CLI's `--version` comes from `internal/version.Version` (default
-  `0.10.0`). Release builds stamp it via `-ldflags -X …version.Version=<tag
+  `0.10.1`). Release builds stamp it via `-ldflags -X …version.Version=<tag
   without the leading v>` — both `.github/workflows/release.yml` and `make
   release-dry-run` do this, and `make build` stamps `git describe` output.
   Bump the default in `internal/version/version.go` in step with each release
@@ -125,11 +125,13 @@ These are recorded as open questions; no legal conclusion is drawn here.
 
 ## Tagging (manual, after review)
 
-The current release is `v0.10.0` (see Versioning above); `v0.9.0` is already
-tagged and published. After the human review gate:
+The current release is `v0.10.1` (see Versioning above). `v0.9.0` is tagged
+and published; `v0.10.0` was tagged but never published — its release gate
+failed on the seeding defect fixed in 0.10.1, and the tag is left in place as
+an unreleased marker. After the human review gate:
 
 ```bash
-git tag -a v0.10.0 -m "Soulseek integration over an external slskd: serialised search, durable jobs, capture import, curated shares"
+git tag -a v0.10.1 -m "Fix: the transfer deadline no longer ends torrent seeding; release gate for the Soulseek integration"
 git push origin master --tags
 ```
 

@@ -1,3 +1,26 @@
+## [0.10.1] - 2026-11-20
+
+A release-gate fix for the torrent seeding path. `v0.10.0` was tagged but
+never published: its tag-triggered release build failed on a slow CI runner,
+where a pre-existing defect ended seeding early and released the staging
+root. The Soulseek integration is unchanged from the 0.10.0 entry below.
+
+### Fixed
+
+- **The transfer deadline no longer ends seeding.** `torrent fetch --seed`
+  keeps seeding until interrupted even when `--timeout` is set: the deadline
+  bounds the transfer (metadata included), and the KeepSeeding wait now ends
+  only when the caller's context is cancelled. Previously the deadline also
+  cut the seeding wait short — the run recorded `stopped` and released the
+  staging root while the caller still wanted to seed. The default
+  (`--timeout` unset) was unaffected. Regression:
+  `TestSeedingOutlivesTransferTimeout`.
+
+- **Test-harness stderr race.** The real-process torrent tests read the
+  child's stderr buffer on failure paths while `os/exec`'s copy goroutine
+  could still be writing; the buffer is now mutex-guarded, and the helper's
+  transfer budget has loaded-runner headroom. Test-only change.
+
 ## [0.10.0] - 2026-11-20
 
 Soulseek arrives as an integration over an external, unmodified `slskd >= 0.26.0`

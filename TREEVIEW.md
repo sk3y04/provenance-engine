@@ -1,7 +1,7 @@
 # Treeview - File Reference
 
-File-level reference for every Go source file in the module (283 files),
-regenerated for the `v0.10.0` release. Test files are listed with their coverage.
+File-level reference for every Go source file in the module (284 files),
+regenerated for the `v0.10.1` release. Test files are listed with their coverage.
 Package-level design lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md);
 the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 
@@ -373,6 +373,7 @@ the public facade is documented in [`docs/ENGINE.md`](docs/ENGINE.md).
 | `seedctl_test.go` | Seed start/stop control and slot lifetime |
 | `seeder_test.go` | Local seeder fixture |
 | `seed_test.go` | Seed session verification before serving |
+| `seed_timeout_test.go` | Seeding outlives the transfer deadline; ownership held until caller cancellation |
 | `status_process_test.go` | Status across processes without inferring liveness |
 | `status_test.go` | Recorded-state rendering, unreadable records |
 | `v2_test.go` | v2 identity, `bt2-` job ids, layer persistence |
